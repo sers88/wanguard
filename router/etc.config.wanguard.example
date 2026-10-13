@@ -1,0 +1,43 @@
+# /etc/config/wanguard — единственный источник правды о группах и членстве.
+# Рендер всего data plane (nft + ip rules + таблицы маршрутизации + маршруты)
+# — `wanguard apply` (issue #13). Читают/пишут: wanguard CLI, luci-app-wanguard.
+#
+# Группа = config group '<имя>' (имя = [A-Za-z0-9_], это же имя используют члены):
+#   option type 'direct'  + option iface '<netifd-интерфейс>'  -> выход через интерфейс
+#   option type 'proxy'                                     -> выход через mihomo (макс. 1)
+# Аллокация автоматична и детерминирована (по алфавиту direct-групп):
+#   proxy  = fwmark 300 / table 500 (фикс.)
+#   direct = fwmark 100,200,400,... / tables 400,401,...  (см. docs/ARCHITECTURE.md §2)
+
+config globals 'globals'
+	option redir_port '7892'
+	# никогда не маркировать/не редиректить трафик к этим адресам
+	# (админ-каналы, API оператора — переживут даже маркированное окно)
+	list no_mark '203.0.113.10'
+
+config group 'a'
+	option type 'direct'
+	option iface 'vpn'
+
+config group 'b'
+	option type 'direct'
+	option iface 'wan2'
+
+config group 'c'
+	option type 'proxy'
+
+config member 'm_001122334455'
+	option name 'laptop'
+	option mac '00:11:22:33:44:55'
+	option group 'c'
+
+config member 'm_001122334456'
+	option name 'laptop-wifi'
+	option mac '00:11:22:33:44:56'
+	option group 'c'
+
+# Легаси (этап #4/#7, до #13): секция config wan 'wan' больше не используется
+# новым кодом; удалить вручную после приёмки #13:
+# config wan 'wan'
+# 	option group_a 'ppp'
+# 	option group_b 'pppoe'

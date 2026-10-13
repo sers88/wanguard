@@ -1,0 +1,17 @@
+#!/bin/sh
+# wanguard-testmark MAC [SECONDS] — temporarily add MAC to group C (mihomo TUN),
+# auto-remove after SECONDS. Must survive ssh disconnects (no nohup on BusyBox):
+# ignores SIGHUP, detached launch: ( wanguard-testmark .. >/tmp/.. 2>&1 </dev/null & )
+# If killed mid-window, worst case the mark stays until next call with same MAC
+# or `nft flush set inet wanguard mac_c` — always verify set after experiments.
+trap '' HUP
+MAC="$1"
+SECS="${2:-60}"
+SET="${3:-mac_c}"
+TABLE="inet wanguard"
+
+nft add element $TABLE $SET { "$MAC" } || exit 1
+echo "marked $MAC in $SET for ${SECS}s at $(date)" > /tmp/wanguard-testmark.state
+sleep "$SECS"
+nft delete element $TABLE $SET { "$MAC" }
+echo "unmarked $MAC from $SET after ${SECS}s at $(date)" > /tmp/wanguard-testmark.done

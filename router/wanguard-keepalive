@@ -1,0 +1,19 @@
+#!/bin/sh
+# wanguard keepalive (issue #13): `wand-tick` + `apply` loop.
+# wand-tick (issue #6) probes both WANs through their devices (HTTP anchors,
+# 3 fails = down, 6 oks = up again) and flips direct groups' UCI iface on
+# failover/failback; apply then renders EVERYTHING — nft table/sets/rules,
+# ip rules, per-group tables and routes, including `default dev Meta
+# table 500` after every mihomo restart (Meta is recreated by mihomo, the
+# route dies with it) and the fallback `metric 200` via the main WAN while
+# Meta is down. Doing the flips via UCI keeps the render model the single
+# source of truth — this loop and the watchdog can never fight.
+# Idempotent diff (no flush windows), safe to run concurrently with the CLI.
+# Logs only non-trivial output (changes, warnings, errors) via logger.
+while :; do
+	wout=$(/usr/bin/wanguard wand-tick 2>&1)
+	[ -n "$wout" ] && logger -t wanguard-wand "$wout"
+	out=$(/usr/bin/wanguard apply 2>&1)
+	[ "$out" = in-sync ] || logger -t wanguard-keepalive "$out"
+	sleep 10
+done

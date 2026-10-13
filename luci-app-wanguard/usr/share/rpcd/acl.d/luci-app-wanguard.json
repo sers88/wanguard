@@ -1,0 +1,25 @@
+{
+	"luci-app-wanguard": {
+		"description": "Grant access to WAN Guard device groups",
+		"read": {
+			"ubus": {
+				"file": [ "read", "exec" ],
+				"network.interface": [ "dump" ]
+			},
+			"file": {
+				"/tmp/dhcp.leases": [ "read" ],
+				"/usr/bin/wanguard": [ "exec" ]
+			},
+			"uci": [ "wanguard" ]
+		},
+		"write": {
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"file": {
+				"/usr/bin/wanguard": [ "exec" ]
+			},
+			"uci": [ "wanguard" ]
+		}
+	}
+}

@@ -1,0 +1,814 @@
+#!/bin/sh
+# wanguard — named groups x arbitrary ifaces (issue #13, docs/ARCHITECTURE.md §2/§5)
+#
+# Source of truth: /etc/config/wanguard (UCI). `apply` renders EVERYTHING:
+#   - nft: sets mac_<group> + marking/redirect rules (idempotent diff by
+#     comment tags, no flush windows);
+#   - ip rules (policy routing) per group;
+#   - per-group routing tables: default via the group's device + fallback
+#     `default <main-route> metric 200` (proxy: mihomo dead -> direct).
+# Self-healing: keepalive re-runs apply every 10s; init script at boot.
+#
+# Allocation (deterministic from sorted group names, docs/ARCHITECTURE.md §2):
+#   proxy  (max 1) -> fwmark 300, table 500, ip rule prio 8000 (mihomo singleton)
+#   direct (sorted) -> fwmark 100,200,400,500,... (skip 300), table 400+k,
+#                      ip rule prio 8100+k
+# Generated rules carry tags "wg:<group>:m<mark>" / "wg:<group>:r<port>" — the
+# tag fully determines the rule body, so the diff never text-matches nft's
+# normalization (marks are displayed as 0x... etc.).
+#
+# Usage:
+#   wanguard list                     members + drift status
+#   wanguard add <mac> <group> [name]
+#   wanguard move <mac> <group>
+#   wanguard remove <mac>
+#   wanguard apply                    full UCI -> nft + ip rules + routes
+#   wanguard grouplist                groups: type/iface/mark/table/device
+#   wanguard devices                  LAN clients: mac/ip/name/online (board)
+#   wanguard groupadd <name> <iface|proxy>
+#   wanguard groupset <name> <iface|proxy>
+#   wanguard groupdel <name>
+#   wanguard wanstatus                WAN probe states + group home/current/mode (#6)
+#   wanguard wanset <group> <iface>   pin group to iface (manual override)
+#   wanguard wanauto <group>          resume watchdog auto-mode
+#
+# MAC accepted as AA:BB:CC:DD:EE:FF / aa-bb-cc-dd-ee-ff / aabb.ccdd.eeff / bare hex.
+# Group names: [A-Za-z0-9_], <=15 chars, must not be 'globals'/'wan'.
+
+CONF=wanguard
+TABLE="inet wanguard"
+NFT_FILE=/usr/share/wanguard/wanguard.nft
+BR=br-lan
+
+msg() { printf '%s\n' "$*"; }
+warn() { printf 'wanguard: %s\n' "$*" >&2; }
+err() { printf 'wanguard: %s\n' "$*" >&2; exit 1; }
+
+# ---------- helpers ----------
+
+normalize_mac() { # prints MAC as aa:bb:cc:dd:ee:ff, empty if invalid
+	local raw hex
+	raw=$(printf '%s' "$1" | tr 'ABCDEF-' 'abcdef:')
+	hex=$(printf '%s' "$raw" | tr -d ':.')
+	case "$hex" in
+		[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+		*) return 1 ;;
+	esac
+	printf '%s' "$hex" | sed 's/../&:/g; s/:$//'
+}
+
+member_ids() { # list of UCI sections of type member
+	uci -q show "$CONF" 2>/dev/null | grep '=member$' | cut -d= -f1 | sed "s/^$CONF\.//"
+}
+
+get_member_opt() { uci -q get "$CONF.$1.$2"; }
+
+group_ids() { # sorted section ids of type group
+	uci -q show "$CONF" 2>/dev/null | grep '=group$' | cut -d= -f1 | sed "s/^$CONF\.//" | sort
+}
+
+group_opt() { uci -q get "$CONF.$1.$2"; }
+
+group_exists() {
+	local g
+	for g in $(group_ids); do [ "$g" = "$1" ] && return 0; done
+	return 1
+}
+
+proxy_ids() {
+	local g
+	for g in $(group_ids); do [ "$(group_opt "$g" type)" = proxy ] && echo "$g"; done
+	return 0
+}
+
+direct_ids() {
+	local g
+	for g in $(group_ids); do [ "$(group_opt "$g" type)" = direct ] && echo "$g"; done
+	return 0
+}
+
+group_members() { # group name -> member count
+	local sid n=0
+	for sid in $(member_ids); do
+		[ "$(get_member_opt "$sid" group)" = "$1" ] && n=$((n+1))
+	done
+	echo "$n"
+}
+
+find_by_mac() { # mac -> section id (first match), empty otherwise
+	local sid m
+	for sid in $(member_ids); do
+		m=$(normalize_mac "$(get_member_opt "$sid" mac)" 2>/dev/null)
+		[ "$m" = "$1" ] && { echo "$sid"; return 0; }
+	done
+	return 1
+}
+
+section_id_for_mac() { # m_d8bbc1cc1771
+	local h
+	h=$(printf '%s' "$1" | tr -d ':')
+	echo "m_$h"
+}
+
+desired_group() { # group -> members' MACs, one per line
+	local sid
+	for sid in $(member_ids); do
+		[ "$(get_member_opt "$sid" group)" = "$1" ] && get_member_opt "$sid" mac
+	done
+	return 0
+}
+
+current_elements() { # nft set name -> normalized element list, one per line
+	local out
+	out=$(nft list set $TABLE "$1" 2>/dev/null | tr '\n' ' ')
+	case "$out" in
+		*elements*)
+			printf '%s\n' "$out" \
+				| sed 's/.*elements = {//; s/}[[:space:]]*}.*//' \
+				| tr ',' '\n' | tr -d ' \t' | grep -v '^$'
+			;;
+	esac
+}
+
+iface_device() { # netifd iface name -> l3_device; empty when down/missing
+	local st
+	[ -n "$1" ] || return 0
+	st=$(ubus call network.interface."$1" status 2>/dev/null) || return 0
+	printf '%s' "$st" | grep -q '"up":[[:space:]]*true' || return 0
+	printf '%s' "$st" | jsonfilter -e '@.l3_device' -e '@.device' 2>/dev/null | awk 'NF { print; exit }'
+}
+
+# ---------- migration (issue #13, idempotent) ----------
+
+migrate_legacy() { # create a/b/c from the legacy layout, once
+	[ -z "$(group_ids)" ] || return 0
+	local wa
+	wa=$(uci -q get "$CONF.wan.group_a" 2>/dev/null)
+	uci set "$CONF.a=group"
+	uci set "$CONF.a.type=direct"
+	uci set "$CONF.a.iface=$([ "$wa" = pppoe ] && echo wan2 || echo vpn)"
+	uci set "$CONF.b=group"
+	uci set "$CONF.b.type=direct"
+	uci set "$CONF.b.iface=wan2"
+	uci set "$CONF.c=group"
+	uci set "$CONF.c.type=proxy"
+	uci commit "$CONF" || err "uci commit failed"
+	msg "migrated legacy layout: groups a(vpn) b(wan2) c(proxy) created (config wan left as-is)"
+}
+
+# ---------- allocation (deterministic, docs/ARCHITECTURE.md §2) ----------
+
+alloc_lines() { # -> "name type mark table prio [iface]" per line
+	local nproxy=0 k=0 g m t
+	for g in $(proxy_ids); do
+		[ "$nproxy" -eq 0 ] && echo "$g proxy 300 500 8000"
+		nproxy=$((nproxy+1))
+	done
+	[ "$nproxy" -le 1 ] || warn "$nproxy proxy groups defined; mihomo is a singleton — rendering only the first"
+	for g in $(direct_ids); do
+		k=$((k+1))
+		if [ "$k" -gt 99 ]; then
+			warn "too many direct groups (>99), ignoring '$g'"
+			continue
+		fi
+		m=$((100*k)); [ "$m" -lt 300 ] || m=$((m+100)) # 300 = mihomo
+		t=$((400+k-1))
+		echo "$g direct $m $t $((8100+k-1)) $(group_opt "$g" iface)"
+	done
+	return 0
+}
+
+# ---------- nft rendering (diff, no flush windows) ----------
+
+ensure_table() {
+	# skeleton hallmark: the local_v4 set (legacy table lacks it -> recreate)
+	nft list set $TABLE local_v4 >/dev/null 2>&1 && return 0
+	nft delete table $TABLE >/dev/null 2>&1
+	nft -f "$NFT_FILE" || return 1
+}
+
+render_diff() { # appends add/delete element commands for one set to $TMPF
+	local setname e have_sp want_sp
+	setname="$1"
+	# membership must be tested with spaces around elements: $2/$3 are
+	# newline-separated, and " $have " alone keeps internal newlines, which
+	# makes every multi-element match fail (phantom add+delete churn)
+	have_sp=" $(printf '%s' "$3" | tr '\n' ' ') "
+	want_sp=" $(printf '%s' "$2" | tr '\n' ' ') "
+	for e in $2; do
+		case "$have_sp" in
+			*" $e "*) ;;
+			*) printf 'add element %s %s { %s }\n' "$TABLE" "$setname" "$e" >> "$TMPF" ;;
+		esac
+	done
+	for e in $3; do
+		case "$want_sp" in
+			*" $e "*) ;;
+			*) printf 'delete element %s %s { %s }\n' "$TABLE" "$setname" "$e" >> "$TMPF" ;;
+		esac
+	done
+}
+
+rule_wanted() { # chain tag -> 0 if present in $DRF (desired rules)
+	awk -v c="$1" -v t="$2" '$1==c && $2==t {f=1; exit} END { if (f) exit 0; exit 1 }' "$DRF"
+}
+
+rule_live() { # chain tag -> 0 if present in $HRF (live rule tags)
+	awk -v c="$1" -v t="$2" '$1==c && $2==t {f=1; exit} END { if (f) exit 0; exit 1 }' "$HRF"
+}
+
+# ---------- ip rules / routes ----------
+
+reconcile_rules() { # $1=alloc file -> prints change count; errors to stderr
+	local n=0 g typ m t p P want=" "
+	while read -r g typ m t p ifc; do
+		[ -n "$g" ] || continue
+		want="$want$p "
+		if ! ip rule show 2>/dev/null | grep -Eq "^[[:space:]]*$p:"; then
+			ip rule add prio "$p" fwmark "$m" table "$t" && n=$((n+1))
+		fi
+	done < "$1"
+	for P in $(ip rule show 2>/dev/null | sed -n 's/^[[:space:]]*\([0-9][0-9]*\):.*/\1/p'); do
+		[ "$P" -ge 8000 ] && [ "$P" -le 8199 ] || continue
+		case "$want" in
+			*" $P "*) ;;
+			*) while ip rule del prio "$P" 2>/dev/null; do n=$((n+1)); done ;;
+		esac
+	done
+	echo "$n"
+}
+
+reconcile_routes() { # $1=alloc file -> prints change count; warnings to stderr
+	local n=0 g typ m t p ifc dev mainline T alloc_t inuse
+	mainline=$(ip route show table main 2>/dev/null | grep '^default ' | head -n1)
+	while read -r g typ m t p ifc; do
+		[ -n "$g" ] || continue
+		dev=""
+		if [ "$typ" = proxy ]; then
+			ip link show Meta >/dev/null 2>&1 && dev=Meta
+		else
+			dev=$(iface_device "$ifc")
+		fi
+		if [ -n "$dev" ]; then
+			ip route show table "$t" 2>/dev/null | grep -q "default dev $dev " || \
+				{ ip route replace default dev "$dev" table "$t" && n=$((n+1)); }
+		else
+			# warn only when someone actually depends on the group
+			[ "$(group_members "$g")" -gt 0 ] && {
+				if [ "$typ" = proxy ]; then
+					warn "group $g: mihomo TUN Meta is down — routes skipped (keepalive will retry)"
+				else
+					warn "group $g: iface '${ifc:-?}' down or missing — routes skipped (keepalive will retry)"
+				fi
+			}
+		fi
+		# fallback: main default at metric 200 (idempotent; matches the legacy
+		# UCI-installed route byte-for-byte, so both sources coexist safely)
+		if [ -n "$mainline" ] && ! ip route show table "$t" 2>/dev/null | grep -Eq ' metric 200($| )'; then
+			ip route replace $mainline metric 200 table "$t" && n=$((n+1))
+		fi
+	done < "$1"
+	# flush orphan tables of removed groups (allocator range only)
+	alloc_t=" $(awk '{printf "%s ", $4}' "$1") "
+	inuse=$(ip route show table all 2>/dev/null | sed -n 's/.* table \([0-9][0-9]*\).*/\1/p' | sort -u)
+	for T in $inuse; do
+		[ "$T" -ge 400 ] && [ "$T" -le 500 ] || continue
+		case "$alloc_t" in
+			*" $T "*) ;;
+			*) ip route flush table "$T" >/dev/null 2>&1 && n=$((n+1)) ;;
+		esac
+	done
+	echo "$n"
+}
+
+# ---------- WAN watchdog (issue #6) ----------
+#
+# Policy (owner-approved 2026-10-12): HTTP anchor through each WAN device
+# (2 anchors, DOWN only when both fail); 3 failed probes = down (30s);
+# a down wan needs 6 ok probes (60s stable) to be up again. On home-wan
+# death a direct group flips to the first up backup; failback is automatic
+# once home recovers. Min dwell between switches of one group: 60s.
+# Flips are done via UCI iface= + the keepalive's apply, so the render
+# model stays the single source of truth (keepalive never fights the
+# watchdog). Proxy groups are never touched (mihomo fails over via the
+# main-table metrics itself).
+
+WAND_DIR=/tmp/wanguard
+WAND_MIN_DWELL=60
+WAND_FAILS_DOWN=3
+WAND_OKS_UP=6
+
+wand_wans() { # distinct CURRENT+HOME ifaces of direct groups, sorted
+	# Homes MUST be included: after a failover every group's current iface
+	# may point at the backup, the dead home would drop out of probing and
+	# could never be seen recovering (bug found live 2026-10-13).
+	local g ifc
+	for g in $(direct_ids); do
+		ifc=$(group_opt "$g" iface)
+		[ -n "$ifc" ] && echo "$ifc"
+		ifc=$(group_opt "$g" wan_home)
+		[ -n "$ifc" ] && echo "$ifc"
+	done | sort -u
+}
+
+wand_state() { # $1=wan -> up|down (optimistic default: up)
+	local s
+	s=$(cat "$WAND_DIR/$1.state" 2>/dev/null)
+	echo "${s:-up}"
+}
+
+wand_probe() { # $1=wan $2=device -> 0 ok (prints rtt s) / 1 fail
+	local wan="$1" dev="$2" a1 a2 r f
+	f="$WAND_DIR/$wan.force"
+	if [ -f "$f" ]; then # test hook: forced probe result (ok|fail)
+		read -r r < "$f"
+		[ "$r" = ok ] && { echo 0; return 0; }
+		return 1
+	fi
+	a1=$(uci -q get "$CONF.globals.wan_anchor1" 2>/dev/null)
+	[ -n "$a1" ] || a1='http://www.gstatic.com/generate_204'
+	a2=$(uci -q get "$CONF.globals.wan_anchor2" 2>/dev/null)
+	[ -n "$a2" ] || a2='http://detectportal.firefox.com/success.txt'
+	r=$(curl --interface "$dev" -m 5 -sf -o /dev/null -w '%{time_total}' "$a1" 2>/dev/null) && { echo "$r"; return 0; }
+	r=$(curl --interface "$dev" -m 5 -sf -o /dev/null -w '%{time_total}' "$a2" 2>/dev/null) && { echo "$r"; return 0; }
+	return 1
+}
+
+cmd_wand_tick() { # one watchdog step; runs from the keepalive right before apply
+	command -v curl >/dev/null 2>&1 || return 0
+	mkdir -p "$WAND_DIR"
+	local now wan dev rtt fails oks state events=""
+	now=$(date +%s)
+	# --- probe phase: update per-wan state files ---
+	for wan in $(wand_wans); do
+		dev=$(iface_device "$wan")
+		if [ -n "$dev" ] && rtt=$(wand_probe "$wan" "$dev"); then
+			oks=$(( $(cat "$WAND_DIR/$wan.oks" 2>/dev/null || echo 0) + 1 ))
+			echo 0 > "$WAND_DIR/$wan.fails"
+			echo "$oks" > "$WAND_DIR/$wan.oks"
+			echo "$rtt" > "$WAND_DIR/$wan.rtt"
+			state=$(wand_state "$wan")
+			if [ "$state" = down ] && [ "$oks" -ge "$WAND_OKS_UP" ]; then
+				echo up > "$WAND_DIR/$wan.state"
+				echo "$now" > "$WAND_DIR/$wan.since"
+				events="$events up:$wan"
+			fi
+		else
+			fails=$(( $(cat "$WAND_DIR/$wan.fails" 2>/dev/null || echo 0) + 1 ))
+			echo "$fails" > "$WAND_DIR/$wan.fails"
+			echo 0 > "$WAND_DIR/$wan.oks"
+			state=$(wand_state "$wan")
+			if [ "$state" = up ] && [ "$fails" -ge "$WAND_FAILS_DOWN" ]; then
+				echo down > "$WAND_DIR/$wan.state"
+				echo "$now" > "$WAND_DIR/$wan.since"
+				events="$events down:$wan"
+			fi
+		fi
+	done
+	# --- group phase: failover / failback through UCI (rendered by apply) ---
+	local g home cur mode last backup w
+	for g in $(direct_ids); do
+		[ "$(group_opt "$g" wanmode)" = override ] && continue
+		home=$(group_opt "$g" wan_home)
+		cur=$(group_opt "$g" iface)
+		if [ -z "$home" ]; then # seed once: where the group sits becomes home
+			[ -n "$cur" ] || continue
+			uci set "$CONF.$g.wan_home=$cur"
+			uci commit "$CONF"
+			events="$events seed:$g>$cur"
+			continue
+		fi
+		last=$(cat "$WAND_DIR/$g.lastswitch" 2>/dev/null || echo 0)
+		[ $(( now - last )) -ge "$WAND_MIN_DWELL" ] || continue
+		if [ "$cur" = "$home" ]; then
+			[ "$(wand_state "$home")" = down ] || continue
+			backup=""
+			for w in $(wand_wans); do
+				[ "$w" = "$home" ] && continue
+				[ "$(wand_state "$w")" = up ] && { backup="$w"; break; }
+			done
+			[ -n "$backup" ] || continue
+			uci set "$CONF.$g.iface=$backup"
+			uci commit "$CONF"
+			echo "$now" > "$WAND_DIR/$g.lastswitch"
+			events="$events failover:$g>$backup"
+		else
+			[ "$(wand_state "$home")" = up ] || continue
+			uci set "$CONF.$g.iface=$home"
+			uci commit "$CONF"
+			echo "$now" > "$WAND_DIR/$g.lastswitch"
+			events="$events failback:$g>$home"
+		fi
+	done
+	[ -n "$events" ] && echo "wand:$events"
+	return 0
+}
+
+cmd_wanstatus() {
+	local wan dev st rtt since g home cur mode cnt
+	printf '%-8s %-14s %-12s %-9s %s\n' "WAN" "DEVICE" "STATE" "RTT(s)" "SINCE"
+	for wan in $(wand_wans); do
+		dev=$(iface_device "$wan"); [ -n "$dev" ] || dev="-"
+		st=$(wand_state "$wan")
+		[ -f "$WAND_DIR/$wan.force" ] && st="$st/forced"
+		rtt=$(cat "$WAND_DIR/$wan.rtt" 2>/dev/null); [ -n "$rtt" ] || rtt="-"
+		since=$(cat "$WAND_DIR/$wan.since" 2>/dev/null)
+		if [ -n "$since" ]; then
+			since=$(date -d "@$since" '+%d.%m %H:%M:%S' 2>/dev/null || echo "$since")
+		else
+			since="-"
+		fi
+		printf '%-8s %-14s %-12s %-9s %s\n' "$wan" "$dev" "$st" "$rtt" "$since"
+	done
+	echo
+	printf '%-8s %-8s %-8s %-9s %s\n' "GROUP" "HOME" "CURRENT" "MODE" "MEMBERS"
+	for g in $(direct_ids); do
+		home=$(group_opt "$g" wan_home); [ -n "$home" ] || home="-"
+		cur=$(group_opt "$g" iface)
+		mode=$(group_opt "$g" wanmode); [ -n "$mode" ] || mode=auto
+		cnt=$(group_members "$g")
+		printf '%-8s %-8s %-8s %-9s %s\n' "$g" "$home" "$cur" "$mode" "$cnt"
+	done
+	command -v curl >/dev/null 2>&1 || echo "note: curl missing — watchdog probes disabled"
+}
+
+cmd_wanset() {
+	local g="$1" ifc="$2"
+	group_exists "$g" || err "no such group: '$g' (see: wanguard grouplist)"
+	[ "$(group_opt "$g" type)" = direct ] || err "group '$g' is proxy — it follows mihomo, wanset does not apply"
+	ubus call network.interface."$ifc" status >/dev/null 2>&1 || err "unknown netifd iface: '$ifc'"
+	uci set "$CONF.$g.iface=$ifc"
+	uci set "$CONF.$g.wanmode=override"
+	uci commit "$CONF" || err "uci commit failed"
+	msg "group '$g' pinned to '$ifc' (manual override; watchdog skips it; resume: wanguard wanauto $g)"
+	cmd_apply
+}
+
+cmd_wanauto() {
+	local g="$1"
+	group_exists "$g" || err "no such group: '$g' (see: wanguard grouplist)"
+	[ "$(group_opt "$g" type)" = direct ] || err "group '$g' is proxy — nothing to automate"
+	uci set "$CONF.$g.wanmode=auto"
+	uci commit "$CONF" || err "uci commit failed"
+	msg "group '$g' back in auto mode (home: $(group_opt "$g" wan_home); watchdog fails back once home is up)"
+}
+
+# ---------- commands ----------
+
+cmd_apply() {
+	migrate_legacy
+
+	local gchk
+	for gchk in $(group_ids); do
+		case "$(group_opt "$gchk" type)" in
+			direct|proxy) ;;
+			*) msg "warning: group '$gchk' has no valid type (direct|proxy) — ignored" ;;
+		esac
+	done
+
+	ensure_table || err "cannot create nft table (see $NFT_FILE)"
+
+	local TMPF ADF DRF HRF
+	local redir changed=0 n
+	redir=$(uci -q get "$CONF.globals.redir_port" 2>/dev/null); [ -n "$redir" ] || redir=7892
+	TMPF=/tmp/wanguard.apply.$$
+	ADF=/tmp/wanguard.alloc.$$
+	DRF=/tmp/wanguard.want.$$
+	HRF=/tmp/wanguard.have.$$
+	trap 'rm -f "$TMPF" "$ADF" "$DRF" "$HRF"' EXIT
+	: > "$TMPF"; : > "$DRF"; : > "$HRF"
+	alloc_lines > "$ADF"
+
+	# --- desired rules: "chain tag body" (tag determines the body) ---
+	local g typ m t p ifc
+	while read -r g typ m t p ifc; do
+		[ -n "$g" ] || continue
+		if [ "$typ" = proxy ]; then
+			# TCP is handled by the redirect rule and MUST NOT be marked —
+			# after DNAT-to-local a marked packet would be policy-routed
+			# into the TUN (postmortem issue #5)
+			printf 'marking wg:%s:m%s iifname "%s" ether saddr @mac_%s meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
+				"$g" "$m" "$BR" "$g" "$m" >> "$DRF"
+			printf 'redir wg:%s:r%s iifname "%s" ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta l4proto tcp redirect to :%s\n' \
+				"$g" "$redir" "$BR" "$g" "$redir" >> "$DRF"
+		else
+			printf 'marking wg:%s:m%s iifname "%s" ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
+				"$g" "$m" "$BR" "$g" "$m" >> "$DRF"
+		fi
+	done < "$ADF"
+
+	# --- live rule tags: "chain tag handle" (tag keeps wg: prefix, handle verbatim) ---
+	local ch
+	for ch in marking redir; do
+		nft -a list chain $TABLE "$ch" 2>/dev/null \
+			| sed -n 's/.*comment "\(wg:[^"]*\)".*# handle \([^ ]*\).*/'"$ch"' \1 \2/p' >> "$HRF"
+	done
+
+	local have_sets have_sp WANTSETS="no_mark local_v4 "
+	have_sets=$(nft list table $TABLE 2>/dev/null | sed -n 's/^[[:space:]]*set \([A-Za-z0-9_]*\).*/\1/p')
+	have_sp=" $(printf '%s' "$have_sets" | tr '\n' ' ') "
+	while read -r g typ m t p ifc; do
+		[ -n "$g" ] || continue
+		WANTSETS="$WANTSETS""mac_$g "
+		case "$have_sp" in
+			*" mac_$g "*) ;;
+			*) printf 'add set %s mac_%s { type ether_addr; flags interval; }\n' "$TABLE" "$g" >> "$TMPF" ;;
+		esac
+	done < "$ADF"
+
+	# rule deletions: live tags that are no longer desired (incl. changed marks)
+	while read -r ch tag handle; do
+		[ -n "$ch" ] || continue
+		rule_wanted "$ch" "$tag" || printf 'delete rule %s %s handle %s\n' "$TABLE" "$ch" "$handle" >> "$TMPF"
+	done < "$HRF"
+
+	# rule additions: desired tags not live
+	while read -r ch tag body; do
+		[ -n "$ch" ] || continue
+		rule_live "$ch" "$tag" || printf 'add rule %s %s %s comment "%s"\n' "$TABLE" "$ch" "$body" "$tag" >> "$TMPF"
+	done < "$DRF"
+
+	# element diffs
+	local want have want_nm have_nm
+	while read -r g typ m t p ifc; do
+		[ -n "$g" ] || continue
+		want=$(desired_group "$g" | sort)
+		have=$(current_elements "mac_$g" | sort)
+		render_diff "mac_$g" "$want" "$have"
+	done < "$ADF"
+	want_nm=$(uci -q get "$CONF.globals.no_mark" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | sort)
+	have_nm=$(current_elements no_mark | sort)
+	render_diff no_mark "$want_nm" "$have_nm"
+
+	# orphan sets: groups deleted from UCI
+	local s
+	for s in $have_sets; do
+		case "$s" in mac_*) ;; *) continue ;; esac
+		case "$WANTSETS" in
+			*" $s "*) ;;
+			*) printf 'flush set %s %s\ndelete set %s %s\n' "$TABLE" "$s" "$TABLE" "$s" >> "$TMPF" ;;
+		esac
+	done
+
+	if [ -s "$TMPF" ]; then
+		[ -n "$WANGUARD_DEBUG" ] && { echo "--- nft diff:" >&2; cat "$TMPF" >&2; }
+		nft -c -f "$TMPF" 2>/tmp/wanguard.apply.err || {
+			cat /tmp/wanguard.apply.err >&2
+			err "nft check failed, nothing applied"
+		}
+		nft -f "$TMPF" || err "nft apply failed"
+		changed=1
+	fi
+	rm -f "$TMPF"
+
+	n=$(reconcile_rules "$ADF"); [ "${n:-0}" -gt 0 ] && changed=1
+	n=$(reconcile_routes "$ADF"); [ "${n:-0}" -gt 0 ] && changed=1
+
+	[ "$changed" = 1 ] && echo "applied" || echo "in-sync"
+}
+
+cmd_list() {
+	local sid name mac grp bad="" want have drift=0 g
+	printf '%-16s %-20s %-8s\n' "NAME" "MAC" "GROUP"
+	for sid in $(member_ids); do
+		name=$(get_member_opt "$sid" name); [ -n "$name" ] || name="-"
+		mac=$(get_member_opt "$sid" mac)
+		grp=$(get_member_opt "$sid" group)
+		if group_exists "$grp"; then
+			printf '%-16s %-20s %-8s\n' "$name" "$mac" "$grp"
+		else
+			printf '%-16s %-20s %-8s\n' "$name" "$mac" "$grp (??)"
+			bad="$bad $grp"
+		fi
+	done
+	[ -z "$bad" ] || msg "warning: members reference unknown group(s):$bad (fail-safe: main table)"
+	ADF=/tmp/wanguard.list.$$
+	trap 'rm -f "$ADF"' EXIT
+	alloc_lines > "$ADF"
+	while read -r g typ m t p ifc; do
+		[ -n "$g" ] || continue
+		want=$(desired_group "$g" | sort)
+		have=$(current_elements "mac_$g" | sort)
+		[ "$want" != "$have" ] && drift=1
+	done < "$ADF"
+	if [ "$drift" = "1" ]; then
+		msg "nft: DRIFT (UCI != nft sets; run: wanguard apply)"
+		return 1
+	fi
+	msg "nft: in-sync"
+}
+
+cmd_grouplist() {
+	local g typ m t p ifc dev cnt
+	printf '%-10s %-7s %-10s %-5s %-5s %-14s %s\n' "GROUP" "TYPE" "IFACE" "MARK" "TABLE" "DEVICE" "MEMBERS"
+	ADF=/tmp/wanguard.gl.$$
+	trap 'rm -f "$ADF"' EXIT
+	alloc_lines > "$ADF"
+	while read -r g typ m t p ifc; do
+		[ -n "$g" ] || continue
+		if [ "$typ" = proxy ]; then
+			ifc="-"
+			if ip link show Meta >/dev/null 2>&1; then dev=Meta; else dev=down; fi
+		else
+			dev=$(iface_device "$ifc"); [ -n "$dev" ] || dev=down
+		fi
+		cnt=$(group_members "$g")
+		printf '%-10s %-7s %-10s %-5s %-5s %-14s %s\n' "$g" "$typ" "$ifc" "$m" "$t" "$dev" "$cnt"
+	done < "$ADF"
+}
+
+valid_group_name() {
+	case "$1" in
+		globals|wan) return 1 ;;
+	esac
+	printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_]{1,15}$'
+}
+
+cmd_groupadd() {
+	local name="$1" val="$2"
+	valid_group_name "$name" || err "invalid group name: '$name' ([A-Za-z0-9_], <=15, not globals/wan)"
+	uci -q get "$CONF.$name" >/dev/null 2>&1 && err "section '$name' already exists in $CONF"
+	if [ "$val" = proxy ]; then
+		[ -z "$(proxy_ids)" ] || err "proxy group already exists: $(proxy_ids) (mihomo is a singleton)"
+		uci set "$CONF.$name=group"
+		uci set "$CONF.$name.type=proxy"
+	else
+		[ -n "$val" ] || err "usage: wanguard groupadd <name> <iface|proxy>"
+		[ "$val" != direct ] || err "'direct' alone is not an interface name — pass a netifd iface (e.g. vpn, wan2; see: wanguard grouplist)"
+		uci set "$CONF.$name=group"
+		uci set "$CONF.$name.type=direct"
+		uci set "$CONF.$name.iface=$val"
+		[ -n "$(iface_device "$val")" ] || \
+			msg "note: iface '$val' is down or missing in netifd — routes will follow once it is up"
+	fi
+	uci commit "$CONF" || err "uci commit failed"
+	msg "group '$name' created ($([ "$val" = proxy ] && echo proxy || echo "direct -> $val"))"
+	cmd_apply
+}
+
+cmd_groupset() {
+	local name="$1" val="$2" cur
+	group_exists "$name" || err "no such group: '$name' (see: wanguard grouplist)"
+	if [ "$val" = proxy ]; then
+		local other
+		for other in $(proxy_ids); do
+			[ "$other" = "$name" ] || err "proxy group already exists: $other (mihomo is a singleton)"
+		done
+		uci set "$CONF.$name.type=proxy"
+		uci -q delete "$CONF.$name.iface" 2>/dev/null
+		# stale watchdog options must not survive a direct->proxy retarget
+		uci -q delete "$CONF.$name.wan_home" 2>/dev/null
+		uci -q delete "$CONF.$name.wanmode" 2>/dev/null
+	else
+		[ -n "$val" ] || err "usage: wanguard groupset <name> <iface|proxy>"
+		[ "$val" != direct ] || err "'direct' alone is not an interface name — pass a netifd iface (e.g. vpn, wan2; see: wanguard grouplist)"
+		uci set "$CONF.$name.type=direct"
+		uci set "$CONF.$name.iface=$val"
+		# permanent retarget redefines the watchdog home (issue #6)
+		uci set "$CONF.$name.wan_home=$val"
+		uci set "$CONF.$name.wanmode=auto"
+		[ -n "$(iface_device "$val")" ] || \
+			msg "note: iface '$val' is down or missing in netifd — routes will follow once it is up"
+	fi
+	uci commit "$CONF" || err "uci commit failed"
+	msg "group '$name' updated ($([ "$val" = proxy ] && echo proxy || echo "direct -> $val"))"
+	cmd_apply
+}
+
+cmd_groupdel() {
+	local name="$1" sid members=""
+	group_exists "$name" || err "no such group: '$name' (see: wanguard grouplist)"
+	for sid in $(member_ids); do
+		[ "$(get_member_opt "$sid" group)" = "$name" ] && members="$members $(get_member_opt "$sid" mac)"
+	done
+	[ -z "$members" ] || err "group '$name' still has members:$members (move them first: wanguard move <mac> <group>)"
+	uci delete "$CONF.$name" || err "uci delete failed"
+	uci commit "$CONF" || err "uci commit failed"
+	msg "group '$name' deleted"
+	cmd_apply
+}
+
+cmd_add() {
+	local mac grp name sid
+	mac=$(normalize_mac "$1") || err "invalid mac: $1"
+	grp="$2"
+	group_exists "$grp" || err "no such group: '$grp' (see: wanguard grouplist)"
+	name="$3"
+	[ -n "$name" ] || name="mac-${mac#*:}"
+	if sid=$(find_by_mac "$mac") && [ -n "$sid" ]; then
+		err "$mac already registered as '$(get_member_opt "$sid" name)' in group $(get_member_opt "$sid" group) (use: wanguard move $mac $grp)"
+	fi
+	sid=$(section_id_for_mac "$mac")
+	uci set "$CONF.$sid=member" || err "uci set failed"
+	uci set "$CONF.$sid.name=$name"
+	uci set "$CONF.$sid.mac=$mac"
+	uci set "$CONF.$sid.group=$grp"
+	uci commit "$CONF" || err "uci commit failed"
+	msg "added $mac -> group $grp ($name)"
+	cmd_apply
+}
+
+cmd_move() {
+	local mac grp sid cur
+	mac=$(normalize_mac "$1") || err "invalid mac: $1"
+	grp="$2"
+	group_exists "$grp" || err "no such group: '$grp' (see: wanguard grouplist)"
+	sid=$(find_by_mac "$mac") || err "$mac not registered (use: wanguard add $mac <group> [name])"
+	cur=$(get_member_opt "$sid" group)
+	if [ "$cur" = "$grp" ]; then
+		msg "$mac already in group $grp"
+		return 0
+	fi
+	uci set "$CONF.$sid.group=$grp"
+	uci commit "$CONF" || err "uci commit failed"
+	msg "moved $mac: $cur -> $grp"
+	cmd_apply
+}
+
+cmd_remove() {
+	local mac sid name
+	mac=$(normalize_mac "$1") || err "invalid mac: $1"
+	sid=$(find_by_mac "$mac") || err "$mac not registered"
+	name=$(get_member_opt "$sid" name)
+	uci delete "$CONF.$sid" || err "uci delete failed"
+	uci commit "$CONF" || err "uci commit failed"
+	msg "removed $mac ($name)"
+	cmd_apply
+}
+
+cmd_devices() { # LAN clients for the LuCI board (issue #14)
+	# prints: mac<TAB>ip<TAB>name<TAB>online — leases give name/ip, ARP gives
+	# online (complete entry). ARP-only devices (static IPs) show name "-".
+	awk -v LEASES=/tmp/dhcp.leases -v BR="$BR" '
+		function add(mac, ip, name, on) {
+			mac = tolower(mac)
+			if (mac !~ /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f]){5}$/) return
+			if (!(mac in seen)) { order[++n] = mac; seen[mac] = 1 }
+			if (!(mac in ipm) || ipm[mac] == "-") ipm[mac] = ip
+			if (!(mac in nm) || nm[mac] == "-") nm[mac] = name
+			if (on) onm[mac] = 1
+		}
+		BEGIN {
+			while ((getline line < LEASES) > 0) {
+				k = split(line, f, /[ \t]+/)
+				if (k >= 4) add(f[2], f[3], (f[4] == "*" ? "-" : f[4]), 0)
+			}
+			close(LEASES)
+			while ((getline line < "/proc/net/arp") > 0) {
+				k = split(line, f, /[ \t]+/)
+				# "IP address HW type Flags HW address Mask Device"; 0x2 = complete
+				if (k >= 6 && f[3] == "0x2" && f[6] == BR) add(f[4], f[1], "-", 1)
+			}
+			close("/proc/net/arp")
+			for (i = 1; i <= n; i++) {
+				mac = order[i]
+				printf "%s\t%s\t%s\t%d\n", mac,
+					(mac in ipm ? ipm[mac] : "-"), (mac in nm ? nm[mac] : "-"),
+					(mac in onm ? 1 : 0)
+			}
+		}'
+}
+
+cmd_help() {
+	cat <<EOF
+usage: wanguard <command> [args]
+  list                          members + drift status
+  add <mac> <group> [name]      register + apply
+  move <mac> <group>            change group + apply
+  remove <mac>                  unregister + apply
+  apply                         reconcile UCI -> nft + ip rules + routes (idempotent)
+  grouplist                     groups: type, iface, mark/table, device, members
+  devices                       LAN clients: mac, ip, name, online (board data)
+  groupadd <name> <iface|proxy> create group: direct on netifd iface, or proxy (mihomo, max 1)
+  groupset <name> <iface|proxy> change group target
+  groupdel <name>               delete an empty group
+  wanstatus                     WAN probe states + group home/current/mode (issue #6)
+  wanset <group> <iface>        pin group to iface manually (override; watchdog skips it)
+  wanauto <group>               resume watchdog auto failover/failback
+
+group names: [A-Za-z0-9_], <=15 chars. marks/tables are allocated
+automatically: proxy = 300/500 fixed; direct (sorted by name) =
+100,200,400,... / tables 400+ (see docs/ARCHITECTURE.md §2).
+EOF
+}
+
+# ---------- dispatch ----------
+
+case "$1" in
+	list)      cmd_list ;;
+	add)       shift; [ $# -ge 2 ] || err "usage: wanguard add <mac> <group> [name]"; cmd_add "$@" ;;
+	move)      shift; [ $# -ge 2 ] || err "usage: wanguard move <mac> <group>"; cmd_move "$@" ;;
+	remove)    shift; [ $# -ge 1 ] || err "usage: wanguard remove <mac>"; cmd_remove "$@" ;;
+	apply)     cmd_apply ;;
+	grouplist) cmd_grouplist ;;
+	devices)   cmd_devices ;;
+	groupadd)  shift; [ $# -ge 2 ] || err "usage: wanguard groupadd <name> <iface|proxy>"; cmd_groupadd "$@" ;;
+	groupset)  shift; [ $# -ge 2 ] || err "usage: wanguard groupset <name> <iface|proxy>"; cmd_groupset "$@" ;;
+	groupdel)  shift; [ $# -ge 1 ] || err "usage: wanguard groupdel <name>"; cmd_groupdel "$@" ;;
+	wanstatus) cmd_wanstatus ;;
+	wanset)    shift; [ $# -ge 2 ] || err "usage: wanguard wanset <group> <iface>"; cmd_wanset "$@" ;;
+	wanauto)   shift; [ $# -ge 1 ] || err "usage: wanguard wanauto <group>"; cmd_wanauto "$@" ;;
+	wand-tick) cmd_wand_tick ;;
+	""|help|-h|--help) cmd_help ;;
+	*) err "unknown command: $1 (try: wanguard help)" ;;
+esac
