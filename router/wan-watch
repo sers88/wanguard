@@ -1,0 +1,46 @@
+#!/bin/sh
+# wan-watch (issue #18): active health-check of the MAIN egress (pptp-vpn).
+# Group a/b failover is handled by `wanguard wand-tick` (issue #6). This
+# covers the remaining gap: tunnel UP but no internet behind the Freedom
+# exit (lcp-echo stays happy) — main-table traffic (mihomo dials +
+# unclassified) rides the dead path forever, as happened 2026-10-14.
+#
+# Probe: ping via pptp-vpn; T2 tried only if T1 fails. 3 consecutive failed
+# rounds => `ifup vpn` (bounce the tunnel). While it re-dials, main passively
+# falls back to wan2 (metric 100) and switches back on re-establish — no
+# route surgery, netifd-native. Cooldown limits churn if Freedom is long-dead.
+# DRYRUN=1 env logs the action without executing it (for testing).
+
+INTERVAL=10
+FAILS=3
+COOLDOWN=300
+T1=77.88.8.8
+T2=8.8.8.8
+
+fails=0
+down=0
+last_action=0
+
+while :; do
+	if ping -I pptp-vpn -c 1 -W 3 "$T1" >/dev/null 2>&1 \
+		|| ping -I pptp-vpn -c 1 -W 3 "$T2" >/dev/null 2>&1; then
+		[ "$down" = 1 ] && logger -t wan-watch "main egress recovered (pptp-vpn)"
+		down=0
+		fails=0
+	else
+		fails=$((fails + 1))
+		now=$(date +%s)
+		if [ "$fails" -ge "$FAILS" ] && [ $((now - last_action)) -ge "$COOLDOWN" ]; then
+			logger -t wan-watch "main egress dead (${fails} rounds via pptp-vpn) -> ifup vpn; main falls back to wan2"
+			if [ -n "$DRYRUN" ]; then
+				logger -t wan-watch "DRYRUN: ifup vpn skipped"
+			else
+				ifup vpn
+			fi
+			down=1
+			last_action=$now
+			fails=0
+		fi
+	fi
+	sleep "$INTERVAL"
+done

@@ -1,0 +1,139 @@
+# mihomo config — ШАБЛОН (реальный файл живёт на роутере: /etc/mihomo/config.yaml)
+# Секреты заменены плейсхолдерами. Политика: docs/SECRETS.md
+#
+# Этап 3 ВНЕДРЁН (issue #5): mihomo не трогает системную маршрутизацию вообще.
+# Отбор трафика группы C делает nftables (router/wanguard.nft) по source-MAC:
+#   TCP → redirect в redir-port :7892 (ниже)
+#   UDP/прочее → fwmark 300 → ip rule 8000 → table 500 → TUN "Meta"
+# TCP-в-TUN на этой коробке blackhole'ится (SYN умирает до TUN fd, ядро шлёт
+# клиенту RST — постмортем в issue #5), поэтому TCP идёт через redir-port —
+# тот же не-TUN вход, что и mixed-port.
+
+mixed-port: 7890
+redir-port: 7892   # сюда заворачивает TCP группы C nft chain wanguard/redirect_c
+allow-lan: true
+external-controller: 0.0.0.0:9090
+secret: "<DASHBOARD_SECRET>"
+external-ui: ui
+mode: rule
+ipv6: false          # v6-аплинка нет нигде (UL-RA Keenetic — не в счёт): без
+                     # безнадёжных v6-диалов в DIRECT (issue #15)
+log-level: error   # info/warning флуд съедает logread за минуты при сбое (issue #19)
+
+tun:
+  enable: true
+  stack: gvisor        # TUN теперь несёт только UDP группы C; gvisor — честный L3-стек
+  auto-route: false    # маршрутизацию в TUN делает ip rule fwmark 300 (wanguard)
+  auto-redirect: false # глобальный перехват запрещён — отбор per-MAC делает wanguard
+  dns-hijack:
+    - any:53
+  auto-detect-interface: true
+
+# Sniffer: домен из TLS SNI / QUIC для перехваченных соединений по голому IP
+sniffer:
+  enable: true
+  parse-pure-ip: true
+  override-destination: true
+  sniff:
+    TLS:
+      ports:
+        - 443
+        - 8443
+    QUIC:
+      ports:
+        - 443
+
+dns:
+  ipv6: false        # не отдавать клиентам AAAA — пустой ответ (issue #15)
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "+.<PROXY_PROVIDER_DOMAIN>"
+  nameserver:
+    - <PROVIDER_DNS_1>
+    - <PROVIDER_DNS_2>
+
+proxies:
+  - name: <PROXY_NAME>            # напр. fornex-ru16-am4
+    type: hysteria2
+    server: <PROXY_HOST>          # напр. cdn-xx-xxx-in-multi.provider.net
+    port: <PROXY_PORT>            # напр. 5443
+    password: <HYSTERIA2_PASSWORD>
+    obfs: salamander
+    obfs-password: <OBFS_PASSWORD>
+    skip-cert-verify: false
+
+rules:
+  # YouTube
+  - DOMAIN-SUFFIX,youtube.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,youtu.be,<PROXY_NAME>
+  - DOMAIN-SUFFIX,ytimg.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,googlevideo.com,<PROXY_NAME>
+  # OpenAI / ChatGPT / Gemini
+  - DOMAIN-SUFFIX,openai.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,chatgpt.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,oaistatic.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,oaiusercontent.com,<PROXY_NAME>
+  - DOMAIN,gemini.google.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,ai.google.dev,<PROXY_NAME>
+  # Discord
+  - DOMAIN-SUFFIX,discord.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,discord.gg,<PROXY_NAME>
+  - DOMAIN-SUFFIX,discordapp.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,discordapp.net,<PROXY_NAME>
+  - DOMAIN-SUFFIX,discord.media,<PROXY_NAME>
+  # Meta (Instagram / Facebook / WhatsApp)
+  - DOMAIN-SUFFIX,instagram.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,cdninstagram.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,facebook.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,fbcdn.net,<PROXY_NAME>
+  - DOMAIN-SUFFIX,whatsapp.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,whatsapp.net,<PROXY_NAME>
+  - DOMAIN-SUFFIX,wa.me,<PROXY_NAME>
+  # Telegram (десктоп/мобильные клиенты ходят по голым IP диапазонов DC,
+  # поэтому доменов недостаточно — добавлены CIDR датацентров)
+  - DOMAIN-SUFFIX,telegram.org,<PROXY_NAME>
+  - DOMAIN-SUFFIX,t.me,<PROXY_NAME>
+  - DOMAIN-SUFFIX,telegram.me,<PROXY_NAME>
+  - DOMAIN-SUFFIX,telegram.dog,<PROXY_NAME>
+  - DOMAIN-SUFFIX,telegra.ph,<PROXY_NAME>
+  - DOMAIN-SUFFIX,te.legra.ph,<PROXY_NAME>
+  - DOMAIN-SUFFIX,telesco.pe,<PROXY_NAME>
+  - DOMAIN-SUFFIX,tdesktop.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,cdn-telegram.org,<PROXY_NAME>
+  - IP-CIDR,91.108.4.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,91.108.8.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,91.108.12.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,91.108.16.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,91.108.20.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,91.108.56.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,149.154.160.0/20,<PROXY_NAME>,no-resolve
+  - IP-CIDR,95.161.64.0/20,<PROXY_NAME>,no-resolve
+  - IP-CIDR6,2001:67c:4e8::/48,<PROXY_NAME>,no-resolve
+  - IP-CIDR6,2001:b28:f23c::/48,<PROXY_NAME>,no-resolve
+  - IP-CIDR6,2001:b28:f23d::/48,<PROXY_NAME>,no-resolve
+  - IP-CIDR6,2001:b28:f23f::/48,<PROXY_NAME>,no-resolve
+  - IP-CIDR6,2a0a:f280::/32,<PROXY_NAME>,no-resolve
+  # LinkedIn
+  - DOMAIN-SUFFIX,linkedin.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,licdn.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,lnkd.in,<PROXY_NAME>
+  # Пользовательские добавки
+  # KinoPub: cdn-service.space/srvkp.com (DPI-глотали на DIRECT), staticpop.net,
+  # kino.pub — добавлены на живом роутере при починке Dune, синхронизированы сюда
+  - DOMAIN-SUFFIX,kino.watch,<PROXY_NAME>
+  - DOMAIN-SUFFIX,cdn-service.space,<PROXY_NAME>
+  - DOMAIN-SUFFIX,srvkp.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,staticpop.net,<PROXY_NAME>
+  - DOMAIN-SUFFIX,kino.pub,<PROXY_NAME>
+  # 18+
+  - DOMAIN-SUFFIX,pornhub.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,phncdn.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,redgifs.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,warera.io,<PROXY_NAME>
+  - DOMAIN-SUFFIX,ourdream.ai,<PROXY_NAME>
+  # Всё остальное — напрямую (через default WAN)
+  - MATCH,DIRECT

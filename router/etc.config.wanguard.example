@@ -13,7 +13,7 @@ config globals 'globals'
 	option redir_port '7892'
 	# никогда не маркировать/не редиректить трафик к этим адресам
 	# (админ-каналы, API оператора — переживут даже маркированное окно)
-	list no_mark '203.0.113.10'
+	list no_mark '172.65.90.21'
 
 config group 'a'
 	option type 'direct'
@@ -26,14 +26,14 @@ config group 'b'
 config group 'c'
 	option type 'proxy'
 
-config member 'm_001122334455'
-	option name 'laptop'
-	option mac '00:11:22:33:44:55'
+config member 'm_d8bbc1cc1771'
+	option name 'work-pc-eth'
+	option mac 'd8:bb:c1:cc:17:71'
 	option group 'c'
 
-config member 'm_001122334456'
-	option name 'laptop-wifi'
-	option mac '00:11:22:33:44:56'
+config member 'm_701ab828ac03'
+	option name 'work-pc-wifi'
+	option mac '70:1a:b8:28:ac:03'
 	option group 'c'
 
 # Легаси (этап #4/#7, до #13): секция config wan 'wan' больше не используется

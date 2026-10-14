@@ -10,7 +10,7 @@
 | dnsmasq | DHCP всех клиентов (+ статические lease для удобства имён) |
 | wanguard (CLI) | управление членством в группах (`/etc/config/wanguard` → nft) |
 | luci-app-wanguard | веб-морда над тем же UCI (этап 5) |
-| Mesh-точки доступа | L2-мост, без NAT/DHCP |
+| Keenetic mesh | точки доступа, L2-мост, без NAT/DHCP |
 
 ## 2. Маршрутизация: именованные группы × произвольные интерфейсы (issue #13)
 
@@ -53,8 +53,8 @@ table inet wanguard {                       # скелет (wanguard.nft)
 Без него маркированному клиенту ломается трафик к самому роутеру (dnsmasq
 DNS, DHCP-продления, SSH, LuCI): пакеты уходят в TUN вместо локальной
 доставки → «полностью пропал интернет». Постмортем — комментарии в issue #5.
-`no_mark` — оперативные исключения по IP (напр., служебный хост на время
-экспериментов), наполняется из UCI `globals.no_mark`.
+`no_mark` — оперативные исключения по IP (напр., API агента-оператора на
+время экспериментов), наполняется из UCI `globals.no_mark`.
 
 **fw4-зона для TUN обязательна.** Интерфейс `Meta` не входит ни в одну зону
 OpenWrt firewall: базовая цепочка `forward` fw4 имеет `policy drop`, а
@@ -119,7 +119,7 @@ main:      default …                          # все «немаркиров�
 ставил ip rules 9000–9002 и забирал ВЕСЬ форвардный трафик. Для multi-WAN это
 не годилось: группы A/B не выпустить мимо прокси.
 
-Текущее состояние (ключевой фрагмент конфига mihomo):
+Текущее состояние (см. `config/mihomo/config.yaml.example`):
 
 ```yaml
 mixed-port: 7890      # ручной HTTP/SOCKS-прокси (отладка, явные случаи)
@@ -186,7 +186,7 @@ tun:
 ```
 config globals 'globals'
         option redir_port '7892'      # TCP-redirect mihomo (proxy-группа)
-        list no_mark '203.0.113.10'   # никогда не маркировать/не редиректить
+        list no_mark '172.65.90.21'   # никогда не маркировать/не редиректить
 
 config group 'a'                      # имя = [A-Za-z0-9_], им ссылаются члены
         option type 'direct'          # direct → netifd-интерфейс
@@ -195,9 +195,9 @@ config group 'a'                      # имя = [A-Za-z0-9_], им ссылаю
 config group 'c'
         option type 'proxy'           # proxy → mihomo (макс. 1 группа)
 
-config member 'm_001122334455'        # секция = m_<mac-без-двоеточий>
-        option name 'laptop'
-        option mac '00:11:22:33:44:55'
+config member 'm_d8bbc1cc1771'        # секция = m_<mac-без-двоеточий>
+        option name 'work-pc-eth'
+        option mac 'd8:bb:c1:cc:17:71'
         option group 'c'
 ```
 
@@ -255,9 +255,9 @@ wanguard groupdel <имя>                 удалить пустую груп�
   статические IP; ACL не расширялся — роутер-сайд данных нет). Файлы:
   `luci-app-wanguard/` (view + menu.d + acl.d), установка —
   `scripts/deploy-luci.ps1` (чистит кэши LuCI, рестартует rpcd).
-- Откат любого изменения: снапшот до деплоя `deploy-wanguard.ps1` кладёт в
-  `/root/rollback/<дата>/` (файлы + ruleset + ip rule + маршруты) —
-  восстановление = возврат файлов из снапшота + рестарт сервиса.
+- Откат #13: снапшот до деплоя `deploy-wanguard.ps1` кладёт в
+  `/root/rollback/<дата>/` (файлы + ruleset + ip rule + маршруты);
+  процедура — PLAN.md этап 8.
 
 ## 6. MTU/MSS
 
