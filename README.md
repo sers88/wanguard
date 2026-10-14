@@ -3,107 +3,109 @@
 **Per-device WAN routing for OpenWrt** — named groups of LAN clients (by MAC),
 each group pinned to any WAN interface (direct) or to a mihomo proxy, with a
 LuCI kanban board and an idempotent generator that renders the whole data plane
-from a single UCI config.
+from a single UCI config. Move client devices between WAN uplinks: named
+MAC-address groups, each bound to its own netifd interface (direct) or routed
+through mihomo (proxy, single). Everything is managed from
+`/etc/config/wanguard`.
 
-Перевод клиентских устройств домашней сети между WAN-каналами: именованные
-группы по MAC-адресам, каждая группа — на свой netifd-интерфейс (direct) или
-через mihomo (proxy, одна). Всё управляется из `/etc/config/wanguard`.
-
-## Как это работает
+## How it works
 
 ```
-/etc/config/wanguard  (UCI — единственный источник правды)
-        │  wanguard apply   ← идемпотентный дифф, без flush-окон
+/etc/config/wanguard  (UCI — the single source of truth)
+        │  wanguard apply   ← idempotent diff, no flush windows
         ▼
-nft sets mac_<group> + marking/redirect rules (теги wg:<группа>:…)
-ip rules (fwmark → таблица)
-per-group routing tables: default dev <iface> + запасной default metric 200
+nft sets mac_<group> + marking/redirect rules (tags wg:<group>:…)
+ip rules (fwmark → table)
+per-group routing tables: default dev <iface> + backup default metric 200
 ```
 
-- **Аллокация детерминирована**: proxy → fwmark 300/table 500; direct-группы
-  по алфавиту → 100, 200, 400… / таблицы 400+ (300 пропущен под mihomo).
-- **Самолечение**: keepalive перезапускает `apply` раз в 10с — членство
-  переживает рестарты mihomo, чистки nft и полный reboot.
-- **Fail-safe по построению**: клиент вне наборов → main-таблица; упавший
-  интерфейс группы → запасной маршрут; ничего не блокирует интернет целиком.
-- **Браузер не трогает nft**: LuCI правит UCI и вызывает `wanguard apply`.
+- **Deterministic allocation**: proxy → fwmark 300/table 500; direct groups
+  alphabetically → 100, 200, 400… / tables 400+ (300 is reserved for mihomo).
+- **Self-healing**: keepalive reruns `apply` every 10s — membership survives
+  mihomo restarts, nft flushes, and a full reboot.
+- **Fail-safe by construction**: a client outside the sets → main table; a
+  group's dead interface → fallback route; nothing can take the whole
+  internet down.
+- **The browser never touches nft**: LuCI edits UCI and calls `wanguard apply`.
 
-Подробно — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (аллокация, теги,
-постмортемы инцидентов, порядок загрузки).
+Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (allocation, tags,
+incident post-mortems, boot order).
 
-## LuCI: канбан-доска
+## LuCI: kanban board
 
-**Сеть → WAN Guard** — колонки = группы + Unclassified, карточки = клиенты
-(имя/MAC/IP/онлайн). Перенос устройства — drag & drop, применение мгновенное;
-тап по карточке = меню «Move to» (тач-фолбэк). DRIFT переводит доску в
-read-only, пока keepalive не синхронизирует состояние. Табличный вид остаётся
-для массовых правок.
+**Network → WAN Guard** — columns = groups + Unclassified, cards = clients
+(name/MAC/IP/online). Drag & drop moves a device, applied instantly; tapping a
+card opens a "Move to" menu (touch fallback). DRIFT switches the board to
+read-only until keepalive re-syncs the state. A table view remains for bulk
+edits.
 
-## Установка
+## Installation
 
-### Через подписанный apk-фид (штатный путь)
+### Via the signed apk feed (the standard way)
 
-Фид публикуется CI в ветку [`feed`](https://github.com/sers88/wanguard/tree/feed)
-при пуше тега `vX.Y.Z` (пакеты получают версию `X.Y.Z-r1`). Индекс
-`packages.adb` подписан EC-ключом; публичный ключ — [`keys/wanguard.pem`](keys/wanguard.pem).
+The feed is published by CI to the
+[`feed`](https://github.com/sers88/wanguard/tree/feed) branch on a `vX.Y.Z`
+tag push (packages get version `X.Y.Z-r1`). The `packages.adb` index is signed
+with an EC key; the public key is [`keys/wanguard.pem`](keys/wanguard.pem).
 
-На роутере (OpenWrt 24.10+/25.x, apk 3.0.x):
+On the router (OpenWrt 24.10+/25.x, apk 3.0.x):
 
 ```sh
-# 1. доверие ключу фида
+# 1. trust the feed key
 curl -o /etc/apk/keys/wanguard.pem \
   https://raw.githubusercontent.com/sers88/wanguard/feed/keys/wanguard.pem
 
-# 2. подключить фид
+# 2. add the feed
 echo "https://raw.githubusercontent.com/sers88/wanguard/feed/packages/x86_64/packages.adb" \
   >> /etc/apk/repositories.d/customfeeds.list
 
-# 3. установить
+# 3. install
 apk update
 apk add wanguard luci-app-wanguard
 
-# 4. конфиг (только если ещё нет — apk никогда не трогает живой UCI)
+# 4. config (only if absent yet — apk never touches live UCI)
 cp /usr/share/wanguard/etc.config.wanguard.example /etc/config/wanguard
 
-# 5. сервисы
+# 5. services
 /etc/init.d/wanguard enable && /etc/init.d/wanguard start
-/etc/init.d/wan-watch enable && /etc/init.d/wan-watch start   # опционально
+/etc/init.d/wan-watch enable && /etc/init.d/wan-watch start   # optional
 ```
 
-Обновление: `apk update && apk upgrade`. Файлы, переживающие sysupgrade,
-добавить в `/etc/sysupgrade.conf` (`/usr/bin/wanguard*`, `/usr/share/wanguard/`,
-`/etc/init.d/wanguard`, `/etc/init.d/wan-watch`).
+Updates: `apk update && apk upgrade`. For files that must survive a sysupgrade,
+add them to `/etc/sysupgrade.conf` (`/usr/bin/wanguard*`,
+`/usr/share/wanguard/`, `/etc/init.d/wanguard`, `/etc/init.d/wan-watch`).
 
-### Деплой-скрипты (разработка)
+### Deploy scripts (development)
 
-Нужен ssh-доступ с ключом:
+Requires ssh key access to the router:
 
 ```powershell
-powershell .\scripts\deploy-wanguard.ps1    # CLI + keepalive + init.d + nft-скелет
-powershell .\scripts\deploy-luci.ps1        # LuCI-приложение
+powershell .\scripts\deploy-wanguard.ps1    # CLI + keepalive + init.d + nft skeleton
+powershell .\scripts\deploy-luci.ps1        # LuCI app
 ```
 
-## Состав репозитория
+## Repository layout
 
-| Путь | Что это |
+| Path | What it is |
 |---|---|
 | `router/wanguard` | CLI: list/devices/add/move/remove/group*/apply |
-| `router/wanguard-keepalive` | procd-демон: apply каждые 10с |
-| `router/wan-watch` | health-check main-пути (pptp), `ifup vpn` при смерти (#18) |
-| `router/init.d/wanguard` | init-скрипт (apply при загрузке) |
-| `router/init.d/wan-watch` | init-скрипт health-check'а |
-| `router/wanguard.nft` | скелет nft-таблицы |
-| `router/etc.config.wanguard.example` | шаблон UCI |
-| `router/wanguard-testmark` | отладка: временная маркировка MAC |
+| `router/wanguard-keepalive` | procd daemon: apply every 10s |
+| `router/wan-watch` | main-path (pptp) health check, `ifup vpn` on death (#18) |
+| `router/init.d/wanguard` | init script (apply at boot) |
+| `router/init.d/wan-watch` | health-check init script |
+| `router/wanguard.nft` | nft table skeleton |
+| `router/etc.config.wanguard.example` | UCI template |
+| `router/wanguard-testmark` | debug: temporary MAC marking |
 | `luci-app-wanguard/` | view + menu.d + acl.d |
-| `apk/build.sh` | сборка apk-пакетов (wanguard + luci-app-wanguard) |
-| `keys/wanguard.pem` | публичный ключ подписи фида |
-| `scripts/deploy-*.ps1` | деплой на роутер по scp/ssh (разработка) |
+| `apk/build.sh` | apk package build (wanguard + luci-app-wanguard) |
+| `keys/wanguard.pem` | feed signing public key |
+| `scripts/deploy-*.ps1` | scp/ssh deploy to the router (development) |
 
-## Требования
+## Requirements
 
-- OpenWrt с apk (24.10+/25.x), nftables (fw4), bash-free busybox sh
-- Для proxy-группы: mihomo с `redir-port` + TUN (fw4-зона для TUN обязательна)
+- OpenWrt with apk (24.10+/25.x), nftables (fw4), bash-free busybox sh
+- For the proxy group: mihomo with `redir-port` + TUN (a fw4 zone for TUN is
+  mandatory)
 
 ## License
 
