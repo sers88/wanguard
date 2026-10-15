@@ -23,6 +23,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# UTF-8 end-to-end: the example (and the remote config head) carry Cyrillic
+# comments; PS 5.1 defaults (ANSI file read, OEM console decode of native
+# output) mangle them on the way to the router config. WriteAllText (below)
+# already writes UTF-8 without BOM — do not pass an Encoding there, the
+# Encoding.UTF8 property would emit a BOM that upsets YAML parsers.
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 if (-not $Example) { $Example = Join-Path $PSScriptRoot "..\config\mihomo\config.yaml.example" }
 $SshOpts = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new")
 $RemoteCfg = "/etc/mihomo/config.yaml"
@@ -40,7 +46,7 @@ Write-Host "==> example: $Example"
 if (-not (Test-Path $Example)) { throw "example not found: $Example" }
 
 # --- 1. extract rules: section from the example (must be the last section) ---
-$lines = Get-Content $Example
+$lines = Get-Content $Example -Encoding UTF8
 $ruleStart = ($lines | Select-String -Pattern '^rules:' | Select-Object -First 1).LineNumber
 if (-not $ruleStart) { throw "no 'rules:' section in $Example" }
 $rulesLines = $lines[($ruleStart - 1) .. ($lines.Count - 1)]
