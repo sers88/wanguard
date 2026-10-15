@@ -1,15 +1,15 @@
 #!/bin/sh
 # wan-watch (issue #18): active health-check of the MAIN egress (pptp-vpn).
 # Group a/b failover is handled by `wanguard wand-tick` (issue #6). This
-# covers the remaining gap: tunnel UP but no internet behind the Freedom
-# exit (lcp-echo stays happy) — main-table traffic (mihomo dials +
+# covers the remaining gap: tunnel UP but no internet behind the primary
+# ISP's exit (lcp-echo stays happy) — main-table traffic (mihomo dials +
 # unclassified) rides the dead path forever, as happened 2026-10-14.
 #
 # Probe: ping via pptp-vpn; T2 tried only if T1 fails. 3 consecutive failed
 # rounds => `ifup vpn` (bounce the tunnel). While it re-dials, main passively
 # falls back to wan2 (metric 100) and switches back on re-establish — no
-# route surgery, netifd-native. Cooldown limits churn if Freedom is long-dead.
-# DRYRUN=1 env logs the action without executing it (for testing).
+# route surgery, netifd-native. Cooldown limits churn if the transit is
+# long-dead. DRYRUN=1 env logs the action without executing it (for testing).
 
 INTERVAL=10
 FAILS=3

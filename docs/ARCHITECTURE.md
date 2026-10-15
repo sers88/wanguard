@@ -1,286 +1,291 @@
-# Архитектура wanguard
+# wanguard architecture
 
-## 1. Компоненты
+## 1. Components
 
-| Компонент | Роль |
+| Component | Role |
 |---|---|
-| netifd / `ip rule` | policy routing: выбор таблицы по fwmark |
-| nftables (`table inet wanguard`) | маркировка пакетов по source-MAC |
-| mihomo | перехват группы C (TUN), whitelist → Hysteria2, остальное → DIRECT |
-| dnsmasq | DHCP всех клиентов (+ статические lease для удобства имён) |
-| wanguard (CLI) | управление членством в группах (`/etc/config/wanguard` → nft) |
-| luci-app-wanguard | веб-морда над тем же UCI (этап 5) |
-| wan-watch | health-check main-egress (pptp-vpn): 3 rounds dead → `ifup vpn`,
-  пока туннель переустанавливается, main пассивно уезжает на wan2 (metric 100);
-  cooldown 300 с; DRYRUN=1 для теста (issue #18) |
-| Keenetic mesh | точки доступа, L2-мост, без NAT/DHCP |
+| netifd / `ip rule` | policy routing: table selection by fwmark |
+| nftables (`table inet wanguard`) | per-source-MAC packet marking |
+| mihomo | proxy-group interception (TUN), whitelist → Hysteria2, rest → DIRECT |
+| dnsmasq | DHCP for all clients (+ static leases for stable naming) |
+| wanguard (CLI) | group membership management (`/etc/config/wanguard` → nft) |
+| luci-app-wanguard | web UI over the same UCI |
+| wan-watch | main-egress (pptp-vpn) health check: 3 dead rounds → `ifup vpn`;
+  while the tunnel re-dials, main passively rides wan2 (metric 100);
+  300 s cooldown; `DRYRUN=1` for testing |
+| AP mesh | wireless access points, L2 bridge only, no NAT/DHCP |
 
-## 2. Маршрутизация: именованные группы × произвольные интерфейсы (issue #13)
+## 2. Routing: named groups × arbitrary interfaces (issue #13)
 
-Отбор по source-MAC делает nftables. `/usr/share/wanguard/wanguard.nft` —
-только **скелет**: таблица, статические наборы и пустые цепочки. Всё
-остальное — наборы `mac_<группа>`, правила маркировки/redirect, ip rules,
-таблицы маршрутизации и запасные маршруты — генерирует **`wanguard apply`**
-из `/etc/config/wanguard` (идемпотентный дифф, без flush-окон).
+Source-MAC selection is done by nftables. `/usr/share/wanguard/wanguard.nft`
+is only the **skeleton**: the table, static sets and empty chains. Everything
+else — the `mac_<group>` sets, marking/redirect rules, ip rules, routing
+tables and fallback routes — is rendered by **`wanguard apply`** from
+`/etc/config/wanguard` (idempotent diff, no flush windows).
 
 ```
-table inet wanguard {                       # скелет (wanguard.nft)
-    set local_v4 { … }    # локальные/мультикаст/броадкаст — ИМЕНОВАННЫЙ набор
-    set no_mark  { … }    # админ-исключения (из UCI globals.no_mark)
-    chain marking  { type filter hook prerouting priority -150; … }   # пустая
-    chain redirect { type filter hook prerouting priority -100; … }   # пустая
+table inet wanguard {                       # skeleton (wanguard.nft)
+    set local_v4 { … }    # local/multicast/broadcast — a NAMED set
+    set no_mark  { … }    # admin exclusions (from UCI globals.no_mark)
+    chain marking  { type filter hook prerouting priority -150; … }   # empty
+    chain redirect { type filter hook prerouting priority -100; … }   # empty
 }
 ```
 
-**Почему именованный set вместо `define`**: `define` раскрывается только
-внутри `nft -f`-файла; динамически добавляемые правила (`nft add rule`)
-его не видят. Семантика та же, генератор пишет `ip daddr != @local_v4`.
+**Why a named set instead of `define`**: a `define` is only expanded inside
+`nft -f` files; dynamically added rules (`nft add rule`) never see it. The
+semantics are the same — the generator emits `ip daddr != @local_v4`.
 
-Каждое сгенерированное правило несёт тег-комментарий
-`wg:<группа>:m<mark>` (marking) / `wg:<группа>:r<порт>` (redirect) — тег
-полностью определяет тело правила, поэтому дифф сверяет только теги и
-не зависит от нормализации вывода nft (метки как 0x… и т.п.).
+Every generated rule carries a tag-comment `wg:<group>:m<mark>` (marking) /
+`wg:<group>:r<port>` (redirect). The tag fully identifies the rule body, so
+the diff compares tags only and does not depend on nft output normalization
+(marks rendered as 0x… etc.).
 
-**Аллокация mark/table/prio** — детерминирована сортировкой имён групп
-(UBI: `config group '<имя>'`, тип direct|proxy):
+**Mark/table/prio allocation** is deterministic, driven by sorting group
+names (`config group '<name>'`, type direct|proxy):
 
-| Тип | fwmark | table | ip rule prio |
+| Type | fwmark | table | ip rule prio |
 |---|---|---|---|
-| `proxy` (макс. 1 — redir-port и TUN mihomo синглтоны) | **300** | **500** | 8000 |
-| `direct`, по алфавиту: 1-я, 2-я, 3-я… | 100, 200, 400, 500… (300 пропущен) | 400, 401, 402… (≤99 групп) | 8100, 8101, 8102… |
+| `proxy` (max 1 — mihomo redir-port and TUN are singletons) | **300** | **500** | 8000 |
+| `direct`, alphabetically: 1st, 2nd, 3rd… | 100, 200, 400, 500… (300 skipped) | 400, 401, 402… (≤99 groups) | 8100, 8101, 8102… |
 
-Миграция с прежней схемы (a=100/400, b=200/401, c=300/500) — нулевая:
-сегодняшние метки воспроизводятся генератором как частный случай.
+Migration from the legacy scheme (a=100/400, b=200/401, c=300/500) is
+zero-cost: today's marks are reproduced by the generator as a special case.
 
-**Исключение LOCAL_V4 обязательно** (теперь набор `@local_v4` в скелете).
-Без него маркированному клиенту ломается трафик к самому роутеру (dnsmasq
-DNS, DHCP-продления, SSH, LuCI): пакеты уходят в TUN вместо локальной
-доставки → «полностью пропал интернет». Постмортем — комментарии в issue #5.
-`no_mark` — оперативные исключения по IP (напр., API агента-оператора на
-время экспериментов), наполняется из UCI `globals.no_mark`.
+**The LOCAL_V4 exclusion is mandatory** (now the `@local_v4` set in the
+skeleton). Without it, a marked client's traffic to the router itself breaks
+(dnsmasq DNS, DHCP renewal, SSH, LuCI): packets go into the TUN instead of
+local delivery → "internet completely gone". Post-mortem in the issue #5
+discussion. `no_mark` holds operational per-IP exceptions (e.g. admin or
+management hosts during experiments), populated from UCI `globals.no_mark`.
 
-**fw4-зона для TUN обязательна.** Интерфейс `Meta` не входит ни в одну зону
-OpenWrt firewall: базовая цепочка `forward` fw4 имеет `policy drop`, а
-`forward_lan` знает только `accept_to_wan`/`accept_to_lan`. Без зоны ВЕСЬ
-форвардный UDP группы C (br-lan→Meta) режется с ICMP port-unreachable:
-LoL виснет на загрузке матча (UDP 5000-5500/7100-7300 к Riot),
-tailscale живёт на DERP-relay вместо direct, QUIC мёртв. TCP это не
-затрагивало — он DNAT'ится в `redir-port :7892` и идёт через INPUT, поэтому
-дефект не проявлялся на приёмке (все тесты были TCP-only). Постмортем
-LoL-инцидента 2026-10-07: ноль пакетов на Meta при живом TCP + ICMP-шторм
-на br-lan. Фикс: fw4-зона `proxy` (device Meta, input ACCEPT, forward
-REJECT) + forwarding `lan→proxy`; зона ссылается на устройство по имени —
-переживает пересоздание `Meta` при рестартах mihomo. Бэкап конфига firewall
-до фикса на роутере: `/etc/config/firewall.bak-lol-20261007`.
+**A fw4 zone for the TUN is mandatory.** The `Meta` interface belongs to no
+OpenWrt firewall zone: fw4's base `forward` chain has `policy drop`, and
+`forward_lan` only knows `accept_to_wan`/`accept_to_lan`. Without the zone,
+ALL forwarded UDP of the proxy group (br-lan→Meta) is rejected with ICMP
+port-unreachable: an online game hangs at matchmaking (its UDP ranges
+5000-5500/7100-7300), peer-to-peer VPN apps fall back to relays instead of
+direct connections, QUIC dies. TCP was unaffected — it is DNAT'ed into
+`redir-port :7892` and traverses INPUT, which is why the defect never showed
+during acceptance (all tests were TCP-only). Post-mortem of the 2026-10-07
+game-traffic incident: zero packets on Meta while TCP was alive + an ICMP
+storm on br-lan. Fix: fw4 zone `proxy` (device Meta, input ACCEPT, forward
+REJECT) + forwarding `lan→proxy`; the zone references the device by name, so
+it survives `Meta` being recreated on mihomo restarts. A firewall config
+backup from before the fix lives on the router (`firewall.bak-<date>`).
 
-Развязка меток на таблицы и запасные маршруты — тоже генерируются
-(`wanguard apply`), UCI `/etc/config/network` больше не нужен для этого
-(legacy-секции `config rule`/`route` удаляются вручную после приёмки #13 —
-до тех пор сосуществуют безвредно: apply ставит идентичные правила):
-
-```
-ip rule: prio 8000: fwmark 300 lookup 500     # proxy-группа → mihomo
-         prio 8100+: fwmark 100/200/… lookup 400/401/…   # direct-группы
-```
-
-Таблицы (по одной на группу, генерируются):
+Mark→table decoupling and fallback routes are generated too (`wanguard
+apply`); UCI `/etc/config/network` is no longer needed for this (legacy
+`config rule`/`route` sections are removed manually after #13 acceptance —
+until then they coexist harmlessly: apply installs identical rules):
 
 ```
-table 500: default dev Meta scope link        # proxy → mihomo (UDP), когда TUN жив
-table 400+: default dev <l3_device группы>    # direct → свой интерфейс
-каждая:    default <main-default> metric 200  # запас: цель недоступна → напрямую
-main:      default …                          # все «немаркированные» + сам роутер
+ip rule: prio 8000: fwmark 300 lookup 500     # proxy group → mihomo
+         prio 8100+: fwmark 100/200/… lookup 400/401/…   # direct groups
 ```
 
-**Data plane proxy-группы (итоговый, рабочий):**
-- **TCP** → nft redirect → mihomo `redir-port: 7892` (тот же класс входа, что и
-  mixed-port — доказанно рабочий). Сниффер достаёт SNI, доменные правила и
-  IP-CIDR Telegram работают как обычно. TCP НЕ маркируется (см. правило
-  `meta l4proto != tcp` в marking): после DNAT-to-local маркированный пакет
-  ушёл бы policy-route в TUN (постмортем issue #5).
-- **UDP/прочее** → fwmark 300 → table 500 → TUN `Meta` (форвард br-lan→Meta
-  разрешает fw4-зона `proxy` — обязательна, см. выше; без неё UDP группы
-  режется в `handle_reject`).
-- TCP-в-TUN на этой коробке НЕ работает: SYN проходит forward с oif Meta, но
-  до TUN fd не доезжает, ядро отвечает клиенту RST. Диагностировано двойным
-  tcpdump + nft trace (постмортем issue #5). Поэтому TCP — через redirect.
+Tables (one per group, generated):
 
-**Отказобезопасность по построению:**
-- MAC не в наборах → main → интернет есть.
-- nft-таблица снесена → ни меток, ни redirect → main → интернет есть
-  (keepalive пересоздаёт из скелета ≤10с).
-- Интерфейс direct-группы упал → маршрут не встаёт/пропадает → пакеты группы
-  падают на `metric 200` (main-default) → интернет есть; при возврате
-  интерфейса keepalive доустановит маршрут.
-- mihomo остановлен → redirect теряет слушателя: TCP proxy-группы получает RST
-  (fail-close, быстро заметно); UDP падает на `metric 200` → напрямую.
-  TODO: при желании fail-open для TCP — отдельное решение (см. issue #5).
+```
+table 500: default dev Meta scope link        # proxy → mihomo (UDP), when TUN is alive
+table 400+: default dev <group l3_device>     # direct → its own interface
+each:       default <main-default> metric 200 # fallback: target unreachable → directly
+main:       default …                         # all "unmarked" + the router itself
+```
 
-## 3. mihomo: ручной перехват (внедрено)
+**Proxy group data plane (final, working):**
+- **TCP** → nft redirect → mihomo `redir-port: 7892` (the same ingress class
+  as mixed-port — proven to work). The sniffer extracts SNI, so domain rules
+  and Telegram IP-CIDRs work as usual. TCP is NOT marked (see the
+  `meta l4proto != tcp` rule in marking): after DNAT-to-local a marked packet
+  would policy-route into the TUN (post-mortem in issue #5).
+- **UDP/rest** → fwmark 300 → table 500 → TUN `Meta` (forward br-lan→Meta is
+  permitted by the fw4 zone `proxy` — mandatory, see above; without it the
+  group's UDP dies in `handle_reject`).
+- TCP-into-TUN does NOT work on this box: SYN passes forward with oif Meta
+  but never reaches the TUN fd, the kernel RSTs the client. Diagnosed with
+  double tcpdump + nft trace (post-mortem in issue #5). Hence TCP via
+  redirect.
 
-Раньше (этап 0): `tun.auto-route: true`, `tun.auto-redirect: true` — mihomo сам
-ставил ip rules 9000–9002 и забирал ВЕСЬ форвардный трафик. Для multi-WAN это
-не годилось: группы A/B не выпустить мимо прокси.
+**Fail-safety by construction:**
+- MAC not in any set → main → internet works.
+- nft table wiped → no marks, no redirect → main → internet works
+  (keepalive rebuilds from the skeleton in ≤10 s).
+- A direct group's interface dies → its route is missing → the group's
+  packets fall to `metric 200` (main-default) → internet works; when the
+  interface returns, keepalive reinstalls the route.
+- mihomo stopped → redirect has no listener: proxy-group TCP gets RST
+  (fail-close, immediately visible); UDP falls to `metric 200` → direct.
+  TODO: fail-open for TCP, if ever wanted — a separate decision (issue #5).
 
-Текущее состояние (см. `config/mihomo/config.yaml.example`):
+## 3. mihomo: manual interception (implemented)
+
+Stage 0 (obsolete): `tun.auto-route: true`, `tun.auto-redirect: true` —
+mihomo installed ip rules 9000–9002 itself and captured ALL forwarded
+traffic. Not viable for multi-WAN: direct groups can't bypass the proxy.
+
+Current state (see `config/mihomo/config.yaml.example`):
 
 ```yaml
-mixed-port: 7890      # ручной HTTP/SOCKS-прокси (отладка, явные случаи)
-redir-port: 7892      # сюда nft-redirect proxy-группы заворачивает TCP
+mixed-port: 7890      # manual HTTP/SOCKS proxy (debugging, special cases)
+redir-port: 7892      # nft redirect of the proxy group lands here
 tun:
   enable: true
   stack: gvisor
-  auto-route: false        # маршрутизацию делает ip rule fwmark 300 (wanguard)
-  auto-redirect: false     # глобальный перехват запрещён
-  auto-detect-interface: true   # исходящие самого mihomo — в default WAN
+  auto-route: false        # routing is done by ip rule fwmark 300 (wanguard)
+  auto-redirect: false     # global interception forbidden
+  auto-detect-interface: true   # mihomo's own egress follows the default WAN
 ```
 
-Нюансы:
-- DIRECT-трафик mihomo ре-ориджинит от себя — исходный IP клиента на выходе
-  не сохранить ⇒ выбор WAN «по клиенту» возможен только в ядре ДО mihomo.
-  Это и есть причина всей fwmark-схемы.
-- `Meta` пересоздаётся при каждом рестарте mihomo ⇒ маршрут `default dev Meta`
-  в таблице 500 перевставляет цикл **`wanguard-keepalive`** (procd-сервис
-  `wanguard`, START=99): раз в 10с вызывает `wanguard apply`, который
-  восстанавливает всё — nft-таблицу из скелета, наборы, правила, ip rules и
-  маршруты. Проверено: после `/etc/init.d/mihomo restart` маршрут возвращается сам.
-- После рестарта mihomo Hysteria2-туннель поднимается не мгновенно. Первые
-  ~1–2 минуты соединения через прокси отбрасываются: в logread сыпется
-  `dial ... error: authentication failed, status code: 404`, клиенты видят
-  обрывы TLS. Само восстанавливается. **Прежде чем тестировать или
-  диагностировать — выждать пару минут**, иначе легко принять прогрев за поломку.
-- DNS: клиенты ходят в dnsmasq роутера (исключён LOCAL_V4) и получают
-  **реальные IP** — это by design: домен достаёт сниффер из TLS SNI/QUIC,
-  Telegram ловится по IP-CIDR. Минус: возможен DNS-poisoning провайдера для
-  блокируемых доменов — тогда спасают только доменные правила по SNI
-  (для HTTPS достаточно). Клиент с жёстко прописанным внешним DNS (8.8.8.8)
-  попадает в TUN → `dns-hijack any:53` перехватит.
-- mihomo API (`:9090`) живёт без секрета; конфиг применять **рестартом**
-  (`/etc/init.d/mihomo restart`), не PUT /configs (даёт 400).
+Nuances:
+- mihomo's DIRECT traffic is re-originated from itself — the client's source
+  IP cannot be preserved ⇒ per-client WAN selection is only possible in the
+  kernel BEFORE mihomo. That is the whole reason for the fwmark scheme.
+- `Meta` is recreated on every mihomo restart ⇒ the `default dev Meta` route
+  in table 500 is reinstated by the `wanguard-keepalive` loop (procd service
+  `wanguard`, START=99): every 10 s it runs `wanguard apply`, which restores
+  everything — the nft table from the skeleton, sets, rules, ip rules and
+  routes. Verified: after `/etc/init.d/mihomo restart` the route comes back
+  on its own.
+- After a mihomo restart the Hysteria2 tunnel does not come up instantly.
+  For the first ~1–2 minutes proxied connections are dropped: logread fills
+  with `dial ... error: authentication failed, status code: 404`, clients
+  see TLS breaks. It heals by itself. **Wait a couple of minutes before
+  testing or diagnosing** — otherwise warmup is easy to mistake for breakage.
+- DNS: clients query the router's dnsmasq (excluded via LOCAL_V4) and get
+  **real IPs** — by design: the sniffer gets the domain from TLS SNI/QUIC,
+  Telegram is caught by IP-CIDR. Downside: the ISP can poison DNS for
+  blocked domains — then only SNI-based domain rules help (enough for
+  HTTPS). A client with a hardcoded external DNS (8.8.8.8) lands in the TUN
+  → `dns-hijack any:53` catches it.
+- The mihomo API (`:9090`) runs without a secret; apply config changes by
+  **restarting** the service (`/etc/init.d/mihomo restart`), not PUT /configs
+  (it returns 400).
 
-## 4. Порядок загрузки
+## 4. Boot order
 
-0. `firewall` (fw4) — зона `proxy` по имени устройства `Meta` + forwarding
-   `lan→proxy`. Порядок относительно mihomo не важен: пока `Meta` не
-   существует, правила зоны просто не матчатся. Интерфейсы direct-групп
-   должны состоять в fw4-зонах (wan/lan/…) — wanguard предупреждает, но
-   зоны НЕ настраивает.
-1. `network` — интерфейсы, main-default. (Legacy `config rule`/`route`
-   до чистки после приёмки #13 — безвредный дубликат.)
-2. `mihomo` (procd, поздний старт) — поднимает TUN `Meta`, слушает 7890/7892.
-3. `wanguard` (procd, START=99, демон `wanguard-keepalive`) — при старте
-   ставит скелет nft-таблицы (если нет), выполняет `wanguard apply`
-   (наборы + правила + ip rules + таблицы всех групп из UCI) и далее
-   повторяет apply циклом каждые 10с: самолечение после рестартов mihomo,
-   чисток nft и полного reboot.
-4. `wan-watch` (procd, START=99) — active health-check main-egress (issue #18):
-   пинг 77.88.8.8/8.8.8.8 через `-I pptp-vpn`, 3 подряд неудачи → `ifup vpn`
-   (bounce), main на время переустановки пассивно держит wan2 (metric 100).
-   Только runtime-действия netifd — состояния нет, откат = reboot или
-   `stop/disable` сервиса.
+0. `firewall` (fw4) — zone `proxy` by device name `Meta` + forwarding
+   `lan→proxy`. Order relative to mihomo does not matter: until `Meta`
+   exists, the zone rules simply don't match. Direct-group interfaces must
+   be in fw4 zones (wan/lan/…) — wanguard warns but does NOT configure zones.
+1. `network` — interfaces, main default. (Legacy `config rule`/`route`
+   sections until cleanup — a harmless duplicate.)
+2. `mihomo` (procd, late start) — brings up TUN `Meta`, listens on 7890/7892.
+3. `wanguard` (procd, START=99, daemon `wanguard-keepalive`) — at boot
+   installs the nft table skeleton (if missing), runs `wanguard apply`
+   (sets + rules + ip rules + all group tables from UCI) and then repeats
+   apply every 10 s: self-healing after mihomo restarts, nft wipes and full
+   reboots.
+4. `wan-watch` (procd, START=99) — active main-egress health check:
+   pings 77.88.8.8/8.8.8.8 via `-I pptp-vpn`, 3 consecutive failures →
+   `ifup vpn` (bounce); while the tunnel re-dials, main passively rides
+   wan2 (metric 100). Runtime-only netifd actions — no state of its own;
+   rollback = reboot or `stop/disable` of the service.
 
-Отладочный инструмент: `/usr/bin/wanguard-testmark MAC [сек] [набор]` —
-временная маркировка с самоснятием; игнорирует SIGHUP, запускать отсоединённо:
+Debug tool: `/usr/bin/wanguard-testmark MAC [sec] [set]` — temporary marking
+with self-removal; ignores SIGHUP, run detached:
 `setsid wanguard-testmark aa:bb:.. 60 </dev/null >/tmp/tm.log 2>&1 &`
-(nohup на BusyBox отсутствует). После окна всегда проверять
+(nohup does not exist on BusyBox). After every window verify
 `nft list set inet wanguard mac_c`.
 
-## 5. Конфиг: /etc/config/wanguard
+## 5. Config: /etc/config/wanguard
 
-Единственный источник правды о группах и членстве. Читают/пишут одинаково
-`wanguard` (CLI) и luci-app; рендер всего data plane — `wanguard apply`
-(идемпотентный дифф: nft-наборы и правила по тегам, ip rules, таблицы).
+The single source of truth for groups and membership. Read/written uniformly
+by `wanguard` (CLI) and luci-app-wanguard; the whole data plane is rendered
+by `wanguard apply` (idempotent diff: nft sets and rules by tags, ip rules,
+tables).
 
 ```
 config globals 'globals'
-        option redir_port '7892'      # TCP-redirect mihomo (proxy-группа)
-        list no_mark '172.65.90.21'   # никогда не маркировать/не редиректить
+        option redir_port '7892'      # mihomo TCP-redirect (proxy group)
+        list no_mark '192.0.2.10'     # never mark/redirect these
 
-config group 'a'                      # имя = [A-Za-z0-9_], им ссылаются члены
-        option type 'direct'          # direct → netifd-интерфейс
+config group 'a'                      # name = [A-Za-z0-9_], referenced by members
+        option type 'direct'          # direct → netifd interface
         option iface 'vpn'
 
 config group 'c'
-        option type 'proxy'           # proxy → mihomo (макс. 1 группа)
+        option type 'proxy'           # proxy → mihomo (max 1 group)
 
-config member 'm_d8bbc1cc1771'        # секция = m_<mac-без-двоеточий>
-        option name 'work-pc-eth'
-        option mac 'd8:bb:c1:cc:17:71'
+config member 'm_001122334455'        # section = m_<mac-without-colons>
+        option name 'desktop-eth'
+        option mac '00:11:22:33:44:55'
         option group 'c'
 ```
 
-CLI (`/usr/bin/wanguard`, шаблон: `router/etc.config.wanguard.example`):
+CLI (`/usr/bin/wanguard`, template: `router/etc.config.wanguard.example`):
 
 ```
-wanguard list                       члены + статус дрейфа UCI↔nft
-wanguard grouplist                  группы: тип/iface/mark/table/устройство/члены
-wanguard devices                    клиенты LAN: mac/ip/имя/онлайн (данные доски)
-wanguard add <mac> <группа> [имя]   регистрация + применение
-wanguard move <mac> <группа>        смена группы + применение
-wanguard remove <mac>               удаление + применение
-wanguard apply                      полная сверка UCI -> nft + ip rules + таблицы
-wanguard groupadd <имя> <iface|proxy>   создать группу + apply
-wanguard groupset <имя> <iface|proxy>   сменить цель группы + apply
-wanguard groupdel <имя>                 удалить пустую группу + apply
+wanguard list                       members + UCI↔nft drift status
+wanguard grouplist                  groups: type/iface/mark/table/device/members
+wanguard devices                    LAN clients: mac/ip/name/online (board data)
+wanguard add <mac> <group> [name]   register + apply
+wanguard move <mac> <group>         change group + apply
+wanguard remove <mac>               delete + apply
+wanguard apply                      full UCI -> nft + ip rules + tables sync
+wanguard groupadd <name> <iface|proxy>   create group + apply
+wanguard groupset <name> <iface|proxy>   change group target + apply
+wanguard groupdel <name>                 delete empty group + apply
 ```
 
-Свойства и ограничения:
-- Аллокация mark/table/prio детерминирована (см. §2); добавление группы,
-  алфавитно предшествующей существующим, сдвигает их метки — переход
-  fail-safe: пакет со старой меткой без правила уходит в main, keepalive
-  доводит правила/маршруты ≤10с.
-- Имя группы переименованию не поддаётся (имя = id UCI-секции): groupadd →
-  move → groupdel.
-- Одна proxy-группа (валидация в CLI и LuCI; вторая в UCI игнорируется
-  с warning).
-- Интерфейс вне fw4-зон: apply предупреждает, но зоны не настраивает
-  (форвард будет резаться — класс LoL-инцидента).
-- Члены с несуществующей группой игнорируются рендером; `list` предупреждает
-  (fail-safe: main-таблица).
-- MAC нормализуется (двоеточия, lowercase) — принимает дефисы/точки/голый hex.
-- Любая мутация сразу применяет дифф (без flush-окон); перед применением
-  пакет команд проходит `nft -c`.
-- Дрейф самоисцеляется: keepalive-демон раз в 10с вызывает `wanguard apply`,
-  init-скрипт делает то же при загрузке → членство переживает рестарты
-  mihomo, чистки nft-таблицы и полный reboot.
-- `wanguard list` показывает DRIFT, если UCI и nft разошлись (exit 1).
-- Гонки CLI↔keepalive безопасны: обе стороны делают идемпотентный дифф.
-- **luci-app-wanguard** (issue #8/#13/#14) — третий клиент того же UCI:
-  JS-вьюха (Network → WAN Guard), два режима за переключателем «Доска /
-  Таблица». **Доска** (#14): колонки = direct-группы по алфавиту, proxy,
-  Unclassified; карточки = клиенты (имя/MAC/IP/онлайн). Дроп карточки
-  применяет перенос молча (uci.save → uci.apply; эта версия LuCI сама
-  подтверждает rollback-окно ~через 1с — модалка не нужна), при ошибке —
-  тост и пересборка доски из перечитанного UCI (карточка «отскакивает»).
-  Тап по карточке = меню «Move to» (тач/клавиатура-фолбэк; HTML5 DnD на
-  iOS не работает принципиально). DRIFT делает доску read-only. Полл 15с
-  перечитывает UCI + `wanguard devices` — правки из CLI видны сами.
-  **Таблица** (#8): грид групп, грид устройств, добавление из
-  `/tmp/dhcp.leases`, индикатор in-sync/DRIFT; Save & Apply коммитит UCI и
-  выполняет `wanguard apply` через rpcd file-exec (ACL в acl.d). Браузер
-  никогда не трогает nft напрямую — только UCI + CLI-apply. Online-статус
-  и Unclassified берутся из `wanguard devices` (leases + ARP: видны
-  статические IP; ACL не расширялся — роутер-сайд данных нет). Файлы:
-  `luci-app-wanguard/` (view + menu.d + acl.d), установка —
-  `scripts/deploy-luci.ps1` (чистит кэши LuCI, рестартует rpcd).
-- Откат #13: снапшот до деплоя `deploy-wanguard.ps1` кладёт в
-  `/root/rollback/<дата>/` (файлы + ruleset + ip rule + маршруты);
-  процедура — PLAN.md этап 8.
+Properties and constraints:
+- Mark/table/prio allocation is deterministic (see §2); adding a group that
+  sorts before existing ones shifts their marks — the transition is
+  fail-safe: a packet with a stale mark and no rule falls to main, keepalive
+  fixes rules/routes within ≤10 s.
+- Group names cannot be renamed (name = UCI section id): groupadd → move →
+  groupdel.
+- Exactly one proxy group (validated in CLI and LuCI; a second one in UCI is
+  ignored with a warning).
+- An interface outside fw4 zones: apply warns but does not configure zones
+  (forwarding would be dropped — the game-incident class of failure).
+- Members referencing a non-existent group are ignored by the renderer;
+  `list` warns (fail-safe: main table).
+- MACs are normalized (colons, lowercase) — hyphens/dots/bare hex accepted.
+- Every mutation applies the diff immediately (no flush windows); before
+  applying, a command batch passes `nft -c`.
+- Drift self-heals: the keepalive daemon runs `wanguard apply` every 10 s;
+  the init script does the same at boot → membership survives mihomo
+  restarts, nft table wipes and full reboots.
+- `wanguard list` shows DRIFT when UCI and nft diverge (exit 1).
+- CLI↔keepalive races are safe: both sides do an idempotent diff.
+- **luci-app-wanguard** — a third client of the same UCI: a JS view
+  (Network → WAN Guard), two modes behind a "Board / Table" switch.
+  **Board**: columns = direct groups alphabetically, proxy, Unclassified;
+  cards = clients (name/MAC/IP/online). Dropping a card applies the move
+  silently (uci.save → uci.apply; this LuCI version auto-confirms the
+  rollback window ~1 s in — no modal needed); on error — a toast and a
+  board rebuild from re-read UCI (the card "bounces back"). Tapping a card
+  opens a "Move to" menu (touch/keyboard fallback; HTML5 DnD does not work
+  on iOS, period). DRIFT makes the board read-only. A 15 s poll re-reads UCI
+  + `wanguard devices` — CLI edits show up by themselves.
+  **Table**: groups grid, devices grid, adding from `/tmp/dhcp.leases`,
+  in-sync/DRIFT indicator; Save & Apply commits UCI and runs `wanguard
+  apply` via rpcd file-exec (ACL in acl.d). The browser never touches nft
+  directly — only UCI + CLI apply. Online status and Unclassified come from
+  `wanguard devices` (leases + ARP: static IPs are visible; the ACL was not
+  extended — no router-side data). Files: `luci-app-wanguard/` (view +
+  menu.d + acl.d), install via `scripts/deploy-luci.ps1` (clears LuCI
+  caches, restarts rpcd).
+- #13 rollback: the pre-deploy snapshot made by `deploy-wanguard.ps1` lands
+  in `/root/rollback/<date>/` (files + ruleset + ip rule + routes);
+  procedure — see the private repo's plan, stage 8.
 
 ## 6. MTU/MSS
 
-| Путь | MTU | MSS clamp |
+| Path | MTU | MSS clamp |
 |---|---|---|
-| PPTP (nomppe) | ~1436 | да |
-| PPPoE | 1492 | да |
-| TUN Meta | 9000 (внутренний) | n/a |
+| PPTP (nomppe) | ~1436 | yes |
+| PPPoE | 1492 | yes |
+| TUN Meta | 9000 (internal) | n/a |
 
-## 7. Что сознательно НЕ делаем
+## 7. What we deliberately do NOT do
 
-- mwan3 — не нужен: группы жёсткие, переключение ручное.
-- Балансировка/склейка каналов — потоки не ускоряются, сложности много.
-- Авто-failover direct-групп делает `wand-tick` (#6), main-egress — `wan-watch`
-  (#18); обе ветки появились решением владельца после инцидентов 2026-10-12/14.
-  Запасной маршрут (`metric 200`) у групп генерируется по-прежнему.
-- Настройка fw4-зон для новых интерфейсов — вручную владельцем
-  (wanguard только предупреждает).
+- mwan3 — not needed: groups are hard-bound, switching is deliberate.
+- Channel bonding/balancing — flows don't get faster, complexity is high.
+- Auto-failover for direct groups is done by `wand-tick` (#6), main-egress
+  monitoring by `wan-watch` (#18); both exist by owner's decision after the
+  incidents of 2026-10-12/14. The per-group fallback route (`metric 200`)
+  is still generated as before.
+- fw4 zone setup for new interfaces — manually by the owner (wanguard only
+  warns).

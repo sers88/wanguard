@@ -8,14 +8,14 @@ validates with `mihomo -t`, restarts mihomo and waits for the Hysteria2 tunnel
 warmup (~1-2 min, see docs/ARCHITECTURE.md) before probing.
 
 Usage:
-  .\scripts\deploy-whitelist.ps1                          # 192.168.88.1, restart + verify
-  .\scripts\deploy-whitelist.ps1 -Router 192.168.88.50
+  .\scripts\deploy-whitelist.ps1                          # 192.168.1.1, restart + verify
+  .\scripts\deploy-whitelist.ps1 -Router 192.168.1.50
   .\scripts\deploy-whitelist.ps1 -SkipRestart             # build + validate only
 
 Requirements: ssh/scp (OpenSSH client) with key auth to root@router.
 #>
 param(
-    [string]$Router = "192.168.88.1",
+    [string]$Router = "192.168.1.1",
     [string]$User = "root",
     [string]$Example = "",
     [int]$WarmupSeconds = 150,

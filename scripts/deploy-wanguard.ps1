@@ -8,14 +8,14 @@ absent (the live UCI config is the source of truth and is never overwritten).
 Restarts the wanguard service and verifies with `wanguard list`.
 
 Usage:
-  .\scripts\deploy-wanguard.ps1                 # 192.168.88.1
-  .\scripts\deploy-wanguard.ps1 -Router 192.168.88.50
+  .\scripts\deploy-wanguard.ps1                 # 192.168.1.1
+  .\scripts\deploy-wanguard.ps1 -Router 192.168.1.50
   .\scripts\deploy-wanguard.ps1 -NoRestart      # install files only
 
 Requirements: ssh/scp (OpenSSH client) with key auth to root@router.
 #>
 param(
-    [string]$Router = "192.168.88.1",
+    [string]$Router = "192.168.1.1",
     [string]$User = "root",
     [switch]$NoRestart
 )

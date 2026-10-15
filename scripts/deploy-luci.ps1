@@ -5,13 +5,13 @@ Installs the JS view, menu.d and acl.d, clears LuCI caches and restarts rpcd
 so the new menu/ACL take effect. Live /etc/config/wanguard is NOT touched.
 
 Usage:
-  .\scripts\deploy-luci.ps1                 # 192.168.88.1
-  .\scripts\deploy-luci.ps1 -Router 192.168.88.50
+  .\scripts\deploy-luci.ps1                 # 192.168.1.1
+  .\scripts\deploy-luci.ps1 -Router 192.168.1.50
 
 Requirements: ssh/scp (OpenSSH client) with key auth to root@router.
 #>
 param(
-    [string]$Router = "192.168.88.1",
+    [string]$Router = "192.168.1.1",
     [string]$User = "root"
 )
 

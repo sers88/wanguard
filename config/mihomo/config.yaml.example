@@ -1,35 +1,35 @@
-# mihomo config — ШАБЛОН (реальный файл живёт на роутере: /etc/mihomo/config.yaml)
-# Секреты заменены плейсхолдерами. Политика: docs/SECRETS.md
+# mihomo config — TEMPLATE. The real file lives on the router at
+# /etc/mihomo/config.yaml; secrets are placeholders here. This file is the
+# single source of truth for the `rules:` section (see scripts/deploy-whitelist.ps1).
 #
-# Этап 3 ВНЕДРЁН (issue #5): mihomo не трогает системную маршрутизацию вообще.
-# Отбор трафика группы C делает nftables (router/wanguard.nft) по source-MAC:
-#   TCP → redirect в redir-port :7892 (ниже)
-#   UDP/прочее → fwmark 300 → ip rule 8000 → table 500 → TUN "Meta"
-# TCP-в-TUN на этой коробке blackhole'ится (SYN умирает до TUN fd, ядро шлёт
-# клиенту RST — постмортем в issue #5), поэтому TCP идёт через redir-port —
-# тот же не-TUN вход, что и mixed-port.
+# Design: mihomo does NOT touch system routing at all. Per-MAC traffic
+# selection is done by nftables (router/wanguard.nft):
+#   TCP       -> redirect to redir-port :7892 (below)
+#   UDP / rest -> fwmark 300 -> ip rule 8000 -> table 500 -> TUN "Meta"
+# TCP-into-TUN blackholes on some hardware (the SYN dies before it reaches
+# the TUN fd, the kernel RSTs the client), so TCP goes through redir-port —
+# the same non-TUN ingress class as mixed-port.
 
 mixed-port: 7890
-redir-port: 7892   # сюда заворачивает TCP группы C nft chain wanguard/redirect_c
+redir-port: 7892   # proxy-group TCP is redirected here by nft chain wanguard/redirect_c
 allow-lan: true
 external-controller: 0.0.0.0:9090
 secret: "<DASHBOARD_SECRET>"
 external-ui: ui
 mode: rule
-ipv6: false          # v6-аплинка нет нигде (UL-RA Keenetic — не в счёт): без
-                     # безнадёжных v6-диалов в DIRECT (issue #15)
-log-level: error   # info/warning флуд съедает logread за минуты при сбое (issue #19)
+ipv6: false          # no v6 uplink anywhere; avoids hopeless v6 dials in DIRECT
+log-level: error     # info/warning floods logread within minutes on a fault
 
 tun:
   enable: true
-  stack: gvisor        # TUN теперь несёт только UDP группы C; gvisor — честный L3-стек
-  auto-route: false    # маршрутизацию в TUN делает ip rule fwmark 300 (wanguard)
-  auto-redirect: false # глобальный перехват запрещён — отбор per-MAC делает wanguard
+  stack: gvisor        # TUN carries only the proxy group's UDP; gvisor is a proper L3 stack
+  auto-route: false    # routing into TUN is done by ip rule fwmark 300 (wanguard)
+  auto-redirect: false # global interception forbidden — per-MAC selection is wanguard's job
   dns-hijack:
     - any:53
   auto-detect-interface: true
 
-# Sniffer: домен из TLS SNI / QUIC для перехваченных соединений по голому IP
+# Sniffer: domain from TLS SNI / QUIC for connections intercepted by bare IP
 sniffer:
   enable: true
   parse-pure-ip: true
@@ -44,7 +44,7 @@ sniffer:
         - 443
 
 dns:
-  ipv6: false        # не отдавать клиентам AAAA — пустой ответ (issue #15)
+  ipv6: false        # never hand AAAA to clients (empty answers)
   enable: true
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
@@ -57,10 +57,10 @@ dns:
     - <PROVIDER_DNS_2>
 
 proxies:
-  - name: <PROXY_NAME>            # напр. fornex-ru16-am4
+  - name: <PROXY_NAME>            # e.g. my-proxy-01
     type: hysteria2
-    server: <PROXY_HOST>          # напр. cdn-xx-xxx-in-multi.provider.net
-    port: <PROXY_PORT>            # напр. 5443
+    server: <PROXY_HOST>          # e.g. cdn.example.net
+    port: <PROXY_PORT>            # e.g. 443
     password: <HYSTERIA2_PASSWORD>
     obfs: salamander
     obfs-password: <OBFS_PASSWORD>
@@ -85,14 +85,15 @@ rules:
   - DOMAIN-SUFFIX,discordapp.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,discordapp.net,<PROXY_NAME>
   - DOMAIN-SUFFIX,discord.media,<PROXY_NAME>
-  # Meta (Instagram / Facebook / WhatsApp)
+  # Meta (Instagram / Facebook)
   - DOMAIN-SUFFIX,instagram.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,cdninstagram.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,facebook.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,fbcdn.net,<PROXY_NAME>
-  # WhatsApp (клиенты ходят не только по доменам *.whatsapp.com/net и wa.me —
-  # звонки и медиа идут по голым IP из собственных аллокаций Meta/AS32934,
-  # поэтому добавлены CIDR по данным RDAP RIR; v6 добавлен впрок, как у Telegram)
+  # WhatsApp (clients do not only talk to *.whatsapp.com/net and wa.me —
+  # calls and media go to bare IPs from Meta's own allocations, AS32934,
+  # hence the CIDRs below taken from RDAP/RIR data; v6 kept for the future,
+  # same as Telegram)
   - DOMAIN-SUFFIX,whatsapp.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,whatsapp.net,<PROXY_NAME>
   - DOMAIN-SUFFIX,whatsapp.org,<PROXY_NAME>
@@ -119,8 +120,8 @@ rules:
   - IP-CIDR,204.15.20.0/22,<PROXY_NAME>,no-resolve
   - IP-CIDR6,2620:0:1c00::/40,<PROXY_NAME>,no-resolve
   - IP-CIDR6,2a03:2880::/29,<PROXY_NAME>,no-resolve
-  # Telegram (десктоп/мобильные клиенты ходят по голым IP диапазонов DC,
-  # поэтому доменов недостаточно — добавлены CIDR датацентров)
+  # Telegram (desktop/mobile clients go to bare datacenter IP ranges, so
+  # domain rules alone are not enough — DC CIDRs added)
   - DOMAIN-SUFFIX,telegram.org,<PROXY_NAME>
   - DOMAIN-SUFFIX,t.me,<PROXY_NAME>
   - DOMAIN-SUFFIX,telegram.me,<PROXY_NAME>
@@ -147,26 +148,25 @@ rules:
   - DOMAIN-SUFFIX,linkedin.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,licdn.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,lnkd.in,<PROXY_NAME>
-  # X / Twitter (медиа — twimg.com, короткие ссылки — t.co)
+  # X / Twitter (media — twimg.com, short links — t.co)
   - DOMAIN-SUFFIX,x.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,twitter.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,twimg.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,twttr.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,t.co,<PROXY_NAME>
   - DOMAIN-SUFFIX,twtrcdn.com,<PROXY_NAME>
-  # Пользовательские добавки
-  # KinoPub: cdn-service.space/srvkp.com (DPI-глотали на DIRECT), staticpop.net,
-  # kino.pub — добавлены на живом роутере при починке Dune, синхронизированы сюда
+  # Custom additions (a media service; some public resolvers answer these
+  # with a bare CNAME and no A record, so they are pinned here)
   - DOMAIN-SUFFIX,kino.watch,<PROXY_NAME>
   - DOMAIN-SUFFIX,cdn-service.space,<PROXY_NAME>
   - DOMAIN-SUFFIX,srvkp.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,staticpop.net,<PROXY_NAME>
   - DOMAIN-SUFFIX,kino.pub,<PROXY_NAME>
-  # 18+
+  # Adult + misc
   - DOMAIN-SUFFIX,pornhub.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,phncdn.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,redgifs.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,warera.io,<PROXY_NAME>
   - DOMAIN-SUFFIX,ourdream.ai,<PROXY_NAME>
-  # Всё остальное — напрямую (через default WAN)
+  # Everything else — DIRECT (via the default WAN)
   - MATCH,DIRECT
