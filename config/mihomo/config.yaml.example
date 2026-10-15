@@ -90,9 +90,35 @@ rules:
   - DOMAIN-SUFFIX,cdninstagram.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,facebook.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,fbcdn.net,<PROXY_NAME>
+  # WhatsApp (клиенты ходят не только по доменам *.whatsapp.com/net и wa.me —
+  # звонки и медиа идут по голым IP из собственных аллокаций Meta/AS32934,
+  # поэтому добавлены CIDR по данным RDAP RIR; v6 добавлен впрок, как у Telegram)
   - DOMAIN-SUFFIX,whatsapp.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,whatsapp.net,<PROXY_NAME>
+  - DOMAIN-SUFFIX,whatsapp.org,<PROXY_NAME>
+  - DOMAIN-SUFFIX,whatsapp.biz,<PROXY_NAME>
   - DOMAIN-SUFFIX,wa.me,<PROXY_NAME>
+  - IP-CIDR,31.13.24.0/21,<PROXY_NAME>,no-resolve
+  - IP-CIDR,31.13.64.0/18,<PROXY_NAME>,no-resolve
+  - IP-CIDR,45.64.40.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,57.141.0.0/14,<PROXY_NAME>,no-resolve
+  - IP-CIDR,57.145.0.0/16,<PROXY_NAME>,no-resolve
+  - IP-CIDR,57.146.0.0/15,<PROXY_NAME>,no-resolve
+  - IP-CIDR,57.148.0.0/15,<PROXY_NAME>,no-resolve
+  - IP-CIDR,66.220.144.0/20,<PROXY_NAME>,no-resolve
+  - IP-CIDR,69.63.176.0/20,<PROXY_NAME>,no-resolve
+  - IP-CIDR,69.171.224.0/19,<PROXY_NAME>,no-resolve
+  - IP-CIDR,74.119.76.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,102.132.96.0/19,<PROXY_NAME>,no-resolve
+  - IP-CIDR,103.4.96.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,129.134.0.0/16,<PROXY_NAME>,no-resolve
+  - IP-CIDR,157.240.0.0/16,<PROXY_NAME>,no-resolve
+  - IP-CIDR,173.252.64.0/18,<PROXY_NAME>,no-resolve
+  - IP-CIDR,179.60.192.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,185.60.216.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR,204.15.20.0/22,<PROXY_NAME>,no-resolve
+  - IP-CIDR6,2620:0:1c00::/40,<PROXY_NAME>,no-resolve
+  - IP-CIDR6,2a03:2880::/29,<PROXY_NAME>,no-resolve
   # Telegram (десктоп/мобильные клиенты ходят по голым IP диапазонов DC,
   # поэтому доменов недостаточно — добавлены CIDR датацентров)
   - DOMAIN-SUFFIX,telegram.org,<PROXY_NAME>
