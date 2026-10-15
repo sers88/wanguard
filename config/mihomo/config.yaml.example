@@ -147,6 +147,13 @@ rules:
   - DOMAIN-SUFFIX,linkedin.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,licdn.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,lnkd.in,<PROXY_NAME>
+  # X / Twitter (медиа — twimg.com, короткие ссылки — t.co)
+  - DOMAIN-SUFFIX,x.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,twitter.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,twimg.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,twttr.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,t.co,<PROXY_NAME>
+  - DOMAIN-SUFFIX,twtrcdn.com,<PROXY_NAME>
   # Пользовательские добавки
   # KinoPub: cdn-service.space/srvkp.com (DPI-глотали на DIRECT), staticpop.net,
   # kino.pub — добавлены на живом роутере при починке Dune, синхронизированы сюда
