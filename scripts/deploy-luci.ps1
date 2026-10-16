@@ -26,7 +26,9 @@ $Files = @(
 )
 
 function Invoke-Remote([string]$Cmd) {
-    & ssh @SshOpts "$User@$Router" $Cmd
+    # PS 5.1 does not escape embedded quotes for native argv: without this,
+    # ssh ships the command with quotes stripped ("Parsing message data failed").
+    & ssh @SshOpts "$User@$Router" ($Cmd -replace '"', '\"')
     if ($LASTEXITCODE -ne 0) { throw "remote command failed: $Cmd" }
 }
 
@@ -45,6 +47,8 @@ Write-Host "==> clear LuCI caches + restart rpcd"
 Invoke-Remote "rm -f /tmp/luci-indexcache* /tmp/luci-modulecache*; /etc/init.d/rpcd restart; sleep 1"
 
 Write-Host "==> smoke: wanguard list via ubus file exec"
-Invoke-Remote "ubus -S call file exec '{""command"":""/usr/bin/wanguard"",""params"":[""list""]}' | jsonfilter -e ""@['stdout']"" | tail -1"
+# NOTE: jsonfilter on 25.12.5 mis-parses file-exec output (build quirk), so the
+# smoke greps the raw ubus result instead — same end-to-end path as the board.
+Invoke-Remote "ubus call file exec '{""command"":""/usr/bin/wanguard"",""params"":[""list""]}' | grep -q in-sync && echo SMOKE-OK"
 
 Write-Host "==> done. Open: http://$Router/cgi-bin/luci -> Network -> WAN Guard"

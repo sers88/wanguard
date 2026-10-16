@@ -98,10 +98,12 @@ function groupChoices() {
 	var out = [];
 	(uci.sections('wanguard', 'group') || []).forEach(function(g) {
 		var lbl = g['.name'];
-		if (g.type == 'proxy')
-			lbl += ' — mihomo';
-		else if (g.iface)
-			lbl += ' — ' + g.iface;
+		/* hide the target when it duplicates the group name */
+		if (g.type == 'proxy') {
+			if (lbl != 'mihomo')
+				lbl += ' — mihomo';
+		} else if (g.iface != lbl)
+			lbl += ' — ' + (g.iface || '?');
 		out.push([ g['.name'], lbl ]);
 	});
 	return out;
@@ -268,7 +270,14 @@ return view.extend({
 			.sort(function(a, b) { return a.name.localeCompare(b.name); });
 		var prox = gs.filter(function(g) { return g.type == 'proxy'; });
 		return dirs.concat(prox).map(function(g) {
-			return { name: g.name, label: (g.type == 'proxy') ? '%s — mihomo'.format(g.name) : '%s — %s'.format(g.name, g.iface || '?') };
+			/* hide the target when it duplicates the group name */
+			var lbl = g.name;
+			if (g.type == 'proxy') {
+				if (g.name != 'mihomo')
+					lbl += ' — mihomo';
+			} else if (g.iface != g.name)
+				lbl += ' — ' + (g.iface || '?');
+			return { name: g.name, label: lbl };
 		});
 	},
 
