@@ -155,6 +155,17 @@ rules:
   - DOMAIN-SUFFIX,twttr.com,<PROXY_NAME>
   - DOMAIN-SUFFIX,t.co,<PROXY_NAME>
   - DOMAIN-SUFFIX,twtrcdn.com,<PROXY_NAME>
+  # Unraid OS updates + license (releases / api / account / keys)
+  - DOMAIN-SUFFIX,unraid.net,<PROXY_NAME>
+  - DOMAIN-SUFFIX,lime-technology.com,<PROXY_NAME>
+  # Community Applications: plugin + appfeed are hosted on GitHub
+  - DOMAIN-SUFFIX,github.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,githubusercontent.com,<PROXY_NAME>
+  # Docker registries (CA pulls container images from here)
+  - DOMAIN-SUFFIX,docker.io,<PROXY_NAME>
+  - DOMAIN-SUFFIX,docker.com,<PROXY_NAME>
+  - DOMAIN-SUFFIX,ghcr.io,<PROXY_NAME>
+  - DOMAIN-SUFFIX,lscr.io,<PROXY_NAME>
   # Custom additions (a media service; some public resolvers answer these
   # with a bare CNAME and no A record, so they are pinned here)
   - DOMAIN-SUFFIX,kino.watch,<PROXY_NAME>
