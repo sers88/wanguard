@@ -90,7 +90,7 @@ powershell .\scripts\deploy-luci.ps1        # LuCI app
 |---|---|
 | `router/wanguard` | CLI: list/devices/add/move/remove/group*/apply |
 | `router/wanguard-keepalive` | procd daemon: apply every 10s |
-| `router/wan-watch` | main-path (pptp) health check, `ifup vpn` on death (#18) |
+| `router/wan-watch` | main-path health check (main group from UCI), `ifup` on death (#18) |
 | `router/init.d/wanguard` | init script (apply at boot) |
 | `router/init.d/wan-watch` | health-check init script |
 | `router/wanguard.nft` | nft table skeleton |

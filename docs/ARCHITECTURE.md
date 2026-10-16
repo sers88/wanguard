@@ -10,9 +10,10 @@
 | dnsmasq | DHCP for all clients (+ static leases for stable naming) |
 | wanguard (CLI) | group membership management (`/etc/config/wanguard` → nft) |
 | luci-app-wanguard | web UI over the same UCI |
-| wan-watch | main-egress (pptp-vpn) health check: 3 dead rounds → `ifup vpn`;
-  while the tunnel re-dials, main passively rides wan2 (metric 100);
-  300 s cooldown; `DRYRUN=1` for testing |
+| wan-watch | main-egress health check (main group read from UCI
+  `globals.main_group`, default `a`): 3 dead rounds → `ifup <main-iface>`;
+  while the tunnel re-dials, main passively rides the backup default
+  (higher metric); 300 s cooldown; `DRYRUN=1` for testing |
 | AP mesh | wireless access points, L2 bridge only, no NAT/DHCP |
 
 ## 2. Routing: named groups × arbitrary interfaces (issue #13)
@@ -177,9 +178,11 @@ Nuances:
    apply every 10 s: self-healing after mihomo restarts, nft wipes and full
    reboots.
 4. `wan-watch` (procd, START=99) — active main-egress health check:
-   pings 77.88.8.8/8.8.8.8 via `-I pptp-vpn`, 3 consecutive failures →
-   `ifup vpn` (bounce); while the tunnel re-dials, main passively rides
-   wan2 (metric 100). Runtime-only netifd actions — no state of its own;
+   pings 77.88.8.8/8.8.8.8 via the main group's device (UCI
+   `globals.main_group` → `<group>.iface` → its l3_device, re-resolved
+   every round), 3 consecutive failures → `ifup <main-iface>` (bounce);
+   while the tunnel re-dials, main passively rides the backup default
+   (higher metric). Runtime-only netifd actions — no state of its own;
    rollback = reboot or `stop/disable` of the service.
 
 Debug tool: `/usr/bin/wanguard-testmark MAC [sec] [set]` — temporary marking

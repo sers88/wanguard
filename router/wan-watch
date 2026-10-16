@@ -1,15 +1,20 @@
 #!/bin/sh
-# wan-watch (issue #18): active health-check of the MAIN egress (pptp-vpn).
+# wan-watch (issue #18): active health-check of the MAIN egress.
 # Group a/b failover is handled by `wanguard wand-tick` (issue #6). This
 # covers the remaining gap: tunnel UP but no internet behind the primary
 # ISP's exit (lcp-echo stays happy) — main-table traffic (mihomo dials +
 # unclassified) rides the dead path forever, as happened 2026-10-14.
 #
-# Probe: ping via pptp-vpn; T2 tried only if T1 fails. 3 consecutive failed
-# rounds => `ifup vpn` (bounce the tunnel). While it re-dials, main passively
-# falls back to wan2 (metric 100) and switches back on re-establish — no
-# route surgery, netifd-native. Cooldown limits churn if the transit is
-# long-dead. DRYRUN=1 env logs the action without executing it (for testing).
+# The main group is read from UCI (globals.main_group, default 'a'); its
+# netifd iface and the actual kernel device are re-resolved every round,
+# so interface renames never require editing this file.
+#
+# Probe: ping via the main device; T2 tried only if T1 fails. 3 consecutive
+# failed rounds => `ifup <main-iface>` (bounce the tunnel). While it
+# re-dials, main passively falls back to the backup default (higher metric)
+# and switches back on re-establish — no route surgery, netifd-native.
+# Cooldown limits churn if the transit is long-dead. DRYRUN=1 env logs the
+# action without executing it (for testing).
 
 INTERVAL=10
 FAILS=3
@@ -17,25 +22,31 @@ COOLDOWN=300
 T1=77.88.8.8
 T2=8.8.8.8
 
+main_group=$(uci -q get wanguard.globals.main_group) || main_group=a
+main_iface=$(uci -q get wanguard.$main_group.iface) || main_iface=vpn
+
 fails=0
 down=0
 last_action=0
 
 while :; do
-	if ping -I pptp-vpn -c 1 -W 3 "$T1" >/dev/null 2>&1 \
-		|| ping -I pptp-vpn -c 1 -W 3 "$T2" >/dev/null 2>&1; then
-		[ "$down" = 1 ] && logger -t wan-watch "main egress recovered (pptp-vpn)"
+	main_dev=$(ubus call network.interface.$main_iface status 2>/dev/null \
+		| sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+	probe_dev=${main_dev:-$main_iface}
+	if ping -I "$probe_dev" -c 1 -W 3 "$T1" >/dev/null 2>&1 \
+		|| ping -I "$probe_dev" -c 1 -W 3 "$T2" >/dev/null 2>&1; then
+		[ "$down" = 1 ] && logger -t wan-watch "main egress recovered ($probe_dev)"
 		down=0
 		fails=0
 	else
 		fails=$((fails + 1))
 		now=$(date +%s)
 		if [ "$fails" -ge "$FAILS" ] && [ $((now - last_action)) -ge "$COOLDOWN" ]; then
-			logger -t wan-watch "main egress dead (${fails} rounds via pptp-vpn) -> ifup vpn; main falls back to wan2"
+			logger -t wan-watch "main egress dead (${fails} rounds via $probe_dev) -> ifup $main_iface; main falls back to backup"
 			if [ -n "$DRYRUN" ]; then
-				logger -t wan-watch "DRYRUN: ifup vpn skipped"
+				logger -t wan-watch "DRYRUN: ifup $main_iface skipped"
 			else
-				ifup vpn
+				ifup "$main_iface"
 			fi
 			down=1
 			last_action=$now

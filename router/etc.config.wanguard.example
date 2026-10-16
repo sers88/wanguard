@@ -11,6 +11,8 @@
 
 config globals 'globals'
 	option redir_port '7892'
+	# the group wan-watch health-checks and bounces (default: 'a')
+	option main_group 'a'
 	# never mark/redirect traffic to these addresses
 	# (admin channels, management endpoints — survive even a marked window)
 	list no_mark '192.0.2.10'
