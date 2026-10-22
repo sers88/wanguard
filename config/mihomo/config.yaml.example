@@ -18,7 +18,7 @@ secret: "<DASHBOARD_SECRET>"
 external-ui: ui
 mode: rule
 ipv6: false          # no v6 uplink anywhere; avoids hopeless v6 dials in DIRECT
-log-level: error     # info/warning floods logread within minutes on a fault
+log-level: warning     # warning floods only during outages (~300 lines/min); 4MB logd buffer (issue #21) absorbs ~90 min
 
 tun:
   enable: true
@@ -55,6 +55,8 @@ dns:
   nameserver:
     - <PROVIDER_DNS_1>
     - <PROVIDER_DNS_2>
+    - 77.88.8.8        # fallback resolvers (issue #22): keep DNS alive when the
+    - 8.8.8.8          # primary provider's transit is down; egress follows main-table failover
 
 proxies:
   - name: <PROXY_NAME>            # e.g. my-proxy-01
