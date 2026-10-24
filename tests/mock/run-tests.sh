@@ -72,6 +72,21 @@ setup_two_wans() {
 	add_iface_dev wan2 pppoe-wan2
 }
 
+setup_three_wans() { # three direct groups on three ifaces (a=vpn, b=wan2, c=wan3)
+	add_group a
+	add_group b
+	add_group c
+	uci_set a.type direct
+	uci_set a.iface vpn
+	uci_set b.type direct
+	uci_set b.iface wan2
+	uci_set c.type direct
+	uci_set c.iface wan3
+	add_iface_dev vpn pptp-freedom
+	add_iface_dev wan2 pppoe-wan2
+	add_iface_dev wan3 pppoe-wan3
+}
+
 tick()     { T=$((T + 1)); sh "$WG" wand-tick 2>&1; }
 wanstate() { cat "$WAND/$1.state" 2>/dev/null || echo up; }
 field()    { cat "$WAND/$1" 2>/dev/null || echo "${2-}"; }
@@ -306,7 +321,8 @@ uci_set globals.wan_anchors 'http://a1.example/ping'
 add_iface_addr vpn 198.51.100.10
 tick >/dev/null # seed; caches $WAND/vpn.addr
 tmpf="$UBUS_IFACES.new"
-grep -v '^vpn=' "$UBUS_IFACES" > "$tmpf" 2>/dev/null || : > "$tmpf" # iface vanishes
+grep -v '^vpn=' "$UBUS_IFACES" > "$tmpf" 2>/dev/null || : > "$tmpf" # ifdown:
+echo 'vpn=' >> "$tmpf" # netifd object stays, the device is gone
 mv "$tmpf" "$UBUS_IFACES"
 echo fail > "$WAND/vpn.force"
 tick >/dev/null; tick >/dev/null; tick >/dev/null # failover; live resolve impossible
@@ -325,6 +341,104 @@ echo fail > "$WAND/vpn.force"
 tick >/dev/null; tick >/dev/null; tick >/dev/null
 out=$(CONNTRACK_FAILS=1 sh "$WG" wan-flush)
 assert_contains "T17 conntrack failure tolerated, event logged" "$out" "flush:a>vpn(198.51.100.10)"
+
+echo
+echo "== #26: per-group backup priority (list backup_iface) =="
+
+# --- T18: explicit order wins: first UP in the list, not alphabetical ---
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+sh "$WG" backupset a wan3 wan2 # wan3 FIRST though alphabetically last
+tick >/dev/null # seed a.home=vpn
+echo fail > "$WAND/vpn.force"
+out=$(tick); out=$(tick); out=$(tick) # vpn down x3 -> failover
+assert_contains "T18 failover follows the explicit order" "$out" "failover:a>wan3"
+assert_eq "T18 a.iface = wan3" "$(uci -q get wanguard.a.iface)" "wan3"
+
+# --- T19: head of the list dead -> next in order ---
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+sh "$WG" backupset a wan2 wan3
+echo fail > "$WAND/wan2.force" # first in the list dead from the start
+tick >/dev/null # seed
+echo fail > "$WAND/vpn.force"
+out=$(tick); out=$(tick); out=$(tick)
+assert_contains "T19 dead head of list skipped" "$out" "failover:a>wan3"
+assert_eq "T19 a.iface = wan3" "$(uci -q get wanguard.a.iface)" "wan3"
+
+# --- T20: conflict-check: home inside backup_iface is warned + dropped ---
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+out=$(sh "$WG" backupset a vpn wan3 2>&1)
+assert_contains "T20 own-iface entry warned" "$out" "note: 'vpn' is the group's own iface"
+assert_eq "T20 home entry dropped from list" "$(uci -q get wanguard.a.backup_iface)" "wan3"
+out=$(sh "$WG" backupset b wan3 wan3 2>&1) # duplicate (wan3 is not b's own)
+assert_eq "T20 duplicate kept once" "$(uci -q get wanguard.b.backup_iface)" "wan3"
+# hand-edited UCI bypassing the CLI: the runtime filter drops home as well
+uci add_list wanguard.a.backup_iface=vpn # list now: wan3 vpn
+assert_eq "T20 raw add_list stored" "$(uci -q get wanguard.a.backup_iface)" "wan3 vpn"
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # vpn down x3
+assert_eq "T20 runtime filter: home never selected" "$(uci -q get wanguard.a.iface)" "wan3"
+
+# --- T21: no list -> default alphabetical (pre-#26 semantics intact) ---
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+tick >/dev/null # seed
+echo fail > "$WAND/vpn.force"
+out=$(tick); out=$(tick); out=$(tick)
+assert_contains "T21 default order is alphabetical" "$out" "failover:a>wan2"
+
+# --- T22: re-failover: sitting backup dies, home still down -> next in list ---
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+sh "$WG" backupset a wan2 wan3
+tick >/dev/null # seed
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # failover a>wan2
+echo fail > "$WAND/wan2.force" # the backup dies too, home still down
+out=$(tick); out=$(tick); out=$(tick)
+assert_contains "T22 re-failover to next backup" "$out" "failover:a>wan3"
+assert_eq "T22 a.iface = wan3" "$(uci -q get wanguard.a.iface)" "wan3"
+assert_eq "T22 flush names the dead backup" "$(cat "$WAND/a.flush" 2>/dev/null)" "wan2"
+rm -f "$WAND/vpn.force"
+out=$(tick); out=$(tick); out=$(tick); out=$(tick); out=$(tick); out=$(tick) # vpn 6 oks
+assert_contains "T22 failback from second backup" "$out" "failback:a>vpn"
+assert_eq "T22 a.iface back home" "$(uci -q get wanguard.a.iface)" "vpn"
+
+# --- T23: backupset validation ---
+reset_router
+setup_three_wans
+add_iface_dev wan4 pppoe-wan4 # in netifd, but no group sits on it
+add_group p
+uci_set p.type proxy
+out=$(sh "$WG" backupset a nosuch 2>&1)
+assert_contains "T23 unknown iface rejected" "$out" "unknown netifd iface: 'nosuch'"
+out=$(sh "$WG" backupset p wan2 2>&1)
+assert_contains "T23 proxy group rejected" "$out" "backups are a direct-group feature"
+out=$(sh "$WG" backupset b 2>&1)
+assert_contains "T23 empty list usage" "$out" "usage: wanguard backupset"
+out=$(sh "$WG" backupset a wan4 2>&1)
+assert_contains "T23 unwatched iface warned" "$out" "not watched by the watchdog"
+assert_eq "T23 unwatched iface still listed" "$(uci -q get wanguard.a.backup_iface)" "wan4"
+out=$(sh "$WG" backupset a wan2 wan3 2>&1) # re-set: replaces, not appends
+assert_contains "T23 order echoed" "$out" "backup order:wan2 wan3"
+assert_eq "T23 re-set replaces the list" "$(uci -q get wanguard.a.backup_iface)" "wan2 wan3"
+
+# --- T24: wanstatus shows the backup order per group ---
+reset_router
+setup_three_wans
+sh "$WG" backupset a wan3 wan2 >/dev/null
+out=$(sh "$WG" wanstatus 2>&1)
+row=$(echo "$out" | grep '^a ')
+assert_eq "T24 wanstatus shows the order" "$(echo "$row" | awk '{print $5, $6}')" "wan3 wan2"
+rowb=$(echo "$out" | grep '^b ')
+assert_eq "T24 default order shown as *" "$(echo "$rowb" | awk '{print $5}')" "*"
 
 echo
 echo "passed: $PASS, failed: $FAIL (ticks: $T)"

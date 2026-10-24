@@ -1,7 +1,10 @@
 #!/bin/sh
 # mock ubus: `ubus call network.interface.<name> status` -> JSON with
 # up/l3_device/ipv4-address from $UBUS_IFACES (`name=device` lines) and
-# $UBUS_ADDRS (`name=ip` lines, default 10.99.0.1); unknown iface => down.
+# $UBUS_ADDRS (`name=ip` lines, default 10.99.0.1).
+# Known name with empty device (`name=`) => up:false, exit 0 (ifdown'ed
+# iface: the netifd object exists). Unknown name => error exit, like the
+# real ubus on a nonexistent object.
 IFACES=${UBUS_IFACES:?UBUS_IFACES not set}
 ADDRS=${UBUS_ADDRS:-/dev/null}
 [ "$1" = call ] || { echo "mock ubus: unsupported: $*" >&2; exit 2; }
@@ -11,11 +14,16 @@ case "$obj" in
 		name=${obj#network.interface.}
 		dev=""
 		addr="10.99.0.1"
+		known=0
 		while IFS= read -r line; do
 			case "$line" in
-				"$name="*) dev=${line#*=}; break ;;
+				"$name="*) known=1; dev=${line#*=}; break ;;
 			esac
 		done < "$IFACES"
+		if [ "$known" = 0 ]; then
+			echo "mock ubus: unknown object: $obj" >&2
+			exit 2
+		fi
 		while IFS= read -r line; do
 			case "$line" in
 				"$name="*) addr=${line#*=}; break ;;

@@ -3,6 +3,9 @@
 # (full-key lines `wanguard.a.iface=vpn`), section types in $UCI_SECTIONS
 # (`a=group` lines). Emulates the exact subset the wanguard CLI uses:
 #   uci -q get <key> | uci -q show <pkg> | uci set <k>=<v> | uci commit [pkg]
+#   uci add_list <k>=<v> | uci delete <k>   (#26 backup_iface lists:
+#     a list option is stored as repeated key=value lines; `get` joins
+#     their values space-separated, like real uci does for lists)
 STATE=${UCI_STATE:?UCI_STATE not set}
 SECS=${UCI_SECTIONS:?UCI_SECTIONS not set}
 
@@ -12,9 +15,11 @@ if [ "$1" = "-q" ]; then q=1; shift; fi
 case "$1" in
 	get)
 		key="$2"
-		line=$(grep -m1 "^$key=" "$STATE" 2>/dev/null)
-		if [ -n "$line" ]; then
-			printf '%s\n' "${line#*=}"
+		# join all lines of the key (a list option is repeated lines)
+		vals=$(grep "^$key=" "$STATE" 2>/dev/null | sed "s/^$key=//" | tr '\n' ' ')
+		vals=${vals% }
+		if [ -n "$vals" ]; then
+			printf '%s\n' "$vals"
 			exit 0
 		fi
 		[ -n "$q" ] || echo "uci: Entry not found" >&2
@@ -37,6 +42,20 @@ case "$1" in
 		tmp="$STATE.new"
 		grep -v "^$key=" "$STATE" > "$tmp" 2>/dev/null || : > "$tmp"
 		printf '%s=%s\n' "$key" "$val" >> "$tmp"
+		mv "$tmp" "$STATE"
+		exit 0
+		;;
+	add_list)
+		arg="$2"
+		key=${arg%%=*}
+		val=${arg#*=}
+		printf '%s=%s\n' "$key" "$val" >> "$STATE"
+		exit 0
+		;;
+	delete)
+		key="$2"
+		tmp="$STATE.new"
+		grep -v "^$key=" "$STATE" > "$tmp" 2>/dev/null || : > "$tmp"
 		mv "$tmp" "$STATE"
 		exit 0
 		;;

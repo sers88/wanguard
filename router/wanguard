@@ -306,8 +306,12 @@ reconcile_routes() { # $1=alloc file -> prints change count; warnings to stderr
 # wan_reliability N` (default 1 = any anchor answers, the original
 # "DOWN only when both fail" semantics). 3 failed probes = down (30s);
 # a down wan needs 6 ok probes (60s stable) to be up again. On home-wan
-# death a direct group flips to the first up backup; failback is automatic
-# once home recovers. Min dwell between switches of one group: 60s.
+# death a direct group flips to the first UP backup; since #26 the backup
+# order is per-group explicit: `list backup_iface` (first UP in the list;
+# ifaces outside it are not eligible), default = all watched WANs by name.
+# If the backup the group sits on dies while home is still down, selection
+# re-runs down the same list (re-failover). Failback is automatic once
+# home recovers. Min dwell between switches of one group: 60s.
 # Flips are done via UCI iface= + the keepalive's apply, so the render
 # model stays the single source of truth (keepalive never fights the
 # watchdog). Each egress switch also schedules a targeted conntrack
@@ -332,6 +336,33 @@ wand_wans() { # distinct CURRENT+HOME ifaces of direct groups, sorted
 		ifc=$(group_opt "$g" wan_home)
 		[ -n "$ifc" ] && echo "$ifc"
 	done | sort -u
+}
+
+wand_backups() { # $1=group $2=home -> ordered backup candidates (#26):
+	# explicit `list backup_iface` wins: first UP in that order is the
+	# failover target, ifaces outside the list are NOT eligible (mwan3
+	# member-ordering semantics). Entries equal to home, duplicates and
+	# names the wand does not watch (never probed) are dropped — an
+	# unwatched name would look optimistic-up (wand_state default) and
+	# get selected blindly. No (usable) list => every other watched WAN,
+	# alphabetically: the pre-#26 semantics, unchanged default.
+	local g="$1" home="$2" e out="" listed="" watched
+	watched=" $(wand_wans | tr '\n' ' ') " # NB: command substitution keeps
+	for e in $(group_opt "$g" backup_iface); do # NEWLINES, not spaces —
+		[ "$e" = "$home" ] && continue # home is never its own backup
+		case "$watched" in # a raw `case " $(wand_wans) "` never matches
+			*" $e "*)
+				case " $listed " in *" $e "*) continue ;; esac
+				out="$out $e"; listed="$listed $e"
+				;;
+		esac
+	done
+	[ -n "$listed" ] && { echo "${out# }"; return 0; }
+	for e in $(wand_wans); do # default: previous behavior (#6)
+		[ "$e" = "$home" ] && continue
+		out="$out $e"
+	done
+	echo "${out# }"
 }
 
 wand_state() { # $1=wan -> up|down (optimistic default: up)
@@ -494,27 +525,29 @@ cmd_wand_tick() { # one watchdog step; runs from the keepalive right before appl
 		fi
 		last=$(cat "$WAND_DIR/$g.lastswitch" 2>/dev/null || echo 0)
 		[ $(( now - last )) -ge "$WAND_MIN_DWELL" ] || continue
-		if [ "$cur" = "$home" ]; then
-			[ "$(wand_state "$home")" = down ] || continue
-			backup=""
-			for w in $(wand_wans); do
-				[ "$w" = "$home" ] && continue
-				[ "$(wand_state "$w")" = up ] && { backup="$w"; break; }
-			done
-			[ -n "$backup" ] || continue
-			uci set "$CONF.$g.iface=$backup"
-			uci commit "$CONF"
-			echo "$now" > "$WAND_DIR/$g.lastswitch"
-			echo "$home" > "$WAND_DIR/$g.flush" # deferred conntrack flush (#24),
-			events="$events failover:$g>$backup" # processed after apply by wan-flush
-		else
-			[ "$(wand_state "$home")" = up ] || continue
-			uci set "$CONF.$g.iface=$home"
+		if [ "$cur" != "$home" ] && [ "$(wand_state "$home")" = up ]; then
+			uci set "$CONF.$g.iface=$home" # failback: home recovered
 			uci commit "$CONF"
 			echo "$now" > "$WAND_DIR/$g.lastswitch"
 			echo "$cur" > "$WAND_DIR/$g.flush" # the backup being left gets flushed
 			events="$events failback:$g>$home"
+			continue
 		fi
+		# home is down: failover — or re-failover when the backup the group
+		# sits on died too (#26: selection re-runs down the priority list;
+		# before, the group sat dead until the home came back)
+		[ "$(wand_state "$cur")" = up ] && continue # current egress alive — hold
+		backup=""
+		for w in $(wand_backups "$g" "$home"); do
+			[ "$w" = "$cur" ] && continue
+			[ "$(wand_state "$w")" = up ] && { backup="$w"; break; }
+		done
+		[ -n "$backup" ] || continue
+		uci set "$CONF.$g.iface=$backup"
+		uci commit "$CONF"
+		echo "$now" > "$WAND_DIR/$g.lastswitch"
+		echo "$cur" > "$WAND_DIR/$g.flush" # deferred conntrack flush (#24):
+		events="$events failover:$g>$backup" # processed after apply by wan-flush
 	done
 	[ -n "$events" ] && echo "wand:$events"
 	return 0
@@ -539,13 +572,14 @@ cmd_wanstatus() {
 		printf '%-8s %-14s %-12s %-9s %-9s %s\n' "$wan" "$dev" "$st" "$rtt" "$alive/$total" "$since"
 	done
 	echo
-	printf '%-8s %-8s %-8s %-9s %s\n' "GROUP" "HOME" "CURRENT" "MODE" "MEMBERS"
+	printf '%-8s %-8s %-8s %-9s %-20s %s\n' "GROUP" "HOME" "CURRENT" "MODE" "BACKUP" "MEMBERS"
 	for g in $(direct_ids); do
 		home=$(group_opt "$g" wan_home); [ -n "$home" ] || home="-"
 		cur=$(group_opt "$g" iface)
 		mode=$(group_opt "$g" wanmode); [ -n "$mode" ] || mode=auto
+		bk=$(group_opt "$g" backup_iface); [ -n "$bk" ] || bk="*" # *=all watched WANs A-Z
 		cnt=$(group_members "$g")
-		printf '%-8s %-8s %-8s %-9s %s\n' "$g" "$home" "$cur" "$mode" "$cnt"
+		printf '%-8s %-8s %-8s %-9s %-20s %s\n' "$g" "$home" "$cur" "$mode" "$bk" "$cnt"
 	done
 	command -v curl >/dev/null 2>&1 || echo "note: curl missing — watchdog probes disabled"
 }
@@ -569,10 +603,45 @@ cmd_wanset() {
 cmd_wanauto() {
 	local g="$1"
 	group_exists "$g" || err "no such group: '$g' (see: wanguard grouplist)"
-	[ "$(group_opt "$g" type)" = direct ] || err "group '$g' is proxy — nothing to automate"
+	[ "$(group_opt "$g" type)" = direct ] || err "group '$g' is proxy - nothing to automate"
 	uci set "$CONF.$g.wanmode=auto"
 	uci commit "$CONF" || err "uci commit failed"
 	msg "group '$g' back in auto mode (home: $(group_opt "$g" wan_home); watchdog fails back once home is up)"
+}
+
+cmd_backupset() { # explicit backup priority of a direct group (#26):
+	# watchdog fails over to the first UP iface in this order; ifaces
+	# outside the list are NOT eligible. Reset to the default (all watched
+	# WANs, alphabetical): uci -q delete wanguard.<g>.backup_iface
+	local g="$1" home cur ifc out=""
+	shift
+	group_exists "$g" || err "no such group: '$g' (see: wanguard grouplist)"
+	[ "$(group_opt "$g" type)" = direct ] || err "group '$g' is proxy — backups are a direct-group feature"
+	[ $# -ge 1 ] || err "usage: wanguard backupset <group> <iface>... (order matters)"
+	home=$(group_opt "$g" wan_home)
+	cur=$(group_opt "$g" iface)
+	watched=" $(wand_wans | tr '\n' ' ') " # NB: substitution keeps NEWLINES,
+	for ifc in "$@"; do # a raw `case " $(wand_wans) "` never matches (#26)
+		if [ "$ifc" = "$home" ] || [ "$ifc" = "$cur" ]; then # conflict-check
+			msg "note: '$ifc' is the group's own iface — ignored (never its own backup)"
+			continue
+		fi
+		ubus call network.interface."$ifc" status >/dev/null 2>&1 || err "unknown netifd iface: '$ifc'"
+		case " $out " in *" $ifc "*) continue ;; esac # duplicate: first wins
+		case "$watched" in
+			*" $ifc "*) ;;
+			*) msg "note: '$ifc' is not watched by the watchdog (no direct group sits on it) — it is skipped until it becomes some group's iface/wan_home" ;;
+		esac
+		out="$out $ifc"
+	done
+	out=${out# }
+	[ -n "$out" ] || err "nothing left after conflict-checks — backup list not changed"
+	uci -q delete "$CONF.$g.backup_iface"
+	for ifc in $out; do
+		uci add_list "$CONF.$g.backup_iface=$ifc"
+	done
+	uci commit "$CONF" || err "uci commit failed"
+	msg "group '$g' backup order:$out (first UP wins; see: wanguard wanstatus)"
 }
 
 # ---------- commands ----------
@@ -912,6 +981,8 @@ usage: wanguard <command> [args]
   wanstatus                     WAN probe states + group home/current/mode (issue #6)
   wanset <group> <iface>        pin group to iface manually (override; watchdog skips it)
   wanauto <group>               resume watchdog auto failover/failback
+  backupset <group> <iface>...  backup priority order (#26): first UP wins;
+                                no list = all watched WANs, alphabetical
 
 group names: [A-Za-z0-9_], <=15 chars. marks/tables are allocated
 automatically: proxy = 300/500 fixed; direct (sorted by name) =
@@ -935,6 +1006,7 @@ case "$1" in
 	wanstatus) cmd_wanstatus ;;
 	wanset)    shift; [ $# -ge 2 ] || err "usage: wanguard wanset <group> <iface>"; cmd_wanset "$@" ;;
 	wanauto)   shift; [ $# -ge 1 ] || err "usage: wanguard wanauto <group>"; cmd_wanauto "$@" ;;
+	backupset) shift; [ $# -ge 2 ] || err "usage: wanguard backupset <group> <iface>..."; cmd_backupset "$@" ;;
 	wand-tick) cmd_wand_tick ;;
 	wan-flush) cmd_wanflush ;;
 	""|help|-h|--help) cmd_help ;;
