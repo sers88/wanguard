@@ -21,7 +21,9 @@
 # - raw samples are kept in /tmp/bench.$$.* for the issue comment
 
 ITER=${ITER:-100}
+CMDS=${CMDS:-"wand-tick apply wan-flush"} # window 2 (ucode): CMDS="wand-tick"
 WG=${WG:-/usr/bin/wanguard}
+RUNNER=${RUNNER:-sh}                      # window 2 (ucode): RUNNER=ucode
 BENCH=/tmp/wanguard.bench
 OUT=/tmp/bench.$$
 
@@ -53,7 +55,7 @@ ms() { # seconds.nanos -> milliseconds (integer)
 
 run_once() { # $1=cmd -> prints ms (or empty in batch mode)
 	: > "$OUT.t0"; : > "$OUT.t1"
-	s=$(date +%s%N); sh "$BENCH" "$1" >/dev/null 2>&1; e=$(date +%s%N)
+	s=$(date +%s%N); "$RUNNER" "$BENCH" "$1" >/dev/null 2>&1; e=$(date +%s%N)
 	ms $(( e - s ))
 }
 
@@ -68,9 +70,9 @@ summarize() { # $1=label $2=samples-file (one ms value per line)
 }
 
 # --- warmup (creates state files, settles drift if any) ---
-for c in wand-tick apply wan-flush; do sh "$BENCH" $c >/dev/null 2>&1; done
+for c in $CMDS; do "$RUNNER" "$BENCH" $c >/dev/null 2>&1; done
 
-for c in wand-tick apply wan-flush; do
+for c in $CMDS; do
 	S="$OUT.$c"
 	: > "$S"
 	i=0
@@ -78,7 +80,7 @@ for c in wand-tick apply wan-flush; do
 		if [ "$NS" = 1 ]; then
 			run_once "$c" >> "$S"
 		else
-			s=$(date +%s); sh "$BENCH" "$c" >/dev/null 2>&1; e=$(date +%s)
+			s=$(date +%s); "$RUNNER" "$BENCH" "$c" >/dev/null 2>&1; e=$(date +%s)
 			echo $(( e - s )) >> "$S" # seconds only (coarse)
 		fi
 		i=$(( i + 1 ))
@@ -93,8 +95,8 @@ done
 # --- peak RSS of the interpreter process (main process only; transient
 #     children like curl/uci excluded — same method will be used for ucode,
 #     so the comparison is runtime-vs-runtime) ---
-for c in wand-tick apply wan-flush; do
-	sh "$BENCH" $c >/dev/null 2>&1 &
+for c in $CMDS; do
+	"$RUNNER" "$BENCH" $c >/dev/null 2>&1 &
 	pid=$!
 	hwm=0
 	while kill -0 "$pid" 2>/dev/null; do

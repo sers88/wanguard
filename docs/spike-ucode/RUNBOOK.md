@@ -29,18 +29,18 @@ After Phase 1 lands the ucode skeleton on `spike/ucode`:
 ```sh
 scp docs/spike-ucode/wand.uc root@192.168.x.x:/tmp/wanguard.ucode
 ssh root@192.168.x.x
-WG=/tmp/wanguard.ucode sh /tmp/bench-sh.sh
+RUNNER=ucode WG=/tmp/wanguard.ucode CMDS=wand-tick sh /tmp/bench-sh.sh
 ```
 
-`wanguard.ucode` is the ucode port of the tick path (probe + state machine
-+ backups selection); `apply`/`wan-flush` in that file intentionally fall
-back to invoking the stock sh CLI so the timing comparison stays honest
-per-subcommand (documented in the file header).
+`wanguard.ucode` ports the tick path only (UCI via uci.so, iface status
+via one ubus dump, probe via curl child — see the PROBE NOTE in the file,
+backup selection, state machine). `apply`/`wan-flush` pass through to the
+stock sh CLI, so they are NOT benched in this window (only `wand-tick`
+runs the ucode code); the sh baseline numbers from window 1 cover them.
 
-Also eyeball during the window: `ubus call network.interface.wan2 status`
-shape vs what the ucode code reads, and the uclient probe semantics check
-(Phase 1.3): `/tmp/wanguard.ucode probe-selftest` prints per-anchor
-device-binding + RTT results for manual comparison with curl.
+Also run during the window: `/tmp/wanguard.ucode probe-selftest` — prints
+the ubus iface map and per-anchor probe results for manual comparison
+with `curl --interface <dev> ...` behavior (Phase 1.3 evidence).
 
 ## Anti-goals (both windows)
 
