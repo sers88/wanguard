@@ -33,6 +33,10 @@ done
 printf 'wan1=eth0\nwan2=eth1\n' > /tmp/ubus.ifaces
 export UBUS_IFACES=/tmp/ubus.ifaces
 export UBUS_ADDRS=/dev/null
+# iface status is mocked BOTH ways (same fixture files): sh via the PATH
+# ubus stub, ucode via the -L module — else ubusd-without-netifd yields
+# no devices and the probe path never runs
+cp /repo/tests/mock/bin/ubus /tmp/shim/ubus
 
 cat > /etc/config/wanguard <<'EOF'
 config group 'a'
@@ -53,12 +57,20 @@ PATH="/tmp/shim:$PATH"
 export PATH
 
 # warmup (creates files; ucode needs no seed here but sh does)
-if [ "$RUNNER" = sh ]; then sh "$WG" wand-tick >/dev/null 2>&1; else ucode "$WG" wand-tick >/dev/null 2>&1; fi
+if [ "$RUNNER" = sh ]; then sh "$WG" wand-tick >/dev/null 2>&1
+else ucode -L /repo/docs/spike-ucode/mock "$WG" wand-tick >/dev/null 2>&1; fi
+
+MODE=${2:-forced} # forced = #6 force-hook probes (no curl); prod = real probe path
+if [ "$MODE" = prod ]; then
+	rm -f /tmp/wanguard/*.force
+fi
 
 : > /tmp/calls.log
 if [ "$RUNNER" = sh ]; then sh "$WG" wand-tick >/dev/null 2>&1
-else ucode "$WG" wand-tick >/dev/null 2>&1; fi
+else ucode -L /repo/docs/spike-ucode/mock "$WG" wand-tick >/dev/null 2>&1; fi
 
-echo "== $RUNNER: steady-state tick external children =="
-sort /tmp/calls.log | uniq -c | sort -rn
-echo "total: $(grep -c . /tmp/calls.log)"
+# summary OUTSIDE the shimmed PATH (a shimmed sort would log itself)
+cp /tmp/calls.log /tmp/calls.snapshot
+echo "== $RUNNER ($MODE): steady-state tick external children =="
+PATH=/usr/bin:/bin sort /tmp/calls.snapshot | PATH=/usr/bin:/bin uniq -c
+echo "total: $(grep -c . /tmp/calls.snapshot)"
