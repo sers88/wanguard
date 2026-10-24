@@ -429,13 +429,14 @@ wand_conntrack_flush() { # $1=group $2=old-iface -> echo event; empty = nothing 
 cmd_wanflush() { # process pending flush requests written by wand-tick (#24):
 	# tick runs BEFORE the keepalive's apply, the flush must run AFTER it
 	# (otherwise sessions created in between re-grab the old NAT binding).
-	local f g old out=""
+	local f g old ev out=""
 	for f in "$WAND_DIR"/*.flush; do
 		[ -f "$f" ] || continue
 		g=$(basename "$f" .flush)
 		old=$(cat "$f")
 		rm -f "$f"
-		out="$out $(wand_conntrack_flush "$g" "$old")"
+		ev=$(wand_conntrack_flush "$g" "$old")
+		[ -n "$ev" ] && out="$out $ev"
 	done
 	out=${out# }
 	[ -n "$out" ] && echo "wand:$out"
