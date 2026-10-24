@@ -1,0 +1,36 @@
+#!/bin/sh
+# mock curl for probe tests: the anchor map $CURLMAP decides per-URL result.
+# Map line format:  <url-substring>=ok|fail[:rtt]   (rtt default 0.050)
+# First matching line wins; URL not matching any line defaults to ok.
+# exit 7 on fail (curl "couldn't connect"), no stdout — the caller treats
+# any non-zero curl exit as a failed probe regardless of -w output.
+MAP=${CURLMAP:-/dev/null}
+url=""
+for a in "$@"; do
+	case "$a" in
+		-*) ;;
+		*) url=$a ;;
+	esac
+done
+[ -n "$url" ] && echo "mock curl: $url" >> "${CURLLOG:-/dev/null}"
+
+while IFS= read -r line; do
+	[ -n "$line" ] || continue
+	pat=${line%%=*}
+	rest=${line#*=}
+	res=${rest%%:*}
+	rtt=${rest#*:}
+	[ "$rtt" = "$rest" ] && rtt=0.050
+	case "$url" in
+		*"$pat"*)
+			if [ "$res" = fail ]; then
+				exit 7
+			fi
+			echo "$rtt"
+			exit 0
+			;;
+	esac
+done < "$MAP"
+
+echo 0.050
+exit 0

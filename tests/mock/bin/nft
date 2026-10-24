@@ -1,0 +1,3 @@
+#!/bin/sh
+# mock nft: watchdog tests never touch nft; accept everything.
+exit 0

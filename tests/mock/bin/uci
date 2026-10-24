@@ -1,0 +1,50 @@
+#!/bin/sh
+# mock uci for the wanguard test harness: state in $UCI_STATE
+# (full-key lines `wanguard.a.iface=vpn`), section types in $UCI_SECTIONS
+# (`a=group` lines). Emulates the exact subset the wanguard CLI uses:
+#   uci -q get <key> | uci -q show <pkg> | uci set <k>=<v> | uci commit [pkg]
+STATE=${UCI_STATE:?UCI_STATE not set}
+SECS=${UCI_SECTIONS:?UCI_SECTIONS not set}
+
+q=""
+if [ "$1" = "-q" ]; then q=1; shift; fi
+
+case "$1" in
+	get)
+		key="$2"
+		line=$(grep -m1 "^$key=" "$STATE" 2>/dev/null)
+		if [ -n "$line" ]; then
+			printf '%s\n' "${line#*=}"
+			exit 0
+		fi
+		[ -n "$q" ] || echo "uci: Entry not found" >&2
+		exit 1
+		;;
+	show)
+		pkg="$2"
+		while IFS= read -r line; do
+			[ -n "$line" ] && printf '%s.%s\n' "$pkg" "$line"
+		done < "$SECS"
+		while IFS= read -r line; do
+			[ -n "$line" ] && printf "%s='%s'\n" "${line%%=*}" "${line#*=}"
+		done < "$STATE"
+		exit 0
+		;;
+	set)
+		arg="$2"
+		key=${arg%%=*}
+		val=${arg#*=}
+		tmp="$STATE.new"
+		grep -v "^$key=" "$STATE" > "$tmp" 2>/dev/null || : > "$tmp"
+		printf '%s=%s\n' "$key" "$val" >> "$tmp"
+		mv "$tmp" "$STATE"
+		exit 0
+		;;
+	commit|import|export|changes|revert)
+		exit 0
+		;;
+	*)
+		echo "mock uci: unsupported: $*" >&2
+		exit 2
+		;;
+esac

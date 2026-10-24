@@ -1,0 +1,8 @@
+#!/bin/sh
+# mock ip / nft: the watchdog tests never exercise the data plane; accept
+# everything, print plausible defaults for the two read commands.
+case "$1 $2" in
+	"route show") echo "default via 192.0.2.1 dev mock-wan" ;;
+	"rule show") : ;;
+esac
+exit 0

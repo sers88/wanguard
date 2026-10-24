@@ -1,0 +1,20 @@
+#!/bin/sh
+# mock date: `date +%s` returns an epoch advancing +60 per call (so the
+# wand-tick 60s min-dwell passes every mock tick); `date -d @N FMT`
+# returns a fixed string. Counter file: $DATE_COUNT.
+COUNT=${DATE_COUNT:?DATE_COUNT not set}
+case "$*" in
+	*+%s*)
+		c=$(cat "$COUNT" 2>/dev/null)
+		case "$c" in ''|*[!0-9]*) c=1000000000 ;; esac
+		c=$((c + 60))
+		echo "$c" > "$COUNT"
+		echo "$c"
+		;;
+	*-d*)
+		echo "01.01 00:00:00"
+		;;
+	*)
+		echo "Thu Oct 24 12:00:00 UTC 2026"
+		;;
+esac

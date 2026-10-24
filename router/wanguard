@@ -32,6 +32,11 @@
 #   wanguard wanset <group> <iface>   pin group to iface (manual override)
 #   wanguard wanauto <group>          resume watchdog auto-mode
 #
+# Probe anchors (#23): UCI list wan_anchors (URLs) — or legacy
+# wan_anchor1/wan_anchor2, or 2 built-in defaults; option wan_reliability N
+# = how many anchors must answer for the probe to pass (default 1 = any,
+# the pre-#23 semantics: DOWN only when ALL anchors fail).
+#
 # MAC accepted as AA:BB:CC:DD:EE:FF / aa-bb-cc-dd-ee-ff / aabb.ccdd.eeff / bare hex.
 # Group names: [A-Za-z0-9_], <=15 chars, must not be 'globals'/'wan'.
 
@@ -283,8 +288,11 @@ reconcile_routes() { # $1=alloc file -> prints change count; warnings to stderr
 
 # ---------- WAN watchdog (issue #6) ----------
 #
-# Policy (owner-approved 2026-10-12): HTTP anchor through each WAN device
-# (2 anchors, DOWN only when both fail); 3 failed probes = down (30s);
+# Policy (owner-approved 2026-10-12): HTTP anchors through each WAN device;
+# since #23 the anchor set and the pass threshold are configurable:
+# `list wan_anchors` (legacy wan_anchor1/2 still read) + `option
+# wan_reliability N` (default 1 = any anchor answers, the original
+# "DOWN only when both fail" semantics). 3 failed probes = down (30s);
 # a down wan needs 6 ok probes (60s stable) to be up again. On home-wan
 # death a direct group flips to the first up backup; failback is automatic
 # once home recovers. Min dwell between switches of one group: 60s.
@@ -317,36 +325,80 @@ wand_state() { # $1=wan -> up|down (optimistic default: up)
 	echo "${s:-up}"
 }
 
-wand_probe() { # $1=wan $2=device -> 0 ok (prints rtt s) / 1 fail
-	local wan="$1" dev="$2" a1 a2 r f
+wand_anchors() { # probe anchors, one URL per line (#23):
+	# UCI list wan_anchors -> legacy wan_anchor1/wan_anchor2 -> 2 defaults.
+	# The list wins when both forms are set (documented in the example config).
+	local l out=""
+	l=$(uci -q get "$CONF.globals.wan_anchors" 2>/dev/null)
+	if [ -n "$l" ]; then # uci get returns list elements space-separated
+		printf '%s\n' $l
+		return 0
+	fi
+	l=$(uci -q get "$CONF.globals.wan_anchor1" 2>/dev/null)
+	[ -n "$l" ] && out="$l
+"
+	l=$(uci -q get "$CONF.globals.wan_anchor2" 2>/dev/null)
+	[ -n "$l" ] && out="$out$l
+"
+	if [ -n "$out" ]; then
+		printf '%s' "$out"
+		return 0
+	fi
+	echo 'http://www.gstatic.com/generate_204'
+	echo 'http://detectportal.firefox.com/success.txt'
+}
+
+wand_reliability() { # N of M anchors must answer for the probe to pass (#23)
+	# default 1 = any (pre-#23 semantics). Silently clamped to [1..M];
+	# wanstatus shows alive/total so a misconfigured N is visible there.
+	local n m
+	n=$(uci -q get "$CONF.globals.wan_reliability" 2>/dev/null)
+	case "$n" in ''|*[!0-9]*) n=1 ;; esac
+	[ "$n" -ge 1 ] || n=1
+	m=$(wand_anchors | grep -c .)
+	[ "$n" -le "$m" ] || n=$m
+	echo "$n"
+}
+
+wand_probe() { # $1=wan $2=device -> exit 0 if >= wan_reliability anchors answered (#23)
+	# side effects: $WAND_DIR/$wan.alive (count), $WAND_DIR/$wan.rtt (min rtt
+	# of the answering anchors); the #6 force-hook keeps its whole-probe
+	# semantics (ok = all anchors, fail = none).
+	local wan="$1" dev="$2" f r a rtt alive=0 minrtt=""
 	f="$WAND_DIR/$wan.force"
 	if [ -f "$f" ]; then # test hook: forced probe result (ok|fail)
 		read -r r < "$f"
-		[ "$r" = ok ] && { echo 0; return 0; }
+		if [ "$r" = ok ]; then
+			wand_anchors | grep -c . > "$WAND_DIR/$wan.alive"
+			echo 0 > "$WAND_DIR/$wan.rtt"
+			return 0
+		fi
+		echo 0 > "$WAND_DIR/$wan.alive"
 		return 1
 	fi
-	a1=$(uci -q get "$CONF.globals.wan_anchor1" 2>/dev/null)
-	[ -n "$a1" ] || a1='http://www.gstatic.com/generate_204'
-	a2=$(uci -q get "$CONF.globals.wan_anchor2" 2>/dev/null)
-	[ -n "$a2" ] || a2='http://detectportal.firefox.com/success.txt'
-	r=$(curl --interface "$dev" -m 5 -sf -o /dev/null -w '%{time_total}' "$a1" 2>/dev/null) && { echo "$r"; return 0; }
-	r=$(curl --interface "$dev" -m 5 -sf -o /dev/null -w '%{time_total}' "$a2" 2>/dev/null) && { echo "$r"; return 0; }
-	return 1
+	command -v curl >/dev/null 2>&1 || return 1
+	for a in $(wand_anchors); do
+		rtt=$(curl --interface "$dev" -m 5 -sf -o /dev/null -w '%{time_total}' "$a" 2>/dev/null) || continue
+		alive=$((alive + 1))
+		minrtt=$(awk -v a="$minrtt" -v b="$rtt" 'BEGIN { if (a == "" || b + 0 < a + 0) print b; else print a }')
+	done
+	echo "$alive" > "$WAND_DIR/$wan.alive"
+	[ -n "$minrtt" ] && echo "$minrtt" > "$WAND_DIR/$wan.rtt"
+	[ "$alive" -ge "$(wand_reliability)" ]
 }
 
 cmd_wand_tick() { # one watchdog step; runs from the keepalive right before apply
 	command -v curl >/dev/null 2>&1 || return 0
 	mkdir -p "$WAND_DIR"
-	local now wan dev rtt fails oks state events=""
+	local now wan dev fails oks state events=""
 	now=$(date +%s)
 	# --- probe phase: update per-wan state files ---
 	for wan in $(wand_wans); do
 		dev=$(iface_device "$wan")
-		if [ -n "$dev" ] && rtt=$(wand_probe "$wan" "$dev"); then
+		if [ -n "$dev" ] && wand_probe "$wan" "$dev"; then
 			oks=$(( $(cat "$WAND_DIR/$wan.oks" 2>/dev/null || echo 0) + 1 ))
 			echo 0 > "$WAND_DIR/$wan.fails"
 			echo "$oks" > "$WAND_DIR/$wan.oks"
-			echo "$rtt" > "$WAND_DIR/$wan.rtt"
 			state=$(wand_state "$wan")
 			if [ "$state" = down ] && [ "$oks" -ge "$WAND_OKS_UP" ]; then
 				echo up > "$WAND_DIR/$wan.state"
@@ -405,20 +457,22 @@ cmd_wand_tick() { # one watchdog step; runs from the keepalive right before appl
 }
 
 cmd_wanstatus() {
-	local wan dev st rtt since g home cur mode cnt
-	printf '%-8s %-14s %-12s %-9s %s\n' "WAN" "DEVICE" "STATE" "RTT(s)" "SINCE"
+	local wan dev st rtt since g home cur mode cnt alive total
+	printf '%-8s %-14s %-12s %-9s %-9s %s\n' "WAN" "DEVICE" "STATE" "RTT(s)" "ANCHORS" "SINCE"
+	total=$(wand_anchors | grep -c .)
 	for wan in $(wand_wans); do
 		dev=$(iface_device "$wan"); [ -n "$dev" ] || dev="-"
 		st=$(wand_state "$wan")
 		[ -f "$WAND_DIR/$wan.force" ] && st="$st/forced"
 		rtt=$(cat "$WAND_DIR/$wan.rtt" 2>/dev/null); [ -n "$rtt" ] || rtt="-"
+		alive=$(cat "$WAND_DIR/$wan.alive" 2>/dev/null); [ -n "$alive" ] || alive="-"
 		since=$(cat "$WAND_DIR/$wan.since" 2>/dev/null)
 		if [ -n "$since" ]; then
 			since=$(date -d "@$since" '+%d.%m %H:%M:%S' 2>/dev/null || echo "$since")
 		else
 			since="-"
 		fi
-		printf '%-8s %-14s %-12s %-9s %s\n' "$wan" "$dev" "$st" "$rtt" "$since"
+		printf '%-8s %-14s %-12s %-9s %-9s %s\n' "$wan" "$dev" "$st" "$rtt" "$alive/$total" "$since"
 	done
 	echo
 	printf '%-8s %-8s %-8s %-9s %s\n' "GROUP" "HOME" "CURRENT" "MODE" "MEMBERS"

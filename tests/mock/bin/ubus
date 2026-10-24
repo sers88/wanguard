@@ -1,0 +1,27 @@
+#!/bin/sh
+# mock ubus: `ubus call network.interface.<name> status` -> JSON with
+# up/l3_device from $UBUS_IFACES (`name=device` lines); unknown iface => down.
+IFACES=${UBUS_IFACES:?UBUS_IFACES not set}
+[ "$1" = call ] || { echo "mock ubus: unsupported: $*" >&2; exit 2; }
+obj="$2"
+case "$obj" in
+	network.interface.*)
+		name=${obj#network.interface.}
+		dev=""
+		while IFS= read -r line; do
+			case "$line" in
+				"$name="*) dev=${line#*=}; break ;;
+			esac
+		done < "$IFACES"
+		if [ -n "$dev" ]; then
+			printf '{"up": true, "pending": false, "l3_device": "%s", "device": "%s"}\n' "$dev" "$dev"
+		else
+			echo '{"up": false, "pending": false}'
+		fi
+		exit 0
+		;;
+	*)
+		echo "mock ubus: unsupported object: $obj" >&2
+		exit 2
+		;;
+esac

@@ -16,6 +16,13 @@ config globals 'globals'
 	# never mark/redirect traffic to these addresses
 	# (admin channels, management endpoints — survive even a marked window)
 	list no_mark '192.0.2.10'
+	# WAN watchdog probe anchors (#23): the channel counts as UP while at
+	# least `wan_reliability` of them answer (default 1 = any — DOWN only
+	# when ALL fail). Legacy single options wan_anchor1/wan_anchor2 are
+	# still read when the list is absent; when both are set, the list wins.
+	# list wan_anchors 'http://www.gstatic.com/generate_204'
+	# list wan_anchors 'http://detectportal.firefox.com/success.txt'
+	# option wan_reliability '1'
 
 config group 'a'
 	option type 'direct'
