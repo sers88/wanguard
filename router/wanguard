@@ -147,10 +147,12 @@ iface_device() { # netifd iface name -> l3_device; empty when down/missing
 }
 
 iface_addr() { # netifd iface name -> first IPv4; empty when down/missing (#24)
+	# NB: ["key"] form is required — jsonfilter's dotted path breaks on keys
+	# with a hyphen ("Invalid escape sequence" on the 25.12 build, found live).
 	local st
 	[ -n "$1" ] || return 0
 	st=$(ubus call network.interface."$1" status 2>/dev/null) || return 0
-	printf '%s' "$st" | jsonfilter -e '@.ipv4-address[0].address' 2>/dev/null | awk 'NF { print; exit }'
+	printf '%s' "$st" | jsonfilter -e '@["ipv4-address"][0]["address"]' 2>/dev/null | awk 'NF { print; exit }'
 }
 
 # ---------- migration (issue #13, idempotent) ----------

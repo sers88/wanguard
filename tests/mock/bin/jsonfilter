@@ -11,7 +11,7 @@ for arg in "$@"; do
 		*@.device*)
 			printf '%s\n' "$input" | sed -n 's/.*"device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 			;;
-		*@.ipv4-address*)
+		*ipv4-address*)
 			printf '%s\n' "$input" | sed -n 's/.*"ipv4-address"[^]]*"address":"\([^"]*\)".*/\1/p'
 			;;
 		*) ;;
