@@ -115,7 +115,12 @@ function iface_map() { // netifd name -> { device, addr } for UP ifaces
 
 function anchors() { // list wins > legacy anchor1/2 > 2 defaults
 	let l = cursor.get(CONF, 'globals', 'wan_anchors');
-	if (l) return (type(l) == 'array') ? l : [ l ];
+	if (l) {
+		if (type(l) == 'array')
+			return l;
+		// string form (`uci set ...='u1 u2 u3'`): sh word-split parity
+		return filter(split(l, /\s+/), function(s) { return s != ''; });
+	}
 	let out = [];
 	for (let legacy in [ 'wan_anchor1', 'wan_anchor2' ]) {
 		let v = globals_opt(legacy);
@@ -152,9 +157,10 @@ function probe(wan, dev, map) { // >= reliability anchors answered?
 		if (rc != 0 || out == '')
 			continue;
 		alive++;
-		let rtt = +out;
-		if (minrtt == null || rtt < minrtt)
-			minrtt = rtt;
+		// keep curl's ORIGINAL string (0.050, not 0.05 — wanstatus shows
+		// it verbatim); compare numerically, store as-is (sh parity)
+		if (minrtt == null || +out < +minrtt)
+			minrtt = out;
 	}
 	state_write(`${wan}.alive`, alive);
 	if (minrtt != null)
