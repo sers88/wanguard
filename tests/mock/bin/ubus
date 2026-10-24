@@ -1,20 +1,30 @@
 #!/bin/sh
 # mock ubus: `ubus call network.interface.<name> status` -> JSON with
-# up/l3_device from $UBUS_IFACES (`name=device` lines); unknown iface => down.
+# up/l3_device/ipv4-address from $UBUS_IFACES (`name=device` lines) and
+# $UBUS_ADDRS (`name=ip` lines, default 10.99.0.1); unknown iface => down.
 IFACES=${UBUS_IFACES:?UBUS_IFACES not set}
+ADDRS=${UBUS_ADDRS:-/dev/null}
 [ "$1" = call ] || { echo "mock ubus: unsupported: $*" >&2; exit 2; }
 obj="$2"
 case "$obj" in
 	network.interface.*)
 		name=${obj#network.interface.}
 		dev=""
+		addr="10.99.0.1"
 		while IFS= read -r line; do
 			case "$line" in
 				"$name="*) dev=${line#*=}; break ;;
 			esac
 		done < "$IFACES"
+		while IFS= read -r line; do
+			case "$line" in
+				"$name="*) addr=${line#*=}; break ;;
+			esac
+		done < "$ADDRS"
 		if [ -n "$dev" ]; then
-			printf '{"up": true, "pending": false, "l3_device": "%s", "device": "%s"}\n' "$dev" "$dev"
+			# compact ipv4-address on purpose: the jsonfilter stub extracts it
+			# with a simple sed (no whitespace tolerance needed)
+			printf '{"up": true, "pending": false, "l3_device": "%s", "device": "%s", "ipv4-address":[{"address":"%s","mask":24}]}\n' "$dev" "$dev" "$addr"
 		else
 			echo '{"up": false, "pending": false}'
 		fi

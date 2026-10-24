@@ -55,7 +55,7 @@ install -m 644 "$ROOT/router/wanguard.nft"                "$W/usr/share/wanguard
 install -m 644 "$ROOT/router/etc.config.wanguard.example" "$W/usr/share/wanguard/etc.config.wanguard.example"
 pkg wanguard \
 	"Per-MAC policy routing for OpenWrt: client groups, nft marking, main-egress health-watch" \
-	"ip-full nftables" "$W"
+	"ip-full nftables conntrack" "$W"
 
 # ---- luci-app-wanguard ----
 L="$work/luci-app-wanguard"

@@ -1,0 +1,7 @@
+#!/bin/sh
+# mock conntrack (#24 tests): log the invocation, always succeed.
+# Log file: $CONNTRACKLOG. CONNTRACK_FAILS=1 -> exit 1 (tool error path:
+# the caller must survive it).
+[ -n "${CONNTRACKLOG:-}" ] && echo "conntrack $*" >> "$CONNTRACKLOG"
+[ "${CONNTRACK_FAILS:-0}" = 1 ] && exit 1
+exit 0

@@ -8,6 +8,9 @@
 # route dies with it) and the fallback `metric 200` via the main WAN while
 # Meta is down. Doing the flips via UCI keeps the render model the single
 # source of truth — this loop and the watchdog can never fight.
+# After apply the pending conntrack flushes (#24) are processed: a switch
+# invalidates the old egress's NAT bindings, without the flush long-lived
+# sessions keep hanging out the old WAN until the entries expire.
 # Idempotent diff (no flush windows), safe to run concurrently with the CLI.
 # Logs only non-trivial output (changes, warnings, errors) via logger.
 while :; do
@@ -15,5 +18,7 @@ while :; do
 	[ -n "$wout" ] && logger -t wanguard-wand "$wout"
 	out=$(/usr/bin/wanguard apply 2>&1)
 	[ "$out" = in-sync ] || logger -t wanguard-keepalive "$out"
+	fout=$(/usr/bin/wanguard wan-flush 2>&1)
+	[ -n "$fout" ] && logger -t wanguard-wand "$fout"
 	sleep 10
 done

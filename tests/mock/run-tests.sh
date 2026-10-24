@@ -1,10 +1,11 @@
 #!/bin/sh
 # Mock tests for the wanguard WAN watchdog (issue #23: N-of-M probe anchors;
-# #6 failover state machine on top of them).
+# #6 failover state machine on top of them; #24 targeted conntrack flush
+# on egress switches).
 #
 # Runs the REAL router/wanguard against stubbed uci/ubus/ip/nft/curl/
-# jsonfilter/date (tests/mock/bin). POSIX sh only (busybox ash / dash);
-# developed under WSL:  wsl -e sh tests/mock/run-tests.sh
+# jsonfilter/date/conntrack (tests/mock/bin). POSIX sh only (busybox ash /
+# dash); developed under WSL:  wsl -e sh tests/mock/run-tests.sh
 #
 # WARNING: wipes /tmp/wanguard (the wand state dir) — never run on a router.
 set -u
@@ -27,9 +28,11 @@ T=0 # test counter
 UCI_STATE=$TMP/uci.state
 UCI_SECTIONS=$TMP/uci.sections
 UBUS_IFACES=$TMP/ubus.ifaces
+UBUS_ADDRS=$TMP/ubus.addrs
 CURLMAP=$TMP/curl.map
 DATE_COUNT=$TMP/date.count
-export UCI_STATE UCI_SECTIONS UBUS_IFACES CURLMAP DATE_COUNT
+CONNTRACKLOG=$TMP/conntrack.log
+export UCI_STATE UCI_SECTIONS UBUS_IFACES UBUS_ADDRS CURLMAP DATE_COUNT CONNTRACKLOG
 
 cleanup() { rm -rf "$TMP" "$WAND"; }
 trap cleanup EXIT
@@ -40,7 +43,9 @@ reset_router() {
 	: > "$UCI_STATE"
 	: > "$UCI_SECTIONS"
 	: > "$UBUS_IFACES"
+	: > "$UBUS_ADDRS"
 	: > "$CURLMAP"
+	: > "$CONNTRACKLOG"
 	echo 1000000000 > "$DATE_COUNT"
 }
 
@@ -48,6 +53,7 @@ reset_router() {
 add_group()      { echo "$1=group" >> "$UCI_SECTIONS"; }
 uci_set()        { uci set "wanguard.$1=$2"; }
 add_iface_dev()  { echo "$1=$2" >> "$UBUS_IFACES"; }
+add_iface_addr() { echo "$1=$2" >> "$UBUS_ADDRS"; }
 map_anchor()     { echo "$1" >> "$CURLMAP"; }
 remap_anchor()   { # change an existing mapping (stub: first match wins)
 	p="$1"; v="$2"
@@ -209,6 +215,116 @@ map_anchor 'legacy=fail'
 map_anchor 'fresh=ok'
 tick >/dev/null; tick >/dev/null
 assert_eq "T10 list wins: alive=1, not 0" "$(field vpn.alive)" "1"
+
+echo
+echo "== #24: conntrack flush on egress switches =="
+
+# --- T11: failover writes a pending flush; wan-flush deletes via old WAN IP ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+tick >/dev/null # seed a.home=vpn, b.home=wan2
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # vpn down x3 -> failover a>wan2
+[ -f "$WAND/a.flush" ] && ok "T11 pending flush written on failover" || bad "T11 pending flush written on failover" "absent" "$WAND/a.flush"
+assert_eq "T11 pending flush names the old egress" "$(cat "$WAND/a.flush" 2>/dev/null)" "vpn"
+: > "$CONNTRACKLOG"
+out=$(sh "$WG" wan-flush)
+assert_contains "T11 wan-flush logs the event" "$out" "flush:a>vpn(198.51.100.10)"
+assert_contains "T11 conntrack got -D -q old-WAN-IP" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.10"
+[ -f "$WAND/a.flush" ] && bad "T11 pending file consumed" "still there" "removed" || ok "T11 pending file consumed"
+out=$(sh "$WG" wan-flush) # nothing pending -> silence
+assert_eq "T11 idle wan-flush is silent" "$out" ""
+
+# --- T12: idle tick -> no flush requests, no conntrack calls ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+tick >/dev/null; tick >/dev/null; tick >/dev/null; tick >/dev/null # seed + 3 quiet
+assert_eq "T12 no pending flushes in idle cycle" "$(ls "$WAND"/*.flush 2>/dev/null || echo none)" "none"
+assert_eq "T12 no conntrack calls in idle cycle" "$(cat "$CONNTRACKLOG")" ""
+
+# --- T13: failback writes a pending flush of the backup being left ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+tick >/dev/null # seed
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # failover a>wan2
+sh "$WG" wan-flush >/dev/null # consume the failover flush
+rm -f "$WAND/vpn.force"
+echo fail > "$WAND/wan2.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null; tick >/dev/null; tick >/dev/null
+out=$(tick) # vpn up again (6 oks) + wan2 down -> failback in the same tick
+assert_contains "T13 failback happened" "$out" "failback:a>vpn"
+assert_eq "T13 pending flush names the left backup" "$(cat "$WAND/a.flush" 2>/dev/null)" "wan2"
+: > "$CONNTRACKLOG"
+out=$(sh "$WG" wan-flush)
+assert_contains "T13 conntrack got -D -q backup-IP" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.20"
+
+# --- T14: wanset flushes the old egress; same-iface wanset does not ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+tick >/dev/null # seed
+: > "$CONNTRACKLOG"
+out=$(sh "$WG" wanset a wan2 2>&1)
+assert_contains "T14 wanset re-pins the group" "$out" "pinned to 'wan2'"
+assert_contains "T14 wanset flushed the old egress" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.10"
+: > "$CONNTRACKLOG"
+out=$(sh "$WG" wanset a wan2 2>&1) # same iface: no switch, no flush
+assert_eq "T14 same-iface wanset: no conntrack call" "$(cat "$CONNTRACKLOG")" ""
+
+# --- T15: conntrack tool absent -> switch still works, no crash ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+tick >/dev/null # seed
+NOCT="$TMP/bin-noct" # mocks without conntrack: tool-not-installed simulation
+mkdir -p "$NOCT"
+for b in uci ubus jsonfilter curl date ip nft; do ln -s "$MOCKBIN/$b" "$NOCT/$b"; done
+echo fail > "$WAND/vpn.force"
+# NB: plain prepending is not enough — PATH already contains MOCKBIN from the
+# header, so build the PATH explicitly: stubs minus conntrack + system bins.
+PATH="$NOCT:/usr/bin:/bin" sh "$WG" wand-tick >/dev/null
+PATH="$NOCT:/usr/bin:/bin" sh "$WG" wand-tick >/dev/null
+out=$(PATH="$NOCT:/usr/bin:/bin" sh "$WG" wand-tick)
+assert_contains "T15 failover still fires without conntrack" "$out" "failover:a>wan2"
+out=$(PATH="$NOCT:/usr/bin:/bin" sh "$WG" wan-flush)
+assert_eq "T15 wan-flush without conntrack: silent, rc=0" "$out" ""
+
+# --- T16: dead old iface -> remembered addr is used for the flush ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+tick >/dev/null # seed; caches $WAND/vpn.addr
+tmpf="$UBUS_IFACES.new"
+grep -v '^vpn=' "$UBUS_IFACES" > "$tmpf" 2>/dev/null || : > "$tmpf" # iface vanishes
+mv "$tmpf" "$UBUS_IFACES"
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # failover; live resolve impossible
+: > "$CONNTRACKLOG"
+out=$(sh "$WG" wan-flush)
+assert_contains "T16 remembered addr used" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.10"
+assert_contains "T16 event still logged" "$out" "flush:a>vpn(198.51.100.10)"
+
+# --- T17: conntrack tool error -> tick and wan-flush survive ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+tick >/dev/null # seed
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null
+out=$(CONNTRACK_FAILS=1 sh "$WG" wan-flush)
+assert_contains "T17 conntrack failure tolerated, event logged" "$out" "flush:a>vpn(198.51.100.10)"
 
 echo
 echo "passed: $PASS, failed: $FAIL (ticks: $T)"

@@ -31,6 +31,9 @@
 #   wanguard wanstatus                WAN probe states + group home/current/mode (#6)
 #   wanguard wanset <group> <iface>   pin group to iface (manual override)
 #   wanguard wanauto <group>          resume watchdog auto-mode
+#   wanguard wan-flush                process pending conntrack flushes (#24:
+#                                     wand-tick writes them on failover/failback,
+#                                     the keepalive runs this after apply)
 #
 # Probe anchors (#23): UCI list wan_anchors (URLs) — or legacy
 # wan_anchor1/wan_anchor2, or 2 built-in defaults; option wan_reliability N
@@ -141,6 +144,13 @@ iface_device() { # netifd iface name -> l3_device; empty when down/missing
 	st=$(ubus call network.interface."$1" status 2>/dev/null) || return 0
 	printf '%s' "$st" | grep -q '"up":[[:space:]]*true' || return 0
 	printf '%s' "$st" | jsonfilter -e '@.l3_device' -e '@.device' 2>/dev/null | awk 'NF { print; exit }'
+}
+
+iface_addr() { # netifd iface name -> first IPv4; empty when down/missing (#24)
+	local st
+	[ -n "$1" ] || return 0
+	st=$(ubus call network.interface."$1" status 2>/dev/null) || return 0
+	printf '%s' "$st" | jsonfilter -e '@.ipv4-address[0].address' 2>/dev/null | awk 'NF { print; exit }'
 }
 
 # ---------- migration (issue #13, idempotent) ----------
@@ -298,8 +308,11 @@ reconcile_routes() { # $1=alloc file -> prints change count; warnings to stderr
 # once home recovers. Min dwell between switches of one group: 60s.
 # Flips are done via UCI iface= + the keepalive's apply, so the render
 # model stays the single source of truth (keepalive never fights the
-# watchdog). Proxy groups are never touched (mihomo fails over via the
-# main-table metrics itself).
+# watchdog). Each egress switch also schedules a targeted conntrack
+# flush (#24): long sessions would otherwise hang on the old NAT
+# binding; the pending flush runs in the keepalive AFTER apply. Proxy
+# groups are never touched (mihomo fails over via the main-table
+# metrics itself).
 
 WAND_DIR=/tmp/wanguard
 WAND_MIN_DWELL=60
@@ -387,14 +400,60 @@ wand_probe() { # $1=wan $2=device -> exit 0 if >= wan_reliability anchors answer
 	[ "$alive" -ge "$(wand_reliability)" ]
 }
 
+# ---------- conntrack flush on egress switch (issue #24) ----------
+#
+# Forwarded client traffic is masqueraded: the NAT binding lives in the
+# conntrack entry, so after a group moves to another WAN long-lived
+# sessions keep flowing out the OLD egress until the entries expire
+# (the classic mwan3 problem). Targeted fix: delete only entries whose
+# reply-dst is the old egress IPv4 — exactly the mappings made through
+# it. Connections TO the router (SSH/LuCI/DNS) and LAN<->LAN traffic
+# are never NAT'ed (reply-dst is a LAN address) and can never match.
+# Router-own flows (probes, NTP) are short-lived; a hit one re-keys on
+# the next packet. Proxy groups are never switched, hence never flushed
+# (mihomo re-dials itself). Without the conntrack tool the flush
+# degrades to a no-op: failover still works, sessions heal the old way
+# (retransmit after entry timeout / app retry).
+
+wand_conntrack_flush() { # $1=group $2=old-iface -> echo event; empty = nothing to do
+	local g="$1" old="$2" ip
+	[ -n "$old" ] || return 0
+	command -v conntrack >/dev/null 2>&1 || return 0
+	ip=$(iface_addr "$old") # live address (wanset/groupset: old iface still up)
+	[ -n "$ip" ] || ip=$(cat "$WAND_DIR/$old.addr" 2>/dev/null) # remembered by the
+	[ -n "$ip" ] || return 0 # probe phase (failover: the dead iface has none)
+	conntrack -D -q "$ip" >/dev/null 2>&1
+	echo "flush:$g>$old($ip)"
+}
+
+cmd_wanflush() { # process pending flush requests written by wand-tick (#24):
+	# tick runs BEFORE the keepalive's apply, the flush must run AFTER it
+	# (otherwise sessions created in between re-grab the old NAT binding).
+	local f g old out=""
+	for f in "$WAND_DIR"/*.flush; do
+		[ -f "$f" ] || continue
+		g=$(basename "$f" .flush)
+		old=$(cat "$f")
+		rm -f "$f"
+		out="$out $(wand_conntrack_flush "$g" "$old")"
+	done
+	out=${out# }
+	[ -n "$out" ] && echo "wand:$out"
+	return 0
+}
+
 cmd_wand_tick() { # one watchdog step; runs from the keepalive right before apply
 	command -v curl >/dev/null 2>&1 || return 0
 	mkdir -p "$WAND_DIR"
-	local now wan dev fails oks state events=""
+	local now wan dev fails oks state events="" a
 	now=$(date +%s)
 	# --- probe phase: update per-wan state files ---
 	for wan in $(wand_wans); do
 		dev=$(iface_device "$wan")
+		if [ -n "$dev" ]; then # remember the live IPv4 (#24): by flip time the
+			a=$(iface_addr "$wan") # dead iface has no address left to resolve
+			[ -n "$a" ] && echo "$a" > "$WAND_DIR/$wan.addr"
+		fi
 		if [ -n "$dev" ] && wand_probe "$wan" "$dev"; then
 			oks=$(( $(cat "$WAND_DIR/$wan.oks" 2>/dev/null || echo 0) + 1 ))
 			echo 0 > "$WAND_DIR/$wan.fails"
@@ -443,12 +502,14 @@ cmd_wand_tick() { # one watchdog step; runs from the keepalive right before appl
 			uci set "$CONF.$g.iface=$backup"
 			uci commit "$CONF"
 			echo "$now" > "$WAND_DIR/$g.lastswitch"
-			events="$events failover:$g>$backup"
+			echo "$home" > "$WAND_DIR/$g.flush" # deferred conntrack flush (#24),
+			events="$events failover:$g>$backup" # processed after apply by wan-flush
 		else
 			[ "$(wand_state "$home")" = up ] || continue
 			uci set "$CONF.$g.iface=$home"
 			uci commit "$CONF"
 			echo "$now" > "$WAND_DIR/$g.lastswitch"
+			echo "$cur" > "$WAND_DIR/$g.flush" # the backup being left gets flushed
 			events="$events failback:$g>$home"
 		fi
 	done
@@ -487,15 +548,19 @@ cmd_wanstatus() {
 }
 
 cmd_wanset() {
-	local g="$1" ifc="$2"
+	local g="$1" ifc="$2" old
 	group_exists "$g" || err "no such group: '$g' (see: wanguard grouplist)"
 	[ "$(group_opt "$g" type)" = direct ] || err "group '$g' is proxy — it follows mihomo, wanset does not apply"
 	ubus call network.interface."$ifc" status >/dev/null 2>&1 || err "unknown netifd iface: '$ifc'"
+	old=$(group_opt "$g" iface)
 	uci set "$CONF.$g.iface=$ifc"
 	uci set "$CONF.$g.wanmode=override"
 	uci commit "$CONF" || err "uci commit failed"
 	msg "group '$g' pinned to '$ifc' (manual override; watchdog skips it; resume: wanguard wanauto $g)"
 	cmd_apply
+	if [ -n "$old" ] && [ "$old" != "$ifc" ]; then # re-route long sessions
+		msg "wand: $(wand_conntrack_flush "$g" "$old")" # pinned away from old (#24)
+	fi
 }
 
 cmd_wanauto() {
@@ -701,8 +766,9 @@ cmd_groupadd() {
 }
 
 cmd_groupset() {
-	local name="$1" val="$2" cur
+	local name="$1" val="$2" cur old=""
 	group_exists "$name" || err "no such group: '$name' (see: wanguard grouplist)"
+	cur=$(group_opt "$name" iface)
 	if [ "$val" = proxy ]; then
 		local other
 		for other in $(proxy_ids); do
@@ -717,6 +783,7 @@ cmd_groupset() {
 		[ -n "$val" ] || err "usage: wanguard groupset <name> <iface|proxy>"
 		[ "$val" != direct ] || err "'direct' alone is not an interface name — pass a netifd iface (e.g. vpn, wan2; see: wanguard grouplist)"
 		uci set "$CONF.$name.type=direct"
+		[ -n "$cur" ] && old=$cur # direct->direct retarget flushes old (#24)
 		uci set "$CONF.$name.iface=$val"
 		# permanent retarget redefines the watchdog home (issue #6)
 		uci set "$CONF.$name.wan_home=$val"
@@ -727,6 +794,9 @@ cmd_groupset() {
 	uci commit "$CONF" || err "uci commit failed"
 	msg "group '$name' updated ($([ "$val" = proxy ] && echo proxy || echo "direct -> $val"))"
 	cmd_apply
+	if [ -n "$old" ] && [ "$old" != "$val" ]; then # re-route long sessions
+		msg "wand: $(wand_conntrack_flush "$name" "$old")" # from the old egress (#24)
+	fi
 }
 
 cmd_groupdel() {
@@ -863,6 +933,7 @@ case "$1" in
 	wanset)    shift; [ $# -ge 2 ] || err "usage: wanguard wanset <group> <iface>"; cmd_wanset "$@" ;;
 	wanauto)   shift; [ $# -ge 1 ] || err "usage: wanguard wanauto <group>"; cmd_wanauto "$@" ;;
 	wand-tick) cmd_wand_tick ;;
+	wan-flush) cmd_wanflush ;;
 	""|help|-h|--help) cmd_help ;;
 	*) err "unknown command: $1 (try: wanguard help)" ;;
 esac

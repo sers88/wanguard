@@ -1,6 +1,6 @@
 #!/bin/sh
-# mock jsonfilter: emulates `jsonfilter -s - -e @.path ...` for the two
-# paths the wanguard CLI reads from ubus status JSON (reads stdin).
+# mock jsonfilter: emulates `jsonfilter -s - -e @.path ...` for the paths
+# the wanguard CLI reads from ubus status JSON (reads stdin).
 input=$(cat)
 for arg in "$@"; do
 	case "$arg" in
@@ -10,6 +10,9 @@ for arg in "$@"; do
 			;;
 		*@.device*)
 			printf '%s\n' "$input" | sed -n 's/.*"device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+			;;
+		*@.ipv4-address*)
+			printf '%s\n' "$input" | sed -n 's/.*"ipv4-address"[^]]*"address":"\([^"]*\)".*/\1/p'
 			;;
 		*) ;;
 	esac
