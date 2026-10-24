@@ -84,6 +84,12 @@ powershell .\scripts\deploy-wanguard.ps1    # CLI + keepalive + init.d + nft ske
 powershell .\scripts\deploy-luci.ps1        # LuCI app
 ```
 
+**Policy**: production updates must go through the signed feed — push a
+`v*` tag, wait for CI, then `apk update && apk upgrade` on the router.
+The deploy scripts are for development windows only; anything they put on
+the router must be followed by a tag so the feed matches the box again
+(the `wanstatus` ANCHORS column doubles as the skew canary).
+
 ## Repository layout
 
 | Path | What it is |
