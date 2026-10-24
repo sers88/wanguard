@@ -10,7 +10,7 @@ word belongs to the owner; this document prepares it.
 | Artifact | Result |
 |---|---|
 | `wand.uc` — ucode port of the tick path | 311 lines vs 939 sh (whole-file; tick path is ~40% of the sh file) |
-| Differential scenarios (`scenario.sh`, `scenario26.sh`) | byte-identical events sh vs ucode: seed / 3-fail down / failover / dwell hold / 6-ok up / failback / #26 list-order failover / re-failover / flush protocol / final UCI state |
+| Differential scenarios (`scenario.sh`, `scenario26.sh`) | byte-identical events sh vs ucode: seed / 3-fail down / failover / dwell hold / 6-ok up / failback / #26 list-order failover / re-failover / flush protocol / final UCI state; 3×3 GREEN consolidated runs (suites + scenarios in one container); one flake root-caused to stray uci deltas (`/tmp/.uci`) and cross-script stub leakage — both now cleaned in every reset |
 | `run-tests-ucode.sh` — representative T-port | 20/20 (#23 T1–T10, #6 T9, #26 B1/B2); sh suite 67/67 in the same container |
 | Test infrastructure feasibility (the HIGH risk) | **resolved**: ucode children are spawned via /bin/sh → existing PATH stubs (curl/date/conntrack) intercept unchanged; native ubus is mocked by a `.uc` module shadowing via `ucode -L`; uci stays REAL on /etc/config on both sides |
 | Packaging (`build-spike.sh` + `install-test.sh`) | apk builds with pinned apk.static 3.0.7; installs into openwrt/rootfs 25.12.5; `#!/usr/bin/ucode` shebang works; ucode itself was already installed (not pulled as a dependency); unmodified keepalive loop body drives the ucode CLI; passthrough output byte-parity for apply/wan-flush |
@@ -22,7 +22,7 @@ word belongs to the owner; this document prepares it.
 |---|---|---|
 | 1 | Fork collapse per 10 s tick | **sh 58 → ucode 4 external children** (14.5×) in prod shape (2 direct groups, 2 WANs, 2 anchors): sh = 30 uci + 6 awk + 6 grep + 4 jsonfilter + 4 curl + 3 sort + 2 cut + 2 sed + 1 date; ucode = 4 curl (probe only; array-form `fs.popen` would also drop the 4 /bin/sh wrappers) |
 | 2 | Bug classes eliminated by design | jsonfilter quoted-key (live prod bug e98ae77), word-splitting, `case " $(cmd) "` multiline (#26) — NOTE: all already patched in sh; the classes are closed, not open |
-| 3 | Wall-time per tick | container probe: sh 21.8 ms vs ucode 12.1 ms median (~1.8×). ROUTER: pending HITL window 1/2 |
+| 3 | Wall-time per tick | container probe (forced-probe path, full steady state): sh ~110 ms vs ucode ~13.5 ms median (~8×). NB: on the router the tick's wall-time is dominated by the REAL curl probes, which are identical external calls in both variants — the win there applies to the non-blocking plumbing only; the ROUTER row from the HITL windows decides |
 | 4 | Memory | pending (VmHWM method in bench-sh.sh). ROUTER: pending |
 | 5 | Readability | tick path: state as objects (one ubus dump → map) vs grep/cut/sed pipelines; type-safe numbers (dwell/oks/fails) vs string comparisons |
 | 6 | OpenWrt ecosystem alignment | fw4/rpcd/LuCI2 are ucode; matches upstream direction |

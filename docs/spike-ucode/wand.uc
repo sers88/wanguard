@@ -45,7 +45,7 @@ function state_read(name, dflt) {
 	return (s != '') ? s : dflt;
 }
 
-function state_write(name, val) { fs.writefile(`${WAND_DIR}/${name}`, `${val}`); }
+function state_write(name, val) { fs.writefile(`${WAND_DIR}/${name}`, `${val}\n`); } // sh parity: `echo val > file`
 
 function state_int(name) {
 	let s = state_read(name, '0');

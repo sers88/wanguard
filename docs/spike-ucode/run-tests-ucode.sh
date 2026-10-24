@@ -24,9 +24,11 @@ mkdir -p "$TMP" "$WAND"
 # stubs: ONLY curl/date/conntrack are intercepted (ucode spawns them as
 # children, so PATH shims work); uci stays REAL (both the runner and the
 # ucode cursor read/write /etc/config); ubus is mocked via -L, not PATH
-mkdir -p /tmp/shim
-for b in curl date conntrack; do cp "$MOCKBIN/$b" /tmp/shim/$b; chmod +x /tmp/shim/$b; done
-PATH="/tmp/shim:$PATH"
+# (own dir: never leak stubs into other scripts sharing /tmp)
+rm -rf /tmp/ucsuite-shim
+mkdir -p /tmp/ucsuite-shim
+for b in curl date conntrack; do cp "$MOCKBIN/$b" /tmp/ucsuite-shim/$b; chmod +x /tmp/ucsuite-shim/$b; done
+PATH="/tmp/ucsuite-shim:$PATH"
 export PATH
 UBUS_IFACES=$TMP/ubus.ifaces
 UBUS_ADDRS=$TMP/ubus.addrs
@@ -41,8 +43,8 @@ PASS=0
 FAIL=0
 
 reset_router() {
-	rm -rf "$WAND"
-	mkdir -p "$WAND"
+	rm -rf "$WAND" /tmp/.uci # /tmp/.uci: stray deltas would leak across
+	mkdir -p "$WAND"         # test configs (seen once in the scenarios)
 	: > "$UBUS_IFACES"
 	: > "$UBUS_ADDRS"
 	: > "$CURLMAP"

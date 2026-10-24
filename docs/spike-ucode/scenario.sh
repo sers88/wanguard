@@ -26,10 +26,12 @@ export UBUS_IFACES=/tmp/ubus.ifaces
 export UBUS_ADDRS=/dev/null
 # sh side: ONLY the ubus binary is stubbed (same fixture files); uci/date/
 # curl/jsonfilter stay real so both runners see identical /etc/config state
-mkdir -p /tmp/shim
-cp /repo/tests/mock/bin/ubus /tmp/shim/ubus
-chmod +x /tmp/shim/ubus
-PATH="/tmp/shim:$PATH"
+# (fresh dir: run-tests-ucode.sh may have left a date stub in /tmp/shim)
+rm -rf /tmp/scen-shim
+mkdir -p /tmp/scen-shim
+cp /repo/tests/mock/bin/ubus /tmp/scen-shim/ubus
+chmod +x /tmp/scen-shim/ubus
+PATH="/tmp/scen-shim:$PATH"
 export PATH
 
 cat > /etc/config/wanguard <<'EOF'
@@ -43,10 +45,10 @@ config group 'b'
 EOF
 
 reset() {
-	rm -rf /tmp/wanguard
-	mkdir -p /tmp/wanguard
-	echo ok > /tmp/wanguard/wan1.force
-	echo ok > /tmp/wanguard/wan2.force
+	rm -rf /tmp/wanguard /tmp/.uci # /tmp/.uci: stray uci deltas from
+	mkdir -p /tmp/wanguard        # earlier runs would apply onto the
+	echo ok > /tmp/wanguard/wan1.force # fresh heredoc config (flake seen
+	echo ok > /tmp/wanguard/wan2.force # once: seed events reordered)
 }
 reset
 

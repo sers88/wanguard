@@ -22,10 +22,11 @@ mkdir -p /etc/config /var/run
 printf 'wan1=eth0\nwan2=eth1\nwan3=eth2\n' > /tmp/ubus.ifaces
 export UBUS_IFACES=/tmp/ubus.ifaces
 export UBUS_ADDRS=/dev/null
-mkdir -p /tmp/shim
-cp /repo/tests/mock/bin/ubus /tmp/shim/ubus
-chmod +x /tmp/shim/ubus
-PATH="/tmp/shim:$PATH"
+rm -rf /tmp/scen-shim
+mkdir -p /tmp/scen-shim
+cp /repo/tests/mock/bin/ubus /tmp/scen-shim/ubus
+chmod +x /tmp/scen-shim/ubus
+PATH="/tmp/scen-shim:$PATH"
 export PATH
 
 cat > /etc/config/wanguard <<'EOF'
@@ -47,7 +48,7 @@ config group 'c'
 EOF
 
 reset() {
-	rm -rf /tmp/wanguard
+	rm -rf /tmp/wanguard /tmp/.uci # /tmp/.uci: stray uci deltas
 	mkdir -p /tmp/wanguard
 	for w in wan1 wan2 wan3; do echo ok > /tmp/wanguard/$w.force; done
 }
