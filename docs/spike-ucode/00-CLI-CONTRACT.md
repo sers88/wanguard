@@ -27,7 +27,7 @@ can never deploy.
 | `backupset` | `<group> <iface>...` | confirmation line | #26 |
 | `wand-tick` | — | `wand:<events>` one line, empty when quiet | runs before apply in keepalive |
 | `wan-flush` | — | `wand: flush:...` events, empty when quiet | runs after apply in keepalive |
-| (default/help) | — | usage text, exit 1 | |
+| (default/help) | — | usage/help text | **exit 0** (`""`/`help`/`-h`/`--help` → cmd_help) | |
 
 Errors: `wanguard: <message>` on **stderr**, exit 1 (`err()`).
 

@@ -81,14 +81,16 @@ function globals_opt(opt) {
 function ubus_conn() { // absent ubusd == "all ifaces down", same as sh `|| exit`
 	if (!fs.access('/var/run/ubus.sock'))
 		return null;
-	let conn;
-	// nb: connect() raises when ubusd dies between access() and connect —
-	// acceptable for a tick process (keepalive just re-runs it in 10 s)
-	conn = ubus.connect();
-	for (let o in conn.objects())
-		if (o[0] == 'network.interface')
-			return conn;
-	conn.close();
+	try {
+		let conn = ubus.connect(); // raises when ubusd died between the
+		for (let o in conn.objects()) // access() check and connect — caught
+			if (o[0] == 'network.interface')
+				return conn;
+		conn.close();
+	}
+	catch (e) {
+		return null; // keepalive just re-runs the tick in 10 s
+	}
 	return null;
 }
 
@@ -317,7 +319,10 @@ function probe_selftest() { // router window evidence (runbook window 2)
 }
 
 function passthrough(args) { // stock sh CLI handles the rest of the contract
-	let p = fs.popen(`/usr/bin/wanguard ${join(' ', args)} 2>&1`, 'r');
+	// default matches the spike package layout (both shipped side by
+	// side); on a stock router export WANGUARD_SH=/usr/bin/wanguard
+	let sh = getenv('WANGUARD_SH') ?? '/usr/bin/wanguard-sh';
+	let p = fs.popen(`${sh} ${join(' ', args)} 2>&1`, 'r');
 	let out = p.read('all') ?? '';
 	let rc = p.close();
 	print(out);

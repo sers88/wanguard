@@ -29,6 +29,7 @@ After Phase 1 lands the ucode skeleton on `spike/ucode`:
 ```sh
 scp docs/spike-ucode/wand.uc root@192.168.x.x:/tmp/wanguard.ucode
 ssh root@192.168.x.x
+export WANGUARD_SH=/usr/bin/wanguard   # passthrough target for apply etc.
 RUNNER=ucode WG=/tmp/wanguard.ucode CMDS=wand-tick sh /tmp/bench-sh.sh
 ```
 
@@ -38,9 +39,10 @@ backup selection, state machine). `apply`/`wan-flush` pass through to the
 stock sh CLI, so they are NOT benched in this window (only `wand-tick`
 runs the ucode code); the sh baseline numbers from window 1 cover them.
 
-Also run during the window: `/tmp/wanguard.ucode probe-selftest` — prints
-the ubus iface map and per-anchor probe results for manual comparison
-with `curl --interface <dev> ...` behavior (Phase 1.3 evidence).
+Also run during the window: `WANGUARD_SH=/usr/bin/wanguard ucode /tmp/wanguard.ucode
+probe-selftest` — prints the ubus iface map and per-anchor probe results for
+manual comparison with `curl --interface <dev> ...` behavior (Phase 1.3
+evidence).
 
 ## Anti-goals (both windows)
 
