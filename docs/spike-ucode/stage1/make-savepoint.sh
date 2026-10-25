@@ -1,0 +1,197 @@
+#!/bin/sh
+# make-savepoint.sh — stage-1 rollback kit, part 1 (issue #30).
+#
+# Runs ON THE ROUTER (busybox ash), BEFORE the spike package is installed.
+# Creates /root/rollback/<ts>/ containing everything needed to roll the
+# window back with ZERO internet: copies of every file the spike package
+# touches, state dumps for before/after comparison, the stock wanguard apk
+# fetched from the feed while the network is still up, and a generated
+# one-command rollback.sh.
+#
+# Usage:
+#   sh make-savepoint.sh [--force] [/path/to/wanguard-<ver>.apk]
+#
+#   --force   warn instead of aborting on preflight failures (lab/testing
+#             use; on the router run WITHOUT it)
+#   apk path  use this apk instead of `apk fetch` from the feed
+#
+# The rollback ladder it prepares (also printed by rollback.sh):
+#   L0  /etc/init.d/wanguard stop            freeze: no more tick flips
+#   L1  sh /root/rollback/<ts>/rollback.sh   sh CLI back in ~10 s
+#   L2  sh /root/rollback/<ts>/rollback.sh --uci   + UCI from snapshot
+#   L3  sh /root/rollback/<ts>/rollback.sh --apk   full offline reinstall
+#   L4  OpenWrt failsafe 192.168.1.1         last resort (out of band)
+set -u
+FORCE=0
+APK_SRC=""
+for a in "$@"; do
+	case "$a" in
+	--force) FORCE=1 ;;
+	*.apk) APK_SRC="$a" ;;
+	*) echo "usage: sh make-savepoint.sh [--force] [file.apk]" >&2; exit 2 ;;
+	esac
+done
+
+note() { printf '%s\n' "$*"; }
+die() { printf 'ABORT: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'WARN: %s\n' "$*"; }
+preflight_fail() {
+	if [ "$FORCE" = 1 ]; then warn "$*"; else die "$*"; fi
+}
+
+TS=$(date +%Y%m%d-%H%M%S)
+SP="/root/rollback/$TS"
+mkdir -p "$SP" || die "cannot mkdir $SP"
+
+# ---------- preflight ----------
+# The savepoint must capture the STOCK state; the spike install happens AFTER.
+if [ "$(head -1 /usr/bin/wanguard 2>/dev/null)" = "#!/usr/bin/ucode" ]; then
+	preflight_fail "/usr/bin/wanguard is ALREADY ucode — savepoint must run before the spike install"
+fi
+command -v ucode >/dev/null 2>&1 || preflight_fail "ucode missing on PATH — the spike would not run at all"
+if command -v ucode >/dev/null 2>&1; then
+	ucode -e 'import * as uci; import * as ubus; import * as fs' 2>/dev/null \
+		|| preflight_fail "ucode modules (uci/ubus/fs) fail to import — spike would die on first tick"
+fi
+
+# ---------- files the spike package touches ----------
+# fatal: the two files rollback.sh L1/L2 restore
+cp /usr/bin/wanguard "$SP/usr-bin-wanguard" || die "cannot copy /usr/bin/wanguard"
+cp /etc/config/wanguard "$SP/config.wanguard" || die "cannot copy /etc/config/wanguard"
+# expected-present package files (warn if missing — the window must investigate)
+for f in /usr/bin/wanguard-keepalive /usr/bin/wan-watch \
+	/etc/init.d/wanguard /etc/init.d/wan-watch \
+	/usr/share/wanguard/wanguard.nft \
+	/usr/share/wanguard/etc.config.wanguard.example; do
+	if [ -f "$f" ]; then
+		cp "$f" "$SP/$(echo "$f" | tr '/' '_')"
+	else
+		warn "package file missing (unusual): $f"
+	fi
+done
+
+# ---------- state dumps (before/after comparison) ----------
+nft list table inet wanguard >"$SP/nft-table.txt" 2>&1
+ip rule show >"$SP/ip-rule.txt" 2>&1
+: >"$SP/ip-routes.txt"
+i=400
+while [ "$i" -le 520 ]; do
+	ip route show table "$i" 2>/dev/null >>"$SP/ip-routes.txt"
+	i=$((i + 1))
+done
+ip route show >"$SP/ip-route-main.txt" 2>&1
+{
+	echo "== wanguard list"; wanguard list 2>&1
+	echo "== wanguard grouplist"; wanguard grouplist 2>&1
+	echo "== wanguard wanstatus"; wanguard wanstatus 2>&1
+} >"$SP/wanguard-state.txt"
+logread 2>/dev/null | grep wanguard | tail -50 >"$SP/log-before.txt" 2>/dev/null
+
+# md5 of the LIVE router paths (comparable to stage1-manifest.txt)
+md5sum /usr/bin/wanguard /etc/config/wanguard \
+	/usr/bin/wanguard-keepalive /usr/bin/wan-watch \
+	/etc/init.d/wanguard /etc/init.d/wan-watch \
+	/usr/share/wanguard/wanguard.nft \
+	>"$SP/md5sums-before.txt" 2>/dev/null
+
+# ---------- stock apk for the offline L3 rollback ----------
+if [ -n "$APK_SRC" ]; then
+	cp "$APK_SRC" "$SP/" || die "cannot copy $APK_SRC"
+else
+	# feed is configured on the router (/etc/apk/repositories.d/wanguard.list);
+	# fetch while the network is still up — L3 must work with zero internet
+	apk fetch --quiet --output "$SP" wanguard 2>/dev/null || warn "apk fetch failed — copy the apk manually from the feed (see runbook) and re-run"
+fi
+ls "$SP"/wanguard-*.apk >/dev/null 2>&1 || warn "NO stock apk in the savepoint — L3 offline reinstall unavailable, L1 (cp) still works"
+apk ver 2>/dev/null | grep -w wanguard >"$SP/apk-version.txt" 2>/dev/null || \
+	grep -A1 '^P:wanguard$' /lib/apk/db/installed 2>/dev/null | grep '^V:' >"$SP/apk-version.txt" 2>/dev/null || true
+
+# ---------- the one-command rollback ----------
+# L1 restores only the entry binary: every other spike file is byte-identical
+# to stock (md5-verified in the window, gate C), so the next keepalive tick
+# (<=10 s) is fully stock behavior. L3 is the authoritative full reinstall.
+cat >"$SP/rollback.sh" <<ROLLBACK
+#!/bin/sh
+# Generated by make-savepoint.sh at $TS — stage-1 rollback (issue #30).
+#   sh $SP/rollback.sh           L1: restore stock sh CLI, restart, verify
+#   sh $SP/rollback.sh --uci     L2: + /etc/config/wanguard from snapshot
+#   sh $SP/rollback.sh --apk     L3: full offline reinstall of stock package
+# All artifacts are local; NO internet needed. Details: window-runbook.md.
+set -u
+SP="$SP"
+step="\${1:-run}"
+
+[ -f "\$SP/usr-bin-wanguard" ] || { echo "FATAL: \$SP/usr-bin-wanguard missing" >&2; exit 1; }
+
+case "\$step" in
+--uci)
+	cp "\$SP/config.wanguard" /etc/config/wanguard || exit 1
+	echo "L2: /etc/config/wanguard restored from snapshot"
+	exec sh "\$SP/rollback.sh"
+	;;
+--apk)
+	ls "\$SP"/wanguard-*.apk >/dev/null 2>&1 || { echo "FATAL: no saved apk for L3" >&2; exit 1; }
+	apk add --allow-untrusted --force-overwrite "\$SP"/wanguard-*.apk || exit 1
+	echo "L3: stock package reinstalled"
+	exec sh "\$SP/rollback.sh"
+	;;
+run)
+	:
+	;;
+*)
+	echo "usage: sh \$SP/rollback.sh [--uci|--apk]" >&2
+	exit 2
+	;;
+esac
+
+# L1: the sh CLI back as /usr/bin/wanguard (spike's wanguard-sh is the same
+# bytes and may stay — apk ownership is fixed by L3 or the next feed upgrade)
+cp "\$SP/usr-bin-wanguard" /usr/bin/wanguard || exit 1
+chmod 755 /usr/bin/wanguard
+echo "restored: \$(md5sum /usr/bin/wanguard)"
+
+if [ -x /etc/init.d/wanguard ]; then
+	/etc/init.d/wanguard restart >/dev/null 2>&1 || {
+		/etc/init.d/wanguard stop >/dev/null 2>&1
+		sleep 2
+		/etc/init.d/wanguard start >/dev/null 2>&1
+	}
+	echo "service wanguard restarted; waiting one tick (12 s)..."
+	sleep 12
+else
+	echo "WARN: no /etc/init.d/wanguard (lab?) — (re)start the keepalive loop manually"
+fi
+
+logger -t wanguard-rollback "stage-1 ROLLBACK executed from \$SP" 2>/dev/null
+
+echo
+echo "== post-rollback sanity"
+wanguard list 2>&1 | tail -1
+wanguard wanstatus 2>&1 | head -8
+echo
+cat <<'CHECK'
+VERIFY NOW (battery 5/5 from the client):
+  1. telegram   -> 302
+  2. example.com -> 200
+  3. nslookup 192.168.88.1  (LAN DNS)
+  4. SSH to the router
+  5. nslookup ya.ru 8.8.8.8  (UDP through egress)
+wanstatus must show ANCHORS 3/3 and groups on their home egress.
+If anything is red: keep the service STOPPED (/etc/init.d/wanguard stop)
+and escalate (issue #30 window, rollback ladder L4 = failsafe 192.168.1.1).
+CHECK
+ROLLBACK
+chmod 755 "$SP/rollback.sh"
+
+# ---------- summary ----------
+note
+note "== savepoint: $SP"
+ls -la "$SP"
+note
+note "md5 of rollback.sh: $(md5sum "$SP/rollback.sh" | cut -d' ' -f1)"
+note "ROLLBACK COMMAND (write it down):"
+note "  sh $SP/rollback.sh"
+note
+note "Preflight notices: [force=$FORCE]"
+note "Gate D rehearsal (window phase D) will run the command above and reinstall"
+note "the spike afterwards — the rollback is PROVEN, not assumed."
