@@ -1,13 +1,14 @@
 # Verdict draft — ucode migration (issue #29 spike)
 
-**Status: ACCEPTANCE COMPLETE (Docker lab).** Phases 0–3 executed on
-`spike/ucode`; the full acceptance battery C1–C6 ran GREEN in one lab
-session (openwrt/rootfs 25.12.5 containers, real ubusd, real curl probes,
-real nft/ip-rule/conntrack under NET_ADMIN). Per owner decision the
-router was NOT touched: the HITL windows from RUNBOOK.md are cancelled
-and the ROUTER evidence rows are replaced by DOCKER rows below, with the
-explicit caveat that this is not hardware. The final verdict word belongs
-to the owner; this document prepares it.
+**Status: DECIDED — YES, full staged ucode migration (owner, 2026-10-25).**
+The acceptance battery C1–C6 ran GREEN in one lab session (openwrt/rootfs
+25.12.5 containers, real ubusd, real curl probes, real nft/ip-rule/
+conntrack under NET_ADMIN); the router itself was never touched (owner
+decision). After this evidence the owner accepted the full staged
+migration: single agent, no-rush schedule, per-stage tests + tag + live
+5/5 acceptance. The staged plan and its issues live in the private
+tracker (sers88/wanguard-home); this document records the evidence and
+the original draft recommendation (kept below as history).
 
 ## What was proven (all green, reproducible)
 
@@ -81,6 +82,11 @@ real `network.interface` objects, NET_ADMIN for nft/ip-rule/conntrack.
   unproven (see losses #1) — that trust cannot be earned in Docker.
 
 ## Verdict draft (owner decides)
+
+**RECORDED DECISION (2026-10-25): YES — full staged migration** (этапы:
+tick → wan-flush → apply → CLI → retire sh; каждая стадия = тесты зелёные
++ тег + живая приёмка 5/5; один агент, без спешки). Драфт-рекомендация
+ниже сохранена как история обсуждения.
 
 - **Recommended: NO — keep sh, with an explicit revisit trigger.** The
   measured wins are real but modest on this scale: the fork collapse
