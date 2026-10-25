@@ -11,9 +11,15 @@
  *   - wand_backups() selection (#26) and the failover/failback state
  *     machine (3 fails down / 6 oks up / 60 s dwell / UCI-flip + deferred
  *     conntrack flush protocol via /tmp/wanguard/<group>.flush)
+ *   - wan-flush (#24, stage 2): the consumer of that protocol — resolves
+ *     the old egress IPv4 (live via ubus, else <old>.addr), external
+ *     `conntrack -D -q <ip>`, byte-identical flush:<g>><old>(<ip>) events
  *
- * Everything else (apply, wan-flush, ...) is passed through to the stock
- * sh CLI so the keepalive contract keeps working end to end.
+ * Stage 2 (#30/#32): the keepalive's whole tick->apply->flush cycle no
+ * longer descends into sh for the flush leg (`conntrack` itself stays an
+ * external call — fork reduction is not the goal there, leaving sh is).
+ * Everything else (apply, ...) is passed through to the stock sh CLI so
+ * the keepalive contract keeps working end to end.
  *
  * PROBE NOTE (spike finding, Step 1.3): uclient.so exposes
  * new(url,auth,cb)/set_timeout/request/status but libuclient has NO
@@ -212,6 +218,67 @@ function backups(g, home) { // ordered candidates (#26, mwan3 semantics):
 
 function wan_state(wan) { return state_read(`${wan}.state`, 'up'); }
 
+// ---------- conntrack flush on egress switch (issue #24, stage 2) ----------
+
+// Forwarded client traffic is masqueraded: the NAT binding lives in the
+// conntrack entry, so after a group moves to another WAN long-lived
+// sessions keep flowing out the OLD egress until the entries expire
+// (the classic mwan3 problem). Targeted fix: delete only entries whose
+// reply-dst is the old egress IPv4 — exactly the mappings made through
+// it. Connections TO the router (SSH/LuCI/DNS) and LAN<->LAN traffic
+// are never NAT'ed (reply-dst is a LAN address) and can never match.
+// Router-own flows (probes, NTP) are short-lived; a hit one re-keys on
+// the next packet. Proxy groups are never switched, hence never flushed
+// (mihomo re-dials itself). `conntrack` stays an EXTERNAL call (fork
+// reduction is not the goal on this leg — leaving sh for the whole
+// tick->apply->flush cycle is); without the tool the flush degrades to
+// a no-op: failover still works, sessions heal the old way.
+
+function conntrack_available() { // sh parity: `command -v conntrack`
+	return system('command -v conntrack >/dev/null 2>&1') == 0;
+}
+
+function conntrack_flush(g, old, map) { // event string; '' = nothing to do
+	if (old == '')
+		return '';
+	if (!conntrack_available())
+		return '';
+	let ip = map[old]?.addr ?? ''; // live address (wanset/groupset: the
+	if (ip == '')                  // old iface is still up for those)
+		ip = state_read(`${old}.addr`, ''); // remembered by the probe
+	if (ip == '')                  // phase (#24: by flip time the dead
+		return '';             // iface has no address left to resolve)
+	// rc ignored: a tool error must not eat the event — sessions heal
+	// the old way, the event is what the operator sees in the log
+	let p = fs.popen(`conntrack -D -q ${ip} >/dev/null 2>&1`, 'r');
+	p.read('all');
+	p.close();
+	return `flush:${g}>${old}(${ip})`;
+}
+
+function wanflush() { // process pending flush requests written by tick (#24):
+	// tick runs BEFORE the keepalive's apply, the flush must run AFTER
+	// it (otherwise sessions created in between re-grab the old NAT
+	// binding). Files are consumed BEFORE processing: the handling is
+	// idempotent, a mid-way crash must not re-flush.
+	let map = iface_map(); // ONE dump for the whole batch (sh resolves per
+			       // iface) — events and their order are identical
+	let events = [];
+	// sh glob expands alphabetically; no dir / no matches => nothing
+	for (let f in sort(fs.glob(`${WAND_DIR}/*.flush`) ?? [])) {
+		if (fs.stat(f)?.type != 'file') // sh `[ -f ]` parity: non-regular
+			continue;               // glob hits are left untouched
+		let m = match(f, /\/([^\/]+)\.flush$/); // basename minus suffix
+		let old = trim(fs.readfile(f) ?? '');
+		fs.unlink(f); // errors ignored (rm -f parity)
+		let ev = conntrack_flush((m != null) ? m[1] : '', old, map);
+		if (ev != '')
+			push(events, ev);
+	}
+	if (length(events))
+		print(`wand:${join(' ', events)}\n`); // byte-identical to sh
+}
+
 // ---------- wand-tick: one watchdog step ----------
 
 function tick() {
@@ -336,6 +403,9 @@ let cmd = ARGV[0] ?? '';
 switch (cmd) {
 	case 'wand-tick':
 		tick();
+		break;
+	case 'wan-flush':
+		wanflush();
 		break;
 	case 'probe-selftest':
 		probe_selftest();

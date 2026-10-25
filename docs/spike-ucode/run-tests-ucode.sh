@@ -1,10 +1,12 @@
 #!/bin/sh
-# run-tests-ucode.sh — ucode spike test runner (issue #29, Phase 2):
+# run-tests-ucode.sh — ucode test runner (issue #29 Phase 2; #32 stage 2):
 # ports a representative subset of tests/mock/run-tests.sh T-tests to the
-# ucode wand-tick port and runs them against the REAL uci (/etc/config)
-# and the SAME PATH stubs (curl/date/conntrack) as the sh suite; only
-# ubus is intercepted differently (docs/spike-ucode/mock/ubus.uc via
-# `ucode -L`, reading the same UBUS_IFACES/UBUS_ADDRS fixtures).
+# ucode wand-tick/wan-flush port and runs them against the REAL uci
+# (/etc/config) and the SAME PATH stubs (curl/date/conntrack) as the sh
+# suite; only ubus is intercepted differently (docs/spike-ucode/mock/
+# ubus.uc via `ucode -L`, reading the same UBUS_IFACES/UBUS_ADDRS
+# fixtures). F9 additionally diffs the native wan-flush against the stock
+# sh CLI on identical state (byte-parity acceptance of #32).
 #
 # Runs INSIDE the OpenWrt container (ucode is absent in WSL):
 #   docker run --rm -v <repo>:/repo:ro openwrt/rootfs:x86_64-25.12.5 \
@@ -13,6 +15,7 @@ set -u
 
 ROOT=/repo
 UC=$ROOT/docs/spike-ucode/wand.uc
+SH=$ROOT/router/wanguard # stock sh CLI: differential-parity reference (F9)
 MOCK=$ROOT/docs/spike-ucode/mock
 MOCKBIN=$ROOT/tests/mock/bin
 
@@ -21,13 +24,14 @@ WAND=/tmp/wanguard
 rm -rf "$WAND" "$TMP"
 mkdir -p "$TMP" "$WAND"
 
-# stubs: ONLY curl/date/conntrack are intercepted (ucode spawns them as
-# children, so PATH shims work); uci stays REAL (both the runner and the
-# ucode cursor read/write /etc/config); ubus is mocked via -L, not PATH
-# (own dir: never leak stubs into other scripts sharing /tmp)
+# stubs: curl/date/conntrack are intercepted (ucode spawns them as
+# children, so PATH shims work); ubus/jsonfilter are additionally shimmed
+# for the SH differential (F9) — the ucode side never runs them (ubus is
+# mocked via -L, not PATH); uci stays REAL (both the runner and the ucode
+# cursor read/write /etc/config)
 rm -rf /tmp/ucsuite-shim
 mkdir -p /tmp/ucsuite-shim
-for b in curl date conntrack; do cp "$MOCKBIN/$b" /tmp/ucsuite-shim/$b; chmod +x /tmp/ucsuite-shim/$b; done
+for b in curl date conntrack ubus jsonfilter; do cp "$MOCKBIN/$b" /tmp/ucsuite-shim/$b; chmod +x /tmp/ucsuite-shim/$b; done
 PATH="/tmp/ucsuite-shim:$PATH"
 export PATH
 UBUS_IFACES=$TMP/ubus.ifaces
@@ -74,8 +78,10 @@ setup_two_wans() {
 }
 
 tick()     { ucode -L "$MOCK" "$UC" wand-tick 2>&1; }
+flush()    { ucode -L "$MOCK" "$UC" wan-flush 2>&1; } # native since stage 2
 wanstate() { cat "$WAND/$1.state" 2>/dev/null || echo up; }
 field()    { cat "$WAND/$1" 2>/dev/null || echo "${2-}"; }
+flist()    { ls "$WAND"/*.flush 2>/dev/null || echo none; }
 
 ok()  { PASS=$((PASS + 1)); echo "ok   $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL $1 (got: '$2', want: '$3')"; }
@@ -218,6 +224,177 @@ tick >/dev/null
 echo fail > "$WAND/wan1.force"
 out=$(tick); out=$(tick); out=$(tick)
 assert_contains "B2 unusable list -> default A-Z: failover to wan2" "$out" "failover:a>wan2"
+
+echo
+echo "== ucode port: #24 conntrack flush (stage 2: wan-flush is native) =="
+
+# --- F1 (sh T11): failover writes a pending flush; wan-flush resolves the
+# old egress IP, calls conntrack, consumes the file, then is silent ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+tick >/dev/null # seed a.home=vpn, b.home=wan2
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # vpn down x3 -> failover a>wan2
+[ -f "$WAND/a.flush" ] && ok "F1 pending flush written on failover" || bad "F1 pending flush written on failover" "absent" "$WAND/a.flush"
+assert_eq "F1 pending flush names the old egress" "$(cat "$WAND/a.flush" 2>/dev/null)" "vpn"
+: > "$CONNTRACKLOG"
+out=$(flush)
+assert_eq "F1 event byte-exact" "$out" "wand:flush:a>vpn(198.51.100.10)"
+assert_contains "F1 conntrack got -D -q old-WAN-IP" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.10"
+[ -f "$WAND/a.flush" ] && bad "F1 pending file consumed" "still there" "removed" || ok "F1 pending file consumed"
+out=$(flush) # nothing pending -> silence
+assert_eq "F1 idle wan-flush is silent" "$out" ""
+
+# --- F2 (sh T12): idle tick -> no flush requests, no conntrack calls ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+tick >/dev/null; tick >/dev/null; tick >/dev/null; tick >/dev/null # seed + 3 quiet
+assert_eq "F2 no pending flushes in idle cycle" "$(flist)" "none"
+assert_eq "F2 no conntrack calls in idle cycle" "$(cat "$CONNTRACKLOG")" ""
+
+# --- F3 (sh T13): failback writes a pending flush of the backup being left.
+# Single group: sh T13 tolerates group b's own failover noise (contains),
+# the byte-exact assertion here must not. NB: the sh suite's mock date
+# advances +60/call so dwell always passes there; ucode uses real time(),
+# hence the T9-style lastswitch bypass. ---
+reset_router
+add_group a
+uci_set a.type direct
+uci_set a.iface vpn
+add_group b
+uci_set b.type direct
+uci_set b.iface wan2
+uci_set b.wan_home wan2
+uci_set b.wanmode override # keeps wan2 watched, never switches (C5 trick)
+add_iface_dev vpn pptp-freedom
+add_iface_dev wan2 pppoe-wan2
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+uci_set globals.wan_anchors 'http://a1.example/ping'
+tick >/dev/null # seed a.home=vpn
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # failover a>wan2
+assert_eq "F3 failover flush names the old home" "$(cat "$WAND/a.flush" 2>/dev/null)" "vpn"
+flush >/dev/null # consume the failover flush
+rm -f "$WAND/vpn.force"
+echo fail > "$WAND/wan2.force"
+echo 0 > "$WAND/a.lastswitch" # bypass dwell deterministically (see above)
+out=$(tick); out=$(tick); out=$(tick); out=$(tick); out=$(tick)
+out=$(tick) # vpn up again (6 oks) + failback in the same tick
+assert_contains "F3 failback happened" "$out" "failback:a>vpn"
+assert_eq "F3 pending flush names the left backup" "$(cat "$WAND/a.flush" 2>/dev/null)" "wan2"
+: > "$CONNTRACKLOG"
+out=$(flush)
+assert_eq "F3 event byte-exact" "$out" "wand:flush:a>wan2(198.51.100.20)"
+assert_contains "F3 conntrack got -D -q backup-IP" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.20"
+
+# --- F4 (sh T15): no conntrack in PATH -> failover still fires; wan-flush
+# is silent with rc=0 and the pending file is consumed anyway ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+tick >/dev/null # seed
+NOCT="$TMP/noct" # the ucode children minus conntrack (ubus is the -L mock,
+mkdir -p "$NOCT" # uci is native: curl+date are all it spawns via PATH)
+ln -s "$MOCKBIN/curl" "$NOCT/curl"; ln -s "$MOCKBIN/date" "$NOCT/date"
+noct_tick()  { PATH="$NOCT:/usr/bin:/bin" ucode -L "$MOCK" "$UC" wand-tick 2>&1; }
+noct_flush() { PATH="$NOCT:/usr/bin:/bin" ucode -L "$MOCK" "$UC" wan-flush 2>&1; }
+echo fail > "$WAND/vpn.force"
+noct_tick >/dev/null; noct_tick >/dev/null
+out=$(noct_tick)
+assert_contains "F4 failover still fires without conntrack" "$out" "failover:a>wan2"
+[ -f "$WAND/a.flush" ] && ok "F4 tick still writes the pending file" || bad "F4 tick still writes the pending file" "absent" "$WAND/a.flush"
+out=$(noct_flush); rc=$?
+assert_eq "F4 wan-flush without conntrack: silent" "$out" ""
+assert_eq "F4 wan-flush without conntrack: rc=0" "$rc" "0"
+[ -f "$WAND/a.flush" ] && bad "F4 pending file consumed anyway" "still there" "removed" || ok "F4 pending file consumed anyway"
+
+# --- F5 (sh T16): dead old iface -> the remembered .addr is used ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+tick >/dev/null # seed; probe phase caches $WAND/vpn.addr
+tmpf="$UBUS_IFACES.new"
+grep -v '^vpn=' "$UBUS_IFACES" > "$tmpf" 2>/dev/null || : > "$tmpf" # ifdown:
+echo 'vpn=' >> "$tmpf" # netifd object stays, the device is gone
+mv "$tmpf" "$UBUS_IFACES"
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # failover; live resolve impossible
+: > "$CONNTRACKLOG"
+out=$(flush)
+assert_eq "F5 event uses the remembered addr" "$out" "wand:flush:a>vpn(198.51.100.10)"
+assert_contains "F5 conntrack got -D -q remembered-IP" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.10"
+
+# --- F6 (sh T17): conntrack tool error -> tick and wan-flush survive ---
+echo vpn > "$WAND/a.flush" # re-seed a pending request directly
+: > "$CONNTRACKLOG"
+out=$(CONNTRACK_FAILS=1 ucode -L "$MOCK" "$UC" wan-flush 2>&1)
+assert_eq "F6 conntrack failure tolerated, event logged" "$out" "wand:flush:a>vpn(198.51.100.10)"
+
+# --- F7: several pending requests -> ONE line, sh glob (A-Z) order ---
+reset_router
+setup_two_wans
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+echo wan2 > "$WAND/a.flush"
+echo vpn  > "$WAND/b.flush"
+: > "$CONNTRACKLOG"
+out=$(flush)
+assert_eq "F7 two pending -> one line, glob order" "$out" "wand:flush:a>wan2(198.51.100.20) flush:b>vpn(198.51.100.10)"
+assert_eq "F7 both files consumed" "$(flist)" "none"
+assert_eq "F7 both deletes executed" "$(cat "$CONNTRACKLOG")" "conntrack -D -q 198.51.100.20
+conntrack -D -q 198.51.100.10"
+
+# --- F8: empty pending file -> consumed silently, no event, no conntrack ---
+echo "" > "$WAND/a.flush"
+: > "$CONNTRACKLOG"
+out=$(flush)
+assert_eq "F8 empty pending file: silent" "$out" ""
+assert_eq "F8 empty pending file: consumed" "$(flist)" "none"
+assert_eq "F8 empty pending file: no conntrack call" "$(cat "$CONNTRACKLOG")" ""
+
+# --- F11: a DIRECTORY named *.flush is left alone (sh `[ -f ]` parity) ---
+reset_router
+setup_two_wans
+add_iface_addr vpn 198.51.100.10
+mkdir -p "$WAND/a.flush"
+echo vpn > "$WAND/b.flush"
+out=$(flush)
+assert_eq "F11 dir skipped, regular file flushed" "$out" "wand:flush:b>vpn(198.51.100.10)"
+[ -d "$WAND/a.flush" ] && ok "F11 directory left untouched" || bad "F11 directory left untouched" "gone" "still there"
+
+# --- F9: differential byte-parity vs the stock sh CLI on identical state
+# (the #32 acceptance: flush events byte-identical to the sh run) ---
+reset_router
+setup_two_wans
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+echo wan2 > "$WAND/a.flush"; echo vpn > "$WAND/b.flush"
+: > "$CONNTRACKLOG"
+out_uc=$(flush)
+log_uc=$(cat "$CONNTRACKLOG")
+echo wan2 > "$WAND/a.flush"; echo vpn > "$WAND/b.flush" # identical re-seed
+: > "$CONNTRACKLOG"
+out_sh=$(sh "$SH" wan-flush 2>&1)
+log_sh=$(cat "$CONNTRACKLOG")
+assert_eq "F9 byte-parity vs sh (events)" "$out_uc" "$out_sh"
+assert_eq "F9 byte-parity vs sh (conntrack calls)" "$log_uc" "$log_sh"
+assert_contains "F9 sanity: sh actually flushed" "$out_sh" "flush:a>wan2(198.51.100.20)"
+out_uc=$(flush); out_sh=$(sh "$SH" wan-flush 2>&1) # idle rerun: both silent
+assert_eq "F9 idle rerun parity" "$out_uc$out_sh" ""
+
+# --- F10: no /tmp/wanguard at all (fresh boot) -> silent, rc=0 ---
+rm -rf "$WAND"
+out=$(flush); rc=$?
+assert_eq "F10 missing wand dir: silent" "$out" ""
+assert_eq "F10 missing wand dir: rc=0" "$rc" "0"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

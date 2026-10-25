@@ -105,4 +105,17 @@ for cmd in list grouplist wanstatus devices; do
 	echo "  $cmd: byte-identical (rc=$rc1)"
 done
 sed -n '1,2p' /tmp/c4-uc.out | sed 's/^/  devices head: /'
-echo "C4-OK ($ITER keepalive iterations + 4 machine-parsed outputs byte-identical)"
+
+# --- 3) wan-flush byte-parity on identical state (#32: native since
+# stage 2) — event line and the idle rerun must match the sh CLI ---
+echo wan2 > /tmp/wanguard/a.flush
+u=$($UG wan-flush 2>&1)
+case "$u" in "wand:flush:a>wan2(172.30.20.2)") ;; *) fail "wan-flush event: '$u'" ;; esac
+echo wan2 > /tmp/wanguard/a.flush # identical re-seed for the sh run
+s=$($SHG wan-flush 2>&1)
+[ "$u" = "$s" ] || fail "wan-flush parity: ucode '$u' vs sh '$s'"
+u=$($UG wan-flush 2>&1); s=$($SHG wan-flush 2>&1) # idle rerun: both silent
+[ -z "$u$s" ] || fail "wan-flush idle rerun spoke: '$u'/'$s'"
+echo "  wan-flush: byte-identical + idle-silent parity"
+
+echo "C4-OK ($ITER keepalive iterations, machine-parsed outputs + wan-flush events byte-identical)"
