@@ -57,7 +57,7 @@ function connect() {
 			}
 			return { interface: out };
 		},
-		close: function() {}
+		disconnect: function() {} // real ubus.so API (wand.uc uses disconnect)
 	};
 }
 
