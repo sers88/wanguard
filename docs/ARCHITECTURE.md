@@ -292,3 +292,10 @@ Properties and constraints:
   is still generated as before.
 - fw4 zone setup for new interfaces — manually by the owner (wanguard only
   warns).
+- Big-bang rewrite of the sh core — deliberately not. The ucode migration
+  (issue #29 verdict: **YES**, 2026-10-25) is staged: wand-tick →
+  wan-flush → apply → CLI → retire sh; every stage lands with the test
+  battery green, a tag and a live 5/5 acceptance on the router. Evidence
+  and verdict: `docs/spike-ucode/VERDICT.md` (branch `spike/ucode`);
+  staged plan: private tracker (sers88/wanguard-home). Until the final
+  stage ships, the sh core stays the deployed truth.
