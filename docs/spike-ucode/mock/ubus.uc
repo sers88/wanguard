@@ -36,8 +36,8 @@ function fixtures(path) { // `name=value` lines -> object map
 
 function connect() {
 	return {
-		objects: function() {
-			return [ [ 'network.interface', { dump: {} } ] ];
+		list: function() {
+			return [ 'network.interface' ];
 		},
 		call: function(obj, method, args) {
 			if (obj != 'network.interface' || method != 'dump')

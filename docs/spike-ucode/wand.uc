@@ -79,14 +79,15 @@ function globals_opt(opt) {
 // ---------- ubus iface status (ONE dump call for all ifaces) ----------
 
 function ubus_conn() { // absent ubusd == "all ifaces down", same as sh `|| exit`
-	if (!fs.access('/var/run/ubus.sock'))
-		return null;
+	// NB: no socket-path pre-check — the socket path is the ubus module's
+	// business (this build uses /var/run/ubus/ubus.sock, the hardcoded
+	// /var/run/ubus.sock check silently disabled the whole map)
 	try {
-		let conn = ubus.connect(); // raises when ubusd died between the
-		for (let o in conn.objects()) // access() check and connect — caught
-			if (o[0] == 'network.interface')
+		let conn = ubus.connect(); // raises when ubusd is absent/dead
+		for (let o in conn.list()) // conn.list() = object names
+			if (o == 'network.interface')
 				return conn;
-		conn.close();
+		conn.disconnect();
 	}
 	catch (e) {
 		return null; // keepalive just re-runs the tick in 10 s
@@ -100,7 +101,7 @@ function iface_map() { // netifd name -> { device, addr } for UP ifaces
 	if (!conn)
 		return map;
 	let dump = conn.call('network.interface', 'dump', {});
-	conn.close();
+	conn.disconnect();
 	for (let rec in (dump?.interface ?? [])) {
 		if (!rec.up)
 			continue;
