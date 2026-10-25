@@ -90,8 +90,8 @@ ls "$WAND_DIR"/*.force >/dev/null 2>&1 && fail "leftover force files: rm $WAND_D
 svc_ok=0
 if [ -x /etc/init.d/wanguard ] && /etc/init.d/wanguard status 2>/dev/null | grep -q running; then
 	svc_ok=1
-elif ps 2>/dev/null | grep '[w]anguard-keep' >/dev/null; then
-	svc_ok=1 # keepalive alive without procd (lab); NB busybox ps truncates
+elif ps 2>/dev/null | grep '[w]anguard-keep' | grep -qv ' Z '; then
+	svc_ok=1 # keepalive alive without procd (lab); NB zombies match too — exclude
 fi
 [ "$svc_ok" = 1 ] || fail "keepalive loop is not running — the drill needs it to drive ticks"
 
@@ -131,46 +131,44 @@ wait_iface() { # $1=want (use ! to invert) $2=timeout_s
 }
 battery() {
 	[ "$AUTO" = 1 ] && { echo "  (auto: battery prompt skipped)"; return 0; }
+	if [ -n "${WAND_BATTERY_FILE:-}" ]; then
+		# HITL via file (agent-driven window): the operator answers by
+		# creating the file (battery green) or the STOP file (abort);
+		# stdin is not a tty there, so `read` would EOF-abort
+		rm -f "$WAND_BATTERY_FILE" "$WAND_BATTERY_FILE.stop"
+		echo "  WAIT: батарея 5/5 с клиента? -> подтверди: touch $WAND_BATTERY_FILE (стоп: touch $WAND_BATTERY_FILE.stop)"
+		while [ ! -f "$WAND_BATTERY_FILE" ] && [ ! -f "$WAND_BATTERY_FILE.stop" ]; do
+			sleep 3
+		done
+		if [ -f "$WAND_BATTERY_FILE.stop" ]; then
+			rm -f "$WAND_BATTERY_FILE.stop"
+			return 1
+		fi
+		rm -f "$WAND_BATTERY_FILE"
+		echo "  батарея подтверждена"
+		return 0
+	fi
 	printf '  батарея 5/5 с клиента? [y/N] '
 	read -r _ans || _ans=""
 	case "$_ans" in y | Y | yes | да | Д | д) return 0 ;; *) return 1 ;; esac
 }
 
 # ---------- anchor resolution for the nft method ----------
-anchor_ips() {
-	hosts=$(uci -q get wanguard.globals.wan_anchors 2>/dev/null | tr ' ' '\n' | sed -e '/^$/d')
-	if [ -z "$hosts" ]; then # list absent -> legacy pair (#23 precedence)
-		hosts=$(uci -q get wanguard.globals.wan_anchor1 2>/dev/null)
-		hosts="$hosts
-$(uci -q get wanguard.globals.wan_anchor2 2>/dev/null)"
-	fi
-	hosts=$(echo "$hosts" | sed -e 's#^[a-zA-Z]*://##' -e 's#[/:].*##' -e '/^$/d')
-	_ips=""
-	for h in $hosts; do
-		case "$h" in
-		*[!0-9.]*) # hostname: resolve via LAN dnsmasq (probe DNS is unbound)
-			_r=$(nslookup "$h" 127.0.0.1 2>/dev/null | sed -n 's/^Address[ 0-9]*: \([0-9.]*\)$/\1/p' | head -n 2)
-			;;
-		*) _r="$h" ;; # anchor URL with an IP literal (lab)
-		esac
-		for one in $_r; do
-			case " $_ips " in *" $one "*) ;; *) _ips="$_ips $one" ;; esac
-		done
-	done
-	echo $_ips
-}
-drain_up() { # $1=home device
-	ips=$(anchor_ips)
-	[ -n "$ips" ] || { echo "ABORT: no anchor IPs resolved" >&2; return 1; }
-	settxt=""
-	for ip in $ips; do settxt="$settxt$ip, "; done
-	settxt="${settxt%, }"
-	echo "  nft drain: oifname $1 <- anchors:$settxt (tcp/80, router output only)"
+# (anchor_ips removed — see drain_up: a static IP set loses to DNS
+# round-robin, caught live at the 2026-10-25 window, cycle 2)
+drain_up() { # $1=home device — ALL router-originated tcp/80 via that device
+	# NB: no destination filter: the anchors are CDN names and DNS
+	# round-robin hands the probe a DIFFERENT IP every tick — a static
+	# set misses, the probe survives, no down ever happens. The output
+	# hook sees ONLY the router's own traffic (clients are forwarded,
+	# untouched); router-originated tcp/80 through the home device is
+	# in practice just the probes, and the drain lives for one cycle.
+	echo "  nft drain: oifname $1 tcp/80 reject (router output only, no dst filter)"
 	cat >/tmp/drill_drain.nft <<EOF
 table inet drill_drain {
 	chain output {
 		type filter hook output priority -150; policy accept;
-		ip daddr { $settxt } oifname "$1" tcp dport 80 counter reject comment "wanguard stage1 drill"
+		oifname "$1" tcp dport 80 counter reject comment "wanguard stage1 drill"
 	}
 }
 EOF

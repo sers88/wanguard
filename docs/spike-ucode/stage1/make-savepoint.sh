@@ -50,7 +50,10 @@ if [ "$(head -1 /usr/bin/wanguard 2>/dev/null)" = "#!/usr/bin/ucode" ]; then
 fi
 command -v ucode >/dev/null 2>&1 || preflight_fail "ucode missing on PATH — the spike would not run at all"
 if command -v ucode >/dev/null 2>&1; then
-	ucode -e 'import * as uci; import * as ubus; import * as fs' 2>/dev/null \
+	# NB: ucode import REQUIRES the `from '<module>'` clause, and `ucode -e`
+	# chokes when the program ENDS with an import (live finding at this
+	# window) — hence the trailing print
+	ucode -e 'import * as uci from "uci"; import * as ubus from "ubus"; import * as fs from "fs"; print("ucode modules ok\n")' 2>/dev/null \
 		|| preflight_fail "ucode modules (uci/ubus/fs) fail to import — spike would die on first tick"
 fi
 
@@ -131,6 +134,11 @@ case "\$step" in
 	;;
 --apk)
 	ls "\$SP"/wanguard-*.apk >/dev/null 2>&1 || { echo "FATAL: no saved apk for L3" >&2; exit 1; }
+	# apk add of an already-installed same-version package is a NO-OP
+	# (caught live at the 2026-10-25 window: files are NOT re-extracted) —
+	# purge both packages first so the saved apk is re-extracted for real
+	apk del wanguard-ucode >/dev/null 2>&1
+	apk del wanguard >/dev/null 2>&1
 	apk add --allow-untrusted --force-overwrite "\$SP"/wanguard-*.apk || exit 1
 	echo "L3: stock package reinstalled"
 	exec sh "\$SP/rollback.sh"

@@ -21,7 +21,7 @@
 | L0 | `/etc/init.d/wanguard stop` | заморозка: тик больше не переключает | мгновенно |
 | L1 | `sh /root/rollback/<ts>/rollback.sh` | sh-CLI назад, рестарт, sanity-блок | ~10 с |
 | L2 | `sh /root/rollback/<ts>/rollback.sh --uci` | + UCI из снапшота | ~30 с |
-| L3 | `sh /root/rollback/<ts>/rollback.sh --apk` | полный офлайн-reinstall stock 1.0.4 | ~1 мин |
+| L3 | `sh /root/rollback/<ts>/rollback.sh --apk` | полный офлайн-reinstall stock 1.0.4 (del-then-add: `apk add` той же версии — **no-op**, файлы не перезаливает; поймано живьём в окне 2026-10-25) | ~1 мин |
 | L4 | failsafe `192.168.1.1` (кабель напрямую, статика 192.168.1.2) | крайний случай | — |
 
 `<ts>` = метка времени сгенерированного снейпшота (фаза A печатает команду
@@ -107,9 +107,15 @@ passthrough-команды работают. Несовместимо → L1.
 sh /root/rollback/<ts>/rollback.sh
 md5sum -c /root/rollback/<ts>/md5sums-before.txt         # ГЕЙТ D1: все OK — байт-в-байт как до окна
 # батарея 5/5 — ГЕЙТ D2 зелёная
-apk add --allow-untrusted --force-overwrite /tmp/wanguard-ucode-*.apk    # спайк заново
-md5sum -c /tmp/stage1-manifest.txt                       # снова все OK
+# спайк заново: apk add той же версии — NO-OP (файлы не перезаливает!), нужен del+add:
+apk del wanguard-ucode
+apk add --allow-untrusted --force-overwrite /tmp/wanguard-ucode-*.apk
+grep -E '^[0-9a-f]{32}  /' /tmp/stage1-manifest.txt | md5sum -c -   # снова все OK
 ```
+
+Примечание: busybox `md5sum -c` не умеет пропускать комментарии — фильтруй
+манифест грепом выше (строки с путями), иначе получишь шумные FAILED на
+строках `#`.
 
 **ГЕЙТ D:** откат доказан делом. Дальше всё остальное — уже «при страховке».
 
