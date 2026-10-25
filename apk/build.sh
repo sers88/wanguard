@@ -44,9 +44,16 @@ pkg() { # pkg <name> <description> <depends> <stage-dir>
 }
 
 # ---- wanguard (core) ----
+# Stage-1 shape (issue #30/#31): /usr/bin/wanguard = the ucode CLI (wand.uc,
+# natively wand-tick/probe-selftest only), the stock POSIX sh CLI ships next
+# to it as /usr/bin/wanguard-sh and receives everything else via passthrough.
+# keepalive/init.d/wan-watch are UNCHANGED (frozen contract 00-CLI-CONTRACT.md).
+# The ucode interpreter + 3 modules are declared: preinstalled on 25.12
+# (fw4/rpcd need them), but the declaration is the correct contract.
 W="$work/wanguard"
 mkdir -p "$W/usr/bin" "$W/etc/init.d" "$W/usr/share/wanguard"
-install -m 755 "$ROOT/router/wanguard"                    "$W/usr/bin/wanguard"
+install -m 755 "$ROOT/docs/spike-ucode/wand.uc"           "$W/usr/bin/wanguard"
+install -m 755 "$ROOT/router/wanguard"                    "$W/usr/bin/wanguard-sh"
 install -m 755 "$ROOT/router/wanguard-keepalive"          "$W/usr/bin/wanguard-keepalive"
 install -m 755 "$ROOT/router/wan-watch"                   "$W/usr/bin/wan-watch"
 install -m 755 "$ROOT/router/init.d/wanguard"             "$W/etc/init.d/wanguard"
@@ -55,7 +62,7 @@ install -m 644 "$ROOT/router/wanguard.nft"                "$W/usr/share/wanguard
 install -m 644 "$ROOT/router/etc.config.wanguard.example" "$W/usr/share/wanguard/etc.config.wanguard.example"
 pkg wanguard \
 	"Per-MAC policy routing for OpenWrt: client groups, nft marking, main-egress health-watch" \
-	"ip-full nftables conntrack" "$W"
+	"ip-full nftables conntrack ucode ucode-mod-fs ucode-mod-uci ucode-mod-ubus" "$W"
 
 # ---- luci-app-wanguard ----
 L="$work/luci-app-wanguard"
