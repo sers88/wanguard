@@ -103,18 +103,24 @@ ls /tmp/wanguard/*.flush 2>/dev/null
 echo nosuchiface > /tmp/wanguard/x.flush
 wanguard wan-flush; echo rc=$?
 #   ГЕЙТ F3: тишина, rc=0 — нет ни адреса, ни события; файл потреблён
-PATH=/usr/bin:/bin wanguard wan-flush   # (сначала положи запрос:)
-echo freedom > /tmp/wanguard/freedom.flush
-PATH=/usr/bin:/bin wanguard wan-flush; echo rc=$?
+/etc/init.d/wanguard stop   # ЖИВАЯ НАХОДКА окна 2026-10-26: без паузы
+echo freedom > /tmp/wanguard/freedom.flush   # keepalive гонит wan-flush
+PATH=/usr/bin:/bin wanguard wan-flush; echo rc=$?   # каждые 10 с и может
 #   ГЕЙТ F4: без conntrack в PATH — тишина, rc=0, файл потреблён
 ls /tmp/wanguard/*.flush 2>/dev/null    # пусто
+/etc/init.d/wanguard start
 ```
 
 > **ОСТОРОЖНО:** никогда не клади руками `<реальный iface>.flush` с conntrack
 > в PATH — `wan-flush` честно выполнит `conntrack -D` по живому egress и
 > снесёт NAT-биндинги реальных сессий. Проба F3 безопасна всегда (имя не
 > резолвится), проба F4 — потому и с урезанным PATH (до conntrack дело не
-> доходит).
+> доходит; conntrack живёт в /usr/sbin, /usr/bin:/bin его не видят).
+> **Гонка (поймана в окне 2026-10-26):** пока сервис запущен, keepalive
+> исполняет свой wan-flush каждые 10 с и может перехватить засеянный файл
+> РАНЬШЕ ручной пробы — с полным PATH это реальное удаление живых
+> биндингов. Поэтому F4 делается при ОСТАНОВЛЕННОМ сервисе (пауза ~30 c,
+> вотчдог в этот момент не нужен — сеть маршрутизируется по UCI-состоянию).
 
 **ГЕЙТ F:** 3/3 цикла зелёные, flush-события байт-формы на каждом хопе,
 `.flush` пуст после apply, деградации молчат, финальный блок drill чистый.
