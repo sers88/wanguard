@@ -397,6 +397,408 @@ function passthrough(args) { // stock sh CLI handles the rest of the contract
 	exit(rc);
 }
 
+// ---------- apply: UCI -> nft + ip rules + routes (stage 3, #33) ----------
+//
+// 1:1 port of cmd_apply (router/wanguard): render model, single source of
+// truth. External calls stay external (nft/ip — fork reduction is not the
+// goal on these legs, same precedent as conntrack in stage 2); what the
+// port removes is the grep/sed/awk pipeline around them:
+//   - alloc: deterministic from sorted group names (ARCHITECTURE.md §2)
+//   - nft diff by `wg:<group>:*` comment tags (bodies never compared —
+//     nft normalizes marks to 0x..., the tag fully determines the rule)
+//   - batch = sets -> orphan-rule deletes -> rule adds -> element diffs
+//     -> orphan-set flush/delete; THAT ORDER IS LOAD-BEARING on real nft
+//     (`delete set` on a still-referenced set = "Resource busy", NOTES.md
+//     §A4) — do not reorder
+//   - `nft -c` gate: any reject aborts BEFORE anything applies (err, rc 1)
+//   - ip rules + per-group tables, metric-200 fallback, orphan cleanup
+//     (allocator range 400-500 only)
+// Parse surfaces mirror the sh greps/seds exactly (transcripts + port
+// notes: stage3/NOTES.md §E) — including the route greps' trailing space.
+
+const TABLE = 'inet wanguard';
+const NFT_FILE = '/usr/share/wanguard/wanguard.nft';
+const BR = 'br-lan';
+
+function msg(s) { print(s + '\n'); } // sh msg(): stdout
+
+function fail(s) { // sh err(): stderr + exit 1
+	warn(`wanguard: ${s}\n`);
+	exit(1);
+}
+
+function sh_read(cmd) { // captured stdout of an external command, '' on error
+	let p = fs.popen(cmd, 'r');
+	let out = p.read('all') ?? '';
+	p.close();
+	return out;
+}
+
+function sh_rc(cmd) { // exit code of an external command, output dropped
+	let p = fs.popen(cmd, 'r');
+	p.read('all');
+	return p.close();
+}
+
+function migrate_legacy() { // create a/b/c from the legacy layout, once
+	if (length(group_ids()) > 0)
+		return;
+	let wa = cursor.get(CONF, 'wan', 'group_a');
+	// NB: named sections are created by the THREE-argument set(conf,
+	// sid, type) form — a four-argument set(conf, sid, '.type', val)
+	// silently fails (NOTFOUND: the section does not exist yet)
+	cursor.set(CONF, 'a', 'group');
+	cursor.set(CONF, 'a', 'type', 'direct');
+	cursor.set(CONF, 'a', 'iface', (wa == 'pppoe') ? 'wan2' : 'vpn');
+	cursor.set(CONF, 'b', 'group');
+	cursor.set(CONF, 'b', 'type', 'direct');
+	cursor.set(CONF, 'b', 'iface', 'wan2');
+	cursor.set(CONF, 'c', 'group');
+	cursor.set(CONF, 'c', 'type', 'proxy');
+	cursor.save(CONF);
+	cursor.commit(CONF);
+	// the cursor is a SNAPSHOT: sections set after its creation are
+	// invisible to foreach. sh never has this problem (every `uci` call
+	// is a fresh subprocess), so re-read like sh would.
+	cursor = uci.cursor();
+	msg('migrated legacy layout: groups a(vpn) b(wan2) c(proxy) created (config wan left as-is)');
+}
+
+function ensure_table() { // skeleton hallmark: the local_v4 set
+	if (sh_rc(`nft list set ${TABLE} local_v4 >/dev/null 2>&1`) == 0)
+		return true;
+	sh_rc(`nft delete table ${TABLE} >/dev/null 2>&1`);
+	return sh_rc(`nft -f ${NFT_FILE}`) == 0;
+}
+
+function alloc_entries() { // [{g, typ, m, t, p, ifc}] (sh alloc_lines)
+	let out = [], nproxy = 0, k = 0;
+	for (let g in group_ids('proxy')) {
+		if (nproxy == 0)
+			push(out, { g: g, typ: 'proxy', m: 300, t: 500, p: 8000, ifc: '' });
+		nproxy++;
+	}
+	if (nproxy > 1)
+		warn(`wanguard: ${nproxy} proxy groups defined; mihomo is a singleton — rendering only the first\n`);
+	for (let g in group_ids('direct')) {
+		k++;
+		if (k > 99) {
+			warn(`wanguard: too many direct groups (>99), ignoring '${g}'\n`);
+			continue;
+		}
+		let m = 100 * k;
+		if (m >= 300) // 300 = mihomo
+			m += 100;
+		push(out, { g: g, typ: 'direct', m: m, t: 400 + k - 1, p: 8100 + k - 1,
+			ifc: group_opt(g, 'iface') });
+	}
+	return out;
+}
+
+function desired_rules(alloc, redir) { // [{chain, tag, body}] (sh DRF)
+	let out = [];
+	for (let a in alloc) {
+		if (a.typ == 'proxy') {
+			// TCP is handled by the redirect rule and MUST NOT be marked —
+			// after DNAT-to-local a marked packet would be policy-routed
+			// into the TUN (postmortem issue #5)
+			push(out, { chain: 'marking', tag: `wg:${a.g}:m${a.m}`,
+				body: `iifname "${BR}" ether saddr @mac_${a.g} meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set ${a.m}` });
+			push(out, { chain: 'redir', tag: `wg:${a.g}:r${redir}`,
+				body: `iifname "${BR}" ether saddr @mac_${a.g} ip daddr != @local_v4 ip daddr != @no_mark meta l4proto tcp redirect to :${redir}` });
+		} else {
+			push(out, { chain: 'marking', tag: `wg:${a.g}:m${a.m}`,
+				body: `iifname "${BR}" ether saddr @mac_${a.g} ip daddr != @local_v4 ip daddr != @no_mark meta mark set ${a.m}` });
+		}
+	}
+	return out;
+}
+
+function live_rule_tags() { // [{chain, tag, handle}] (sh HRF; sh sed parity)
+	let out = [];
+	for (let ch in [ 'marking', 'redir' ]) {
+		for (let line in split(sh_read(`nft -a list chain ${TABLE} ${ch} 2>/dev/null`), /\n/)) {
+			let m = match(line, /comment "(wg:[^"]*)".*# handle ([^ ]*)/);
+			if (m != null)
+				push(out, { chain: ch, tag: m[1], handle: m[2] });
+		}
+	}
+	return out;
+}
+
+function live_set_names() { // set names from `nft list table` (sh have_sets)
+	let out = [];
+	for (let line in split(sh_read(`nft list table ${TABLE} 2>/dev/null`), /\n/)) {
+		let m = match(line, /^[ \t]*set ([A-Za-z0-9_]*)/);
+		if (m != null)
+			push(out, m[1]);
+	}
+	return out;
+}
+
+function desired_group(g) { // raw member MACs, sorted; render path does NOT
+	let out = [];  // normalize (only `wanguard add` does) — sh parity
+	cursor.foreach(CONF, 'member', (s) => {
+		if (s.group == g && s.mac)
+			push(out, s.mac);
+	});
+	return sort(out);
+}
+
+function current_elements(setname) { // sh current_elements: whitespace-
+	let out = [];  // insensitive parse (real nft wraps element lists)
+	let raw = sh_read(`nft list set ${TABLE} ${setname} 2>/dev/null`);
+	// NB: ucode index() returns -1 (not null) when not found
+	if (index(raw, 'elements') == -1)
+		return out;
+	// token walk, NOT a /\s+/->' ' flatten: ucode replace() is FIRST-only
+	// (live lesson — the flattened string stays multiline and the match
+	// dies). Tokens are whitespace-split, so wrapped renders parse the
+	// same as single-line ones; elements never contain braces.
+	let toks = filter(split(raw, /[ \t\n]+/), (t) => t != '');
+	for (let i = 0; i < length(toks); i++) {
+		if (toks[i] == 'elements' && toks[i + 1] == '=' && toks[i + 2] == '{') {
+			let inner = [];
+			for (let j = i + 3; j < length(toks) && toks[j] != '}'; j++)
+				push(inner, toks[j]);
+			// commas may stick to tokens (`aa:bb:..:ff,`) — sh splits ','
+			// after the strip, so join and re-split for byte parity
+			for (let e in split(join(' ', inner), ','))
+				if (trim(e) != '')
+					push(out, trim(e));
+			break;
+		}
+	}
+	return out;
+}
+
+function render_diff(setname, wantl, havel, batch) { // sh render_diff: adds
+	let have_set = {}, want_set = {};  // first (want order), then deletes
+	for (let e in havel)               // (have order); space-membership
+		have_set[e] = 1;               // equals exact-match: elements have
+	for (let e in wantl)               // no embedded whitespace
+		want_set[e] = 1;
+	for (let e in wantl)
+		if (!(e in have_set))
+			push(batch, `add element ${TABLE} ${setname} { ${e} }`);
+	for (let e in havel)
+		if (!(e in want_set))
+			push(batch, `delete element ${TABLE} ${setname} { ${e} }`);
+}
+
+function rule_has_prio(lines, prio) { // sh grep -Eq "^[[:space:]]*$prio:"
+	for (let line in lines) {
+		let l = replace(line, /^[ \t]+/, '');
+		if (substr(l, 0, length(prio) + 1) == prio + ':')
+			return true;
+	}
+	return false;
+}
+
+function reconcile_rules(alloc) { // -> change count (sh reconcile_rules)
+	let n = 0;
+	let lines = split(sh_read('ip rule show 2>/dev/null'), /\n/);
+	let wanted = {};
+	for (let a in alloc) {
+		wanted[`${a.p}`] = 1;
+		if (!rule_has_prio(lines, `${a.p}`)) {
+			if (sh_rc(`ip rule add prio ${a.p} fwmark ${a.m} table ${a.t}`) == 0)
+				n++;
+		}
+	}
+	for (let line in lines) { // orphan scan, kernel dump order (sh sed order)
+		let m = match(line, /^[ \t]*([0-9]+):/);
+		if (m == null)
+			continue;
+		let P = m[1];
+		if (int(P) < 8000 || int(P) > 8199 || (`${P}` in wanted))
+			continue;
+		while (sh_rc(`ip rule del prio ${P} >/dev/null 2>&1`) == 0) // rc 2 stops
+			n++;
+	}
+	return n;
+}
+
+function reconcile_routes(alloc) { // -> change count (sh reconcile_routes)
+	let n = 0;
+	let mainline = '';
+	for (let line in split(sh_read('ip route show table main 2>/dev/null'), /\n/))
+		if (substr(line, 0, 8) == 'default ') { mainline = line; break; }
+	let map = iface_map(); // ONE dump for the whole pass (sh resolves per iface)
+	for (let a in alloc) {
+		let dev = '';
+		if (a.typ == 'proxy') {
+			if (sh_rc('ip link show Meta >/dev/null 2>&1') == 0)
+				dev = 'Meta';
+		} else {
+			dev = map[a.ifc]?.device ?? '';
+		}
+		if (dev != '') {
+			let out = sh_read(`ip route show table ${a.t} 2>/dev/null`);
+			// sh grep: `default dev <dev> ` — the trailing space is the
+			// contract (real ip-full renders `default dev X scope link `,
+			// NOTES.md §B3). NB: ucode index() is -1 when not found.
+			if (index(out, `default dev ${dev} `) == -1) {
+				if (sh_rc(`ip route replace default dev ${dev} table ${a.t}`) == 0)
+					n++;
+			}
+		} else {
+			// warn only when someone actually depends on the group
+			let members = 0;
+			cursor.foreach(CONF, 'member', (s) => {
+				if (s.group == a.g)
+					members++;
+			});
+			if (members > 0) {
+				if (a.typ == 'proxy')
+					warn(`wanguard: group ${a.g}: mihomo TUN Meta is down — routes skipped (keepalive will retry)\n`);
+				else
+					warn(`wanguard: group ${a.g}: iface '${(a.ifc != '') ? a.ifc : '?'}' down or missing — routes skipped (keepalive will retry)\n`);
+			}
+		}
+		// fallback: main default at metric 200 (idempotent; matches the
+		// legacy UCI-installed route byte-for-byte, so both sources coexist)
+		if (mainline != '') {
+			let has200 = false;
+			for (let line in split(sh_read(`ip route show table ${a.t} 2>/dev/null`), /\n/))
+				if (match(line, / metric 200($| )/) != null) { has200 = true; break; }
+			if (!has200) {
+				// sh passes $mainline unquoted: word-splitting collapses the
+				// trailing render space — trim() is the same collapse
+				if (sh_rc(`ip route replace ${trim(mainline)} metric 200 table ${a.t}`) == 0)
+					n++;
+			}
+		}
+	}
+	// flush orphan tables of removed groups (allocator range only)
+	let alloc_t = {};
+	for (let a in alloc)
+		alloc_t[`${a.t}`] = 1;
+	let inuse = [];
+	for (let line in split(sh_read('ip route show table all 2>/dev/null'), /\n/)) {
+		let m = match(line, /.* table ([0-9]+)/); // greedy: LAST ` table N`
+		if (m != null)
+			push(inuse, m[1]);
+	}
+	for (let T in uniq(sort(inuse))) { // sh `sort -u`: lexicographic
+		if (int(T) >= 400 && int(T) <= 500 && !(`${T}` in alloc_t)) {
+			if (sh_rc(`ip route flush table ${T} >/dev/null 2>&1`) == 0)
+				n++;
+		}
+	}
+	return n;
+}
+
+function apply() {
+	migrate_legacy();
+
+	for (let g in group_ids()) {
+		let t = group_opt(g, 'type');
+		if (t != 'direct' && t != 'proxy')
+			msg(`warning: group '${g}' has no valid type (direct|proxy) — ignored`);
+	}
+
+	if (!ensure_table())
+		fail(`cannot create nft table (see ${NFT_FILE})`);
+
+	let redir = globals_opt('redir_port');
+	if (redir == '')
+		redir = '7892';
+
+	let alloc = alloc_entries();
+	let want = desired_rules(alloc, redir);
+	let have = live_rule_tags();
+	let batch = [];
+
+	// sets: create the wanted ones that are missing
+	let have_sets = live_set_names();
+	let have_set = {};
+	for (let s in have_sets)
+		have_set[s] = 1;
+	for (let a in alloc)
+		if (!(`mac_${a.g}` in have_set))
+			push(batch, `add set ${TABLE} mac_${a.g} { type ether_addr; flags interval; }`);
+
+	// rule deletions: live tags no longer desired (incl. changed marks)
+	let want_tags = {};
+	for (let w in want)
+		want_tags[`${w.chain} ${w.tag}`] = 1;
+	for (let h in have)
+		if (!(`${h.chain} ${h.tag}` in want_tags))
+			push(batch, `delete rule ${TABLE} ${h.chain} handle ${h.handle}`);
+
+	// rule additions: desired tags not live
+	let have_tags = {};
+	for (let h in have)
+		have_tags[`${h.chain} ${h.tag}`] = 1;
+	for (let w in want)
+		if (!(`${w.chain} ${w.tag}` in have_tags))
+			push(batch, `add rule ${TABLE} ${w.chain} ${w.body} comment "${w.tag}"`);
+
+	// element diffs, per group in alloc order, then no_mark
+	for (let a in alloc)
+		render_diff(`mac_${a.g}`, desired_group(a.g),
+			sort(current_elements(`mac_${a.g}`)), batch);
+	let nm_want = [];
+	{
+		let v = cursor.get(CONF, 'globals', 'no_mark');
+		if (type(v) == 'array')
+			nm_want = v;
+		else if (v != null && v != '')
+			nm_want = filter(split(v, /\s+/), (s) => s != '');
+	}
+	render_diff('no_mark', sort(nm_want), sort(current_elements('no_mark')), batch);
+
+	// orphan sets: groups deleted from UCI
+	let wantsets = { no_mark: 1, local_v4: 1 };
+	for (let a in alloc)
+		wantsets[`mac_${a.g}`] = 1;
+	for (let s in have_sets) {
+		if (substr(s, 0, 4) != 'mac_' || (s in wantsets))
+			continue;
+		push(batch, `flush set ${TABLE} ${s}`);
+		push(batch, `delete set ${TABLE} ${s}`);
+	}
+
+	let changed = 0;
+	if (length(batch) > 0) {
+		if (getenv('WANGUARD_DEBUG') != null) {
+			warn('--- nft diff:\n'); // NB: ucode warn() adds NO newline
+			for (let b in batch)
+				warn(b + '\n');
+		}
+		// unique temp name: $PPID from a shell child == the ucode pid,
+		// i.e. exactly the sh `$$` of the original
+		let tf = `/tmp/wanguard.apply.${trim(sh_read('echo $PPID'))}`;
+		// NB: ucode join(sep, arr) — separator FIRST (live lesson: the
+		// reversed order returns null, which writefile happily persists)
+		fs.writefile(tf, join('\n', batch) + '\n');
+		// check-then-apply: any `-c` reject aborts BEFORE anything applies
+		if (sh_rc(`nft -c -f ${tf} 2>/tmp/wanguard.apply.err`) != 0) {
+			let e = fs.popen('cat /tmp/wanguard.apply.err >&2', 'r'); // byte-exact
+			e.read('all');                                           // stderr passthrough
+			e.close();
+			fs.unlink(tf);
+			fail('nft check failed, nothing applied');
+		}
+		if (sh_rc(`nft -f ${tf}`) != 0) {
+			fs.unlink(tf);
+			fail('nft apply failed');
+		}
+		fs.unlink(tf);
+		changed = 1;
+	}
+
+	let n = reconcile_rules(alloc);
+	if (n > 0)
+		changed = 1;
+	n = reconcile_routes(alloc);
+	if (n > 0)
+		changed = 1;
+
+	print((changed == 1) ? 'applied\n' : 'in-sync\n'); // literal keepalive contract
+}
+
 // ---------- dispatch ----------
 
 let cmd = ARGV[0] ?? '';
@@ -409,6 +811,9 @@ switch (cmd) {
 		break;
 	case 'probe-selftest':
 		probe_selftest();
+		break;
+	case 'apply': // native since stage 3 (#33); sh parity gated by
+		apply();   // stage3/apply-parity.sh (165 checks)
 		break;
 	default:
 		passthrough(ARGV);

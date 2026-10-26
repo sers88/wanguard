@@ -265,5 +265,22 @@ asserts sh-vs-ucode byte parity of stdout, rc, nft batch text and full
 nft+ip state, plus reference behavior on the sh side and no-`applied`
 idempotency on the second run). In phase 1 the ucode side is the
 passthrough — parity is trivially true and validates the harness; in
-phase 2 the same file becomes the native-apply gate.
+phase 2 the same file became the native-apply gate and passed as such.
+
+## G. ucode port lessons (phase 2, native apply — all found via the harness)
+
+| # | quirk | effect | rule |
+|---|---|---|---|
+| 1 | `join(sep, arr)` — separator FIRST | `join(arr, sep)` returns `null`; `writefile` happily persisted the string `null` as the whole nft batch | the mock's `unexpected 'null'` was the giveaway |
+| 2 | `warn()` adds NO newline | the WANGUARD_DEBUG dump concatenated into one line | always append `\n` explicitly |
+| 3 | `replace()` is FIRST-only | a `/\s+/->' '` flatten stays multiline; downstream regex match dies | `current_elements` uses a whitespace token walk instead |
+| 4 | `index()` returns **-1** when not found | `index(...) == null` is never true → the `default dev X ` route grep never fired | compare against `-1` |
+| 5 | `set(conf, sid, '.type', type)` silently fails | named sections cannot be created that way (NOTFOUND, no error surfaced); the migrate rendered nothing | the THREE-argument form `set(conf, sid, TYPE)` creates a named section (uci.c docs: "adds a new named section") |
+| 6 | the cursor is a SNAPSHOT | sections created after cursor creation are invisible to `foreach` until reload; sh never sees this (fresh subprocess per `uci` call) | `migrate_legacy` re-creates the cursor after commit |
+| 7 | `$PPID` via a shell child | ucode has no getpid; `echo $PPID` from popen = the ucode pid = exactly the sh `$$` | used for the batch temp file name |
+| 8 | `printf` is C-style (`%s/%d/%J`) | `%j` prints literally | — |
+
+Phase-2 harness result: **165/165 with NATIVE ucode apply** — byte parity
+of stdout, rc, the nft batch text and the full nft+ip rendered state on
+every fixture; sh suite 67/67, ucode suite 55/55, smokes 32+25 unchanged.
 
