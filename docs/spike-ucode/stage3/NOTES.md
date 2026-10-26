@@ -224,3 +224,46 @@ parity evidence.
 5. `applied` vs `in-sync` stays a literal string contract with the
    keepalive (`[ "$out" = in-sync ]`); change-count = nft batch applied
    OR rules changed OR routes changed, exactly as in sh.
+
+## F. Harness lessons (apply-parity.sh, found live 2026-10-27)
+
+The first full harness run against the sh reference surfaced four mock
+bugs the WSL-only smoke had missed — the target userland is busybox and
+the mocks must be busybox-exact:
+
+1. **busybox awk rejects a bare `{` regex** (`gsub(/{/, ...)` →
+   "Repetition not preceded by valid expression"; GNU awk allows it).
+   The batch normalizer now escapes (`/\{/`).
+2. **busybox ash PERSISTS `VAR=val func` after the call** (dash reverts
+   it): a `WANGUARD_DEBUG=1 run_sh apply` capture leaked the variable
+   into every later fixture. Captures now use `( export VAR=...; func )`
+   subshells.
+3. **`route replace` must be metric-key-aware**: real ip keeps
+   `default dev X` AND `default via Y metric 200` side by side in one
+   table; the mock wiped all defaults on every replace, which broke the
+   CLI's idempotency (eternal `applied`). Replace now keys on the LAST
+   `metric` token; different-key defaults coexist.
+4. **Element gate is per-type**: ether_addr = 6 lowercase hex colon
+   pairs; ipv4_addr = dotted quad + optional /CIDR. Justification: the
+   reachable `-c`-gate triggers are hand-edited UCI values — a garbage
+   MAC (P9) and dash/cisco MAC forms (P17) must abort the batch with
+   nothing applied (fail-safe), matching real nft's per-type grammar.
+
+Two more findings recorded for the port:
+
+- **Hostile group NAMES are unreachable via UCI**: the uci parser
+  itself rejects non-ASCII section names (`Parse error (invalid
+  character in name field)`) — the CLI's nft `-c` name gate is pure
+  defense-in-depth; the realistic hostile input is a bad element VALUE
+  (fixtures P9/P17).
+- **The `config wan` section is optional for the legacy migrate**: a
+  fresh empty config bootstraps a(vpn) b(wan2) c(proxy) on the very
+  first `apply` (fixture P0 pins this byte-exactly).
+
+Harness status after the fixes: **165/165** (16 fixtures; every fixture
+asserts sh-vs-ucode byte parity of stdout, rc, nft batch text and full
+nft+ip state, plus reference behavior on the sh side and no-`applied`
+idempotency on the second run). In phase 1 the ucode side is the
+passthrough — parity is trivially true and validates the harness; in
+phase 2 the same file becomes the native-apply gate.
+

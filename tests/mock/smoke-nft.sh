@@ -78,6 +78,15 @@ chk "mac_x render" "$want" "$out"
 printf 'add element inet wanguard mac_x { aa:bb:cc:dd:ee:ff }\n' > /tmp/dup.nft
 sh "$N" -f /tmp/dup.nft; chkrc "dup elem rc" 0 "$?"
 
+# garbage element (hand-edited MAC): -c rejects, nothing applied
+printf 'add element inet wanguard mac_x { not-a-mac }\n' > /tmp/garb.nft
+sh "$N" -c -f /tmp/garb.nft 2>/dev/null; chkrc "garbage elem -c rc" 1 "$?"
+out=$(sh "$N" list set inet wanguard mac_x)
+case "$out" in *not-a-mac*) FAIL=$((FAIL+1)); echo "FAIL: garbage elem leaked" ;; *) PASS=$((PASS+1)) ;; esac
+sh "$N" -f /tmp/garb.nft 2>/dev/null; chkrc "garbage elem -f rc" 1 "$?"
+out=$(sh "$N" list set inet wanguard mac_x)
+case "$out" in *not-a-mac*) FAIL=$((FAIL+1)); echo "FAIL: garbage elem -f leaked" ;; *) PASS=$((PASS+1)) ;; esac
+
 # atomicity: batch with one bad line applies nothing
 cat > /tmp/bad.nft <<'EOF'
 add element inet wanguard mac_x { 99:88:77:66:55:44 }

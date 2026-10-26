@@ -151,9 +151,34 @@ if [ "$1" = "route" ] && [ "$2" = "replace" -o "$2" = "add" ]; then
 	fi
 	case "$line" in
 		default*)
-			# a table holds one default: replace it
-			grep -v '^default' "$ST/route.$tbl" > "$ST/route.$tbl.s" 2>/dev/null || : > "$ST/route.$tbl.s"
-			printf '%s\n' "$line" >> "$ST/route.$tbl.s"
+			# defaults with DIFFERENT metric keys coexist in one table
+			# (real ip: the CLI maintains `default dev X` AND
+			# `default via Y metric 200` side by side); replace = same
+			# default with the same LAST metric token, else append
+			key=$(printf '%s' "$line" | awk '{ for (i = 1; i < NF; i++) if ($i == "metric") m = $(i + 1); print m }')
+			[ -f "$ST/route.$tbl" ] || { # absent table: first entry
+				printf '%s\n' "$line" > "$ST/route.$tbl"
+				exit 0
+			}
+			kept=""
+			{
+				while IFS= read -r r; do
+					[ -n "$r" ] || continue
+					case "$r" in
+						default*)
+							rkey=$(printf '%s' "$r" | awk '{ for (i = 1; i < NF; i++) if ($i == "metric") m = $(i + 1); print m }')
+							if [ "$rkey" = "$key" ] && [ -z "$kept" ]; then
+								printf '%s\n' "$line"
+								kept=1
+							else
+								printf '%s\n' "$r"
+							fi
+							;;
+						*) printf '%s\n' "$r" ;;
+					esac
+				done
+				[ -n "$kept" ] || printf '%s\n' "$line"
+			} < "$ST/route.$tbl" > "$ST/route.$tbl.s"
 			mv "$ST/route.$tbl.s" "$ST/route.$tbl"
 			;;
 		*)

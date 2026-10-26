@@ -188,13 +188,17 @@ if [ -n "$BATCH" ]; then
 	trap 'rm -f "$NORM" "$CAND"' EXIT
 
 	# normalize: brace-join into one command per line
+	# NB: braces ESCAPED in the regexes — busybox awk (the container's
+	# awk, i.e. the target userland) rejects a bare `{` as a regex
+	# ("Repetition not preceded by valid expression"); GNU awk allows it,
+	# which is how this slipped past a WSL-only smoke (#33 lesson)
 	awk '
 		{
 			line = $0
 			sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
 			if (line == "" || line ~ /^#/) next
 			buf = buf (buf == "" ? "" : " ") line
-			o = gsub(/{/, "{", line); c = gsub(/}/, "}", line)
+			o = gsub(/\{/, "{", line); c = gsub(/\}/, "}", line)
 			bal += o - c
 			if (bal < 0) { print "unbalanced braces" > "/dev/stderr"; exit 3 }
 			if (bal == 0) { print buf; buf = "" }
@@ -275,8 +279,25 @@ if [ -n "$BATCH" ]; then
 						[ -n "$sl" ] || { echo "Error: No such file or directory" >&2; return 1; }
 						typ=$(printf '%s' "$sl" | awk '{print $3}')
 						elems=$(printf '%s' "$cmd" | sed -n 's/.*{ \(.*\) }.*/\1/p' | tr ',' ' ')
+						# per-type element gate (loose but honest): real nft
+						# validates the full grammar; the CLI needs the
+						# reject-rc for its `-c` fail-safe (fixtures P9/P17:
+						# hand-edited garbage or dash/cisco MAC forms must
+						# abort the batch, nothing applied). ether_addr = 6
+						# lowercase hex pairs, colon-separated (the form
+						# `wanguard add` normalizes to); ipv4_addr = dotted
+						# quad, optional /CIDR.
+						case "$typ" in
+							ether_addr) rx='^([0-9a-f]{2}:){5}[0-9a-f]{2}$' ;;
+							ipv4_addr)  rx='^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' ;;
+							*)          rx='.' ;;
+						esac
 						new=""
 						for e in $elems; do
+							printf '%s' "$e" | grep -Eq "$rx" || {
+								echo "Error: syntax error" >&2
+								return 1
+							}
 							case " $(set_elems "$sl") " in
 								*" $e "*) ;; # duplicate member: real nft rc=0
 								*) new="$new $e" ;;
