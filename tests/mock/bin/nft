@@ -1,3 +1,375 @@
 #!/bin/sh
-# mock nft: watchdog tests never touch nft; accept everything.
-exit 0
+# mock nft — stateful emulation of the nftables subset `wanguard apply`
+# uses (stage-3 ucode migration, #33 render-parity fixtures).
+#
+# State lives in $NFT_STATE (flat db). When $NFT_STATE is UNSET the mock
+# degrades to the legacy no-op (exit 0 for everything) — the watchdog
+# suites (tests/mock/run-tests.sh, run-tests-ucode.sh F-tests) rely on
+# that and must keep passing untouched.
+#
+# DB line formats (rule bodies / chain decls stored verbatim):
+#   exists                          table inet wanguard is live
+#   set <name> <type> [elem...]     type: ipv4_addr | ether_addr
+#   chain <name> <handle> <decl...> decl = skeleton hook line
+#   rule <chain> <handle> <body...> body includes `comment "wg:..."` tag
+#   next <N>                        handle counter (monotonic, never reused)
+#
+# Supported surface (byte-shaped after real nft 25.12.5; probe transcripts
+# in docs/spike-ucode/stage3/NOTES.md):
+#   nft [-a] list set|chain|table inet wanguard [name]
+#   nft delete table inet wanguard
+#   nft [-c] -f <file>    batch; -c validates only; batches are ATOMIC
+#                         (one bad line = nothing applied, rc 1)
+#
+# Real-nft semantics reproduced where the CLI depends on them:
+#   - add element of an existing member: silent ok (rc 0)
+#   - delete element of an absent member: ERROR (rc 1, nothing applied)
+#   - flush/delete set, delete rule by handle: object must exist
+#   - set/chain names must match [A-Za-z0-9_]+ (the cyrillic fixture
+#     relies on the -c gate rejecting those, nothing applied)
+#   - empty sets render WITHOUT the elements line
+set -u
+
+STATE=${NFT_STATE:-}
+if [ -z "$STATE" ]; then
+	exit 0 # legacy watchdog mode
+fi
+
+die() { # $@ = message -> stderr, rc 1
+	echo "Error: $*" >&2
+	exit 1
+}
+
+valid_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_]+$'; }
+
+load() { [ -f "$STATE" ] || : > "$STATE"; }
+
+table_exists() { grep -qx 'exists' "$STATE" 2>/dev/null; }
+
+set_line() { grep -E "^set $1( |\$)" "$STATE" 2>/dev/null | head -n 1; }
+
+chain_line() { grep -E "^chain $1 " "$STATE" 2>/dev/null | head -n 1; }
+
+DB=$STATE # active db: $STATE for reads, $CAND during batch application
+
+next_handle() { # bump counter in $DB, echo old value
+	nh=$(grep -E '^next ' "$DB" | sed 's/^next //')
+	sed -i "s/^next .*/next $((nh + 1))/" "$DB"
+	echo "$nh"
+}
+
+db_replace_line() { # $1=grep-regex $2=new line (on $DB)
+	grep -vE "$1" "$DB" > "$DB.t"
+	printf '%s\n' "$2" >> "$DB.t"
+	mv "$DB.t" "$DB"
+}
+
+db_drop_line() { # $1=grep-regex (on $DB)
+	grep -vE "$1" "$DB" > "$DB.t"
+	mv "$DB.t" "$DB"
+}
+
+set_elems() { # $1=set db line -> elements as space-separated words
+	printf '%s' "$1" | cut -d' ' -f4-
+}
+
+render_set() { # $1=set db line
+	set -- $1
+	name=$2; typ=$3
+	shift 3
+	printf 'table inet wanguard {\n'
+	printf '\tset %s {\n' "$name"
+	printf '\t\ttype %s\n' "$typ"
+	printf '\t\tflags interval\n'
+	if [ $# -gt 0 ]; then
+		printf '\t\telements = { '
+		first=1
+		for e in "$@"; do
+			[ "$first" = 1 ] || printf ', '
+			printf '%s' "$e"
+			first=0
+		done
+		printf ' }\n'
+	fi
+	printf '\t}\n}\n'
+}
+
+render_chain() { # $1=name $2=with_handles(0|1)
+	withh=$2
+	cl=$(chain_line "$1")
+	[ -n "$cl" ] || die "No such file or directory"
+	set -- $cl
+	name=$2; h=$3
+	decl=$cl
+	decl=${decl#chain $name $h }
+	if [ "$withh" = 1 ]; then
+		printf 'table inet wanguard {\n'
+		printf '\tchain %s { # handle %s\n' "$name" "$h"
+	else
+		printf 'table inet wanguard {\n'
+		printf '\tchain %s {\n' "$name"
+	fi
+	printf '\t\t%s\n' "$(printf '%s' "$decl" | sed 's/priority -150/priority mangle/; s/priority -100/priority dstnat/')"
+	grep -E "^rule $name " "$STATE" 2>/dev/null | while IFS= read -r rl; do
+		hl=${rl#rule $name }
+		h=${hl%% *}
+		body=${hl#$h }
+		if [ "$withh" = 1 ]; then
+			printf '\t\t%s # handle %s\n' "$body" "$h"
+		else
+			printf '\t\t%s\n' "$body"
+		fi
+	done
+	printf '\t}\n}\n'
+}
+
+# ---------- argument parsing ----------
+
+OPT_A=0; OPT_C=0; BATCH=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-a) OPT_A=1 ;;
+		-c) OPT_C=1 ;;
+		-f) BATCH="$2"; shift ;;
+		list|delete) break ;;
+		*) die "syntax error, unexpected '$1'" ;;
+	esac
+	shift
+done
+
+load
+DB=$STATE
+
+case "${1:-}" in
+	list)
+		obj=${2:-}
+		[ "$obj" = set ] || [ "$obj" = chain ] || [ "$obj" = table ] || die "syntax error"
+		[ "${3:-}${4:-}" = "inetwanguard" ] || die "no such table"
+		table_exists || die "No such file or directory"
+		case "$obj" in
+			set)
+				sl=$(set_line "${5:-}")
+				[ -n "$sl" ] || die "No such file or directory"
+				render_set "$sl"
+				;;
+			chain)
+				render_chain "${5:-}" "$OPT_A"
+				;;
+			table)
+				printf 'table inet wanguard {\n'
+				first=1
+				grep -E '^set ' "$STATE" | while IFS= read -r sl; do
+					[ "$first" = 1 ] || printf '\n'
+					render_set "$sl" | sed -n '2,$p' | sed '$d'
+					first=0
+				done
+				grep -E '^chain ' "$STATE" | while IFS= read -r cl; do
+					[ "$first" = 1 ] || printf '\n'
+					cn=${cl#chain }
+					cn=${cn%% *}
+					render_chain "$cn" 0 | sed -n '2,$p' | sed '$d'
+					first=0
+				done
+				printf '}\n'
+				;;
+		esac
+		exit 0
+		;;
+	delete)
+		[ "${2:-}${3:-}${4:-}" = "tableinetwanguard" ] || die "syntax error"
+		: > "$STATE"
+		exit 0
+		;;
+esac
+
+if [ -n "$BATCH" ]; then
+	NORM=$STATE.norm.$$
+	CAND=$STATE.cand.$$
+	trap 'rm -f "$NORM" "$CAND"' EXIT
+
+	# normalize: brace-join into one command per line
+	awk '
+		{
+			line = $0
+			sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+			if (line == "" || line ~ /^#/) next
+			buf = buf (buf == "" ? "" : " ") line
+			o = gsub(/{/, "{", line); c = gsub(/}/, "}", line)
+			bal += o - c
+			if (bal < 0) { print "unbalanced braces" > "/dev/stderr"; exit 3 }
+			if (bal == 0) { print buf; buf = "" }
+		}
+		END {
+			if (buf != "") { print "unexpected end of file" > "/dev/stderr"; exit 3 }
+		}
+	' "$BATCH" > "$NORM" || die "syntax error"
+
+	cp "$STATE" "$CAND"
+	DB=$CAND
+	apply_cmd() { # $1=command; db candidate in $CAND (= $DB); rc 0/1
+		cmd=$1
+		set -- $cmd
+		op=$1
+		case "$op" in
+			table) # skeleton: table inet wanguard { ... }
+				[ "$1$2$3" = tableinetwanguard ] || { echo "Error: no such table" >&2; return 1; }
+				: > "$CAND"
+				echo exists >> "$CAND"
+				echo next 1 >> "$CAND"
+				rest=${cmd#table inet wanguard \{}
+				rest=${rest%\}}
+				while :; do
+					rest=${rest# }
+					case "$rest" in
+						set\ *|chain\ *) ;;
+						*) break ;;
+					esac
+					kind=${rest%% *}
+					rest=${rest#* }
+					name=${rest%%[ {]*}
+					rest=${rest#"$name" }
+					[ "${rest%\{*}" != "$rest" ] || { echo "Error: syntax error" >&2; return 1; }
+					rest=${rest#\{}
+					depth=1; out=""; i=1
+					while [ "$i" -le "${#rest}" ]; do
+						ch=$(printf '%s' "$rest" | cut -c "$i")
+						if [ "$ch" = "{" ]; then depth=$((depth + 1)); fi
+						if [ "$ch" = "}" ]; then
+							depth=$((depth - 1))
+							[ "$depth" -eq 0 ] && break
+						fi
+						out="$out$ch"
+						i=$((i + 1))
+					done
+					rest=${rest#"$out"}
+					rest=${rest#\}}
+					if ! valid_name "$name"; then
+						echo "Error: syntax error, unexpected $name" >&2
+						return 1
+					fi
+					if [ "$kind" = set ]; then
+						typ=$(printf '%s' "$out" | sed -n 's/.*type \([a-z_0-9]*\).*/\1/p')
+						elems=$(printf '%s' "$out" | sed -n 's/.*elements = { \(.*\) }.*/\1/p' | tr ',' ' ')
+						printf 'set %s %s %s\n' "$name" "$typ" "$elems" >> "$CAND"
+					else
+						decl=$(printf '%s' "$out" | sed 's/[ \t][ \t]*/ /g; s/^ //; s/ $//')
+						nh=$(grep -E '^next ' "$CAND" | sed 's/^next //')
+						sed -i "s/^next .*/next $((nh + 1))/" "$CAND"
+						printf 'chain %s %s %s\n' "$name" "$nh" "$decl" >> "$CAND"
+					fi
+				done
+				;;
+			add)
+				case "$2" in
+					set)
+						name=${cmd#add set inet wanguard }
+						name=${name%% *}
+						valid_name "$name" || { echo "Error: syntax error, unexpected $name" >&2; return 1; }
+						grep -qE "^set $name( |\$)" "$CAND" && { echo "Error: File exists" >&2; return 1; }
+						printf 'set %s ether_addr\n' "$name" >> "$CAND"
+						;;
+					element)
+						spec=${cmd#add element inet wanguard }
+						name=${spec%% *}
+						sl=$(grep -E "^set $name( |\$)" "$CAND")
+						[ -n "$sl" ] || { echo "Error: No such file or directory" >&2; return 1; }
+						typ=$(printf '%s' "$sl" | awk '{print $3}')
+						elems=$(printf '%s' "$cmd" | sed -n 's/.*{ \(.*\) }.*/\1/p' | tr ',' ' ')
+						new=""
+						for e in $elems; do
+							case " $(set_elems "$sl") " in
+								*" $e "*) ;; # duplicate member: real nft rc=0
+								*) new="$new $e" ;;
+							esac
+						done
+						new=${new# }
+						[ -n "$new" ] || return 0
+						cur=$(set_elems "$sl")
+						db_replace_line "^set $name( |\$)" \
+							"set $name $typ ${cur:+$cur }$new"
+						;;
+					rule)
+						spec=${cmd#add rule inet wanguard }
+						chain=${spec%% *}
+						grep -qE "^chain $chain " "$CAND" || { echo "Error: No such file or directory" >&2; return 1; }
+						body=${spec#$chain }
+						body=${body# }
+						nh=$(grep -E '^next ' "$CAND" | sed 's/^next //')
+						sed -i "s/^next .*/next $((nh + 1))/" "$CAND"
+						printf 'rule %s %s %s\n' "$chain" "$nh" "$body" >> "$CAND"
+						;;
+					*) echo "Error: syntax error" >&2; return 1 ;;
+				esac
+				;;
+			delete)
+				case "$2" in
+					element)
+						spec=${cmd#delete element inet wanguard }
+						name=${spec%% *}
+						sl=$(grep -E "^set $name( |\$)" "$CAND")
+						[ -n "$sl" ] || { echo "Error: No such file or directory" >&2; return 1; }
+						typ=$(printf '%s' "$sl" | awk '{print $3}')
+						elems=$(printf '%s' "$cmd" | sed -n 's/.*{ \(.*\) }.*/\1/p' | tr ',' ' ')
+						for e in $elems; do
+							case " $(set_elems "$sl") " in
+								*" $e "*) ;;
+								*) echo "Error: element does not exist" >&2; return 1 ;;
+							esac
+						done
+						kept=""
+						for e in $(set_elems "$sl"); do
+							drop=0
+							for d in $elems; do [ "$d" = "$e" ] && drop=1; done
+							[ "$drop" = 1 ] || kept="$kept $e"
+						done
+						kept=${kept# }
+						db_replace_line "^set $name( |\$)" "set $name $typ $kept"
+						;;
+					rule)
+						spec=${cmd#delete rule inet wanguard }
+						chain=${spec%% *}
+						h=$(printf '%s' "$spec" | sed 's/^'$chain'[ \t]*handle[ \t]*//')
+						grep -qE "^rule $chain $h " "$CAND" || { echo "Error: No such file or directory" >&2; return 1; }
+						db_drop_line "^rule $chain $h "
+						;;
+					set)
+						name=${cmd#delete set inet wanguard }
+						name=${name%% *}
+						grep -qE "^set $name( |\$)" "$CAND" || { echo "Error: No such file or directory" >&2; return 1; }
+						db_drop_line "^set $name( |\$)"
+						;;
+					*) echo "Error: syntax error" >&2; return 1 ;;
+				esac
+				;;
+			flush)
+				[ "$2" = set ] || { echo "Error: syntax error" >&2; return 1; }
+				name=${cmd#flush set inet wanguard }
+				name=${name%% *}
+				sl=$(grep -E "^set $name( |\$)" "$CAND")
+				[ -n "$sl" ] || { echo "Error: No such file or directory" >&2; return 1; }
+				typ=$(printf '%s' "$sl" | awk '{print $3}')
+				db_replace_line "^set $name( |\$)" "set $name $typ"
+				;;
+			*) echo "Error: syntax error, unexpected '$op'" >&2; return 1 ;;
+		esac
+	}
+
+	rc=0
+	while IFS= read -r cmd; do
+		[ -n "$cmd" ] || continue
+		apply_cmd "$cmd" || { rc=1; break; }
+	done < "$NORM"
+
+	if [ "$rc" = 0 ] && [ "$OPT_C" = 0 ]; then
+		cat "$CAND" > "$STATE" # atomic: db changes only on full success
+		rm -f "$NORM" "$CAND"
+		trap - EXIT
+		exit 0
+	fi
+	rm -f "$NORM" "$CAND"
+	trap - EXIT
+	[ "$rc" = 0 ] && exit 0
+	exit 1
+fi
+
+die "syntax error, unexpected end of arguments"
