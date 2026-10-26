@@ -9,7 +9,10 @@
 #    one anchor dead -> alive=2 >= 2 -> stays up; two dead -> alive=1 < 2
 #    -> down after 3 consecutive fails (WAND_FAILS_DOWN);
 # 3) override groups never switch: wanmode=override skips the group in
-#    the tick even when its WAN dies (down:wan2 event proves ticks ran).
+#    the tick even when its WAN dies (down:wan2 event proves ticks ran);
+# 4) flush degradation edges (#32): no conntrack in PATH -> wan-flush is
+#    a silent rc=0 no-op with the pending file consumed; empty pending
+#    file and missing /tmp/wanguard -> silent, consumed, rc=0.
 set -u
 
 UG=/usr/bin/wanguard
@@ -120,4 +123,26 @@ case "$out" in *"failback:x"*) fail "override: x flipped (failback:x)" ;; esac
 [ "$(uci -q get wanguard.x.iface)" = wan2 ] || fail "override: x.iface=$(uci -q get wanguard.x.iface)"
 echo "3) override: down:wan2 seen, group x held wan2, zero x events"
 
-echo "C5-OK (honest 5s black-hole tick, N-of-M 2-of-3, override holds)"
+# --- 4) flush degradation edges (#32) ------------------------------------
+reset_lab 1
+ticks 1
+NOCT=/tmp/c5-noct # the ucode children minus conntrack (ubus/uci are
+rm -rf $NOCT      # in-process for the ucode CLI; curl is PATH-spawned)
+mkdir -p $NOCT
+ln -sf "$(command -v curl)" $NOCT/curl
+echo wan2 > /tmp/wanguard/a.flush
+u=$(PATH="$NOCT:/usr/bin:/bin" $UG wan-flush 2>&1); rc=$?
+[ -z "$u" ] || fail "degrade: wan-flush spoke: '$u'"
+[ "$rc" = 0 ] || fail "degrade: rc=$rc"
+[ -f /tmp/wanguard/a.flush ] && fail "degrade: pending file not consumed"
+echo "4) degradation: no conntrack -> silent rc=0, pending file consumed"
+echo "" > /tmp/wanguard/a.flush # empty request: consumed silently
+u=$($UG wan-flush 2>&1)
+[ -z "$u" ] || fail "empty pending: spoke: '$u'"
+[ -f /tmp/wanguard/a.flush ] && fail "empty pending: file not consumed"
+rm -rf /tmp/wanguard # fresh boot: no wand dir at all
+u=$($UG wan-flush 2>&1); rc=$?
+[ -z "$u" ] && [ "$rc" = 0 ] || fail "missing wand dir: '$u' rc=$rc"
+echo "   empty pending file + missing /tmp/wanguard: silent, consumed, rc=0"
+
+echo "C5-OK (honest 5s black-hole tick, N-of-M 2-of-3, override holds, flush degradation)"

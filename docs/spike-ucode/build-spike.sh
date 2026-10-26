@@ -1,8 +1,9 @@
 #!/bin/sh
-# build-spike.sh — Phase 3 packaging probe (issue #29): build the SPIKE
-# package `wanguard-ucode` = stock package with /usr/bin/wanguard swapped
-# for the ucode port (both binaries shipped side by side; the ucode one
-# passes apply/wan-flush/... through to /usr/bin/wanguard-sh).
+# build-spike.sh — packaging probe (issue #29; window vehicle for stages
+# 1-2, issues #31/#32): build the SPIKE package `wanguard-ucode` = stock
+# package with /usr/bin/wanguard swapped for the ucode port (both binaries
+# shipped side by side; the ucode one passes apply/... through to
+# /usr/bin/wanguard-sh, while wand-tick and wan-flush are native).
 #
 # NOT a release artifact: exists to prove apk packaging works unchanged
 # with a ucode shebang, to pin the real depends delta, and to feed the
@@ -42,7 +43,7 @@ inst "$ROOT/router/etc.config.wanguard.example"   "$W/usr/share/wanguard/etc.con
 	-I "name:wanguard-ucode" \
 	-I "version:$VER" \
 	-I "arch:x86_64" \
-	-I "description:SPIKE (#29): wanguard core with the ucode wand-tick port" \
+	-I "description:SPIKE (#29/#32): wanguard core with the ucode wand-tick + wan-flush ports" \
 	-I "license:MIT" \
 	-I "maintainer:sers88" \
 	-I "url:https://github.com/sers88/wanguard" \

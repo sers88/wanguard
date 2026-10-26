@@ -74,6 +74,21 @@ ticks() { # $1=count -> $out accumulates
 	while [ $n -lt $1 ]; do out="$out$($UG wand-tick 2>&1)"; n=$(( n + 1 )); done
 }
 
+# flushcheck — the #32 acceptance per hop: the ucode wan-flush event must
+# be byte-exact AND equal the stock sh CLI's event on identical state
+# (the pending file is re-seeded for the sh rerun; a second conntrack -D
+# on the same IP is idempotent; the idle rerun must be silent on both)
+flushcheck() { # $1=group $2=old-iface $3=ip
+	local u s want="flush:$1>$2($3)"
+	u=$($UG wan-flush 2>&1)
+	case "$u" in "wand:$want") ;; *) fail "flush event: '$u' (want 'wand:$want')" ;; esac
+	echo "$2" > "/tmp/wanguard/$1.flush"
+	s=$($SHG wan-flush 2>&1)
+	[ "$u" = "$s" ] || fail "flush parity: ucode '$u' vs sh '$s'"
+	u=$($UG wan-flush 2>&1); s=$($SHG wan-flush 2>&1) # idle rerun (the
+	[ -z "$u$s" ] || fail "idle flush spoke: '$u'/'$s'" # parity run consumed)
+}
+
 echo "== C3: live 3-WAN re-failover drill (ucode CLI, #26 backup order)"
 
 # prereqs: third WAN wired (host: docker network wanC + connects)
@@ -104,9 +119,8 @@ case "$out" in *"failover:a>wan2"*) fail "p1: picked wan2 — backup_iface order
 o=$($UG apply 2>&1); case "$o" in in-sync|applied*) ;; *) fail "p1 apply: '$o'" ;; esac
 rt=$(ip route show table 400 | grep '^default')
 case "$rt" in *"dev eth2"*) ;; *) fail "p1: table400 '$rt' (want dev eth2)" ;; esac
-o=$($UG wan-flush 2>&1)
-case "$o" in *"flush:a>wan1("*) ;; *) fail "p1 wan-flush: '$o'" ;; esac
-echo "p1: wan1 dead -> failover a>wan3 (list order), table400 dev eth2"
+flushcheck a wan1 172.30.10.2
+echo "p1: wan1 dead -> failover a>wan3 (list order), table400 dev eth2, flush:a>wan1(172.30.10.2) byte-parity"
 
 # --- phase 2: wan3 dies too -> #26 RE-failover to the next backup ---
 block $C
@@ -118,9 +132,8 @@ case "$out" in *"failover:a>wan2"*) ;; *) fail "p2: no RE-failover a>wan2 in '$o
 o=$($UG apply 2>&1); case "$o" in in-sync|applied*) ;; *) fail "p2 apply: '$o'" ;; esac
 rt=$(ip route show table 400 | grep '^default')
 case "$rt" in *"dev eth1"*) ;; *) fail "p2: table400 '$rt' (want dev eth1)" ;; esac
-o=$($UG wan-flush 2>&1)
-case "$o" in *"flush:a>wan3("*) ;; *) fail "p2 wan-flush: '$o'" ;; esac
-echo "p2: wan3 dead -> RE-failover a>wan2 (#26), table400 dev eth1"
+flushcheck a wan3 172.30.30.2
+echo "p2: wan3 dead -> RE-failover a>wan2 (#26), table400 dev eth1, flush:a>wan3(172.30.30.2) byte-parity"
 
 # --- phase 3: wan1 recovers -> failback (wan3 stays dead) ---
 unblock $A
@@ -132,9 +145,8 @@ case "$out" in *"failback:a>wan1"*) ;; *) fail "p3: no failback:a>wan1 in '$out'
 o=$($UG apply 2>&1); case "$o" in in-sync|applied*) ;; *) fail "p3 apply: '$o'" ;; esac
 rt=$(ip route show table 400 | grep '^default')
 case "$rt" in *"dev eth0"*) ;; *) fail "p3: table400 '$rt' (want dev eth0)" ;; esac
-o=$($UG wan-flush 2>&1)
-case "$o" in *"flush:a>wan2("*) ;; *) fail "p3 wan-flush: '$o'" ;; esac
-echo "p3: wan1 recovered -> failback a>wan1, table400 dev eth0"
+flushcheck a wan2 172.30.20.2
+echo "p3: wan1 recovered -> failback a>wan1, table400 dev eth0, flush:a>wan2(172.30.20.2) byte-parity"
 
 # --- sh parity: stock sh CLI must honor the same backup-list order ---
 unblock $C # sh section needs the fresh baseline: wan3 alive again
@@ -150,4 +162,4 @@ echo "sh live failover: ok (a>wan3, list order honored)"
 
 $UG apply >/dev/null 2>&1
 nft list table inet wanguard | grep -q "wg:b" || fail "wg:b rules missing"
-echo "C3-OK (live wan1->wan3->wan2->wan1 + sh parity)"
+echo "C3-OK (live wan1->wan3->wan2->wan1 + sh parity + byte-exact flush:wand events per hop)"

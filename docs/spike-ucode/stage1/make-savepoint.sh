@@ -44,9 +44,17 @@ SP="/root/rollback/$TS"
 mkdir -p "$SP" || die "cannot mkdir $SP"
 
 # ---------- preflight ----------
-# The savepoint must capture the STOCK state; the spike install happens AFTER.
+# The savepoint must capture the CURRENT FEED state; the candidate install
+# happens AFTER. Stage 1 (issue #31) snapshotted a stock sh CLI; since the
+# feed reached 1.0.5 the before-state is ucode TOO — that is the new normal,
+# not an anomaly. What must NOT be silently snapshotted is a leftover
+# window candidate: package `wanguard-ucode` still in the apk DB means a
+# previous window never rolled forward, resolve that first.
+if grep -q '^P:wanguard-ucode$' /lib/apk/db/installed 2>/dev/null; then
+	preflight_fail "wanguard-ucode is already installed — a previous window candidate is still in the DB (roll it forward to a feed tag or apk del + restore bytes first)"
+fi
 if [ "$(head -1 /usr/bin/wanguard 2>/dev/null)" = "#!/usr/bin/ucode" ]; then
-	preflight_fail "/usr/bin/wanguard is ALREADY ucode — savepoint must run before the spike install"
+	warn "/usr/bin/wanguard is ucode — normal since feed 1.0.5 (stage 2+); these bytes become the L1 rollback target"
 fi
 command -v ucode >/dev/null 2>&1 || preflight_fail "ucode missing on PATH — the spike would not run at all"
 if command -v ucode >/dev/null 2>&1; then
