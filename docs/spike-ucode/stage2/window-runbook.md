@@ -138,18 +138,25 @@ ls /tmp/wanguard/*.flush 2>/dev/null    # пусто
 1. Агент: merge `spike/ucode` → main, тег `v1.0.6` → CI → фид
    (`apk/build.sh` уже собирает stage-2 форму: `/usr/bin/wanguard` = wand.uc
    с нативным wan-flush + `wanguard-sh` рядом).
-2. На роутере (уроки окна 2026-10-25: спайк из БД вычищать ДО апгрейда,
-   после del файлы на диске отсутствуют секунды — keepalive переживает):
+2. На роутере (уроки окон 2026-10-25 и 2026-10-26):
 
    ```sh
-   apk del wanguard-ucode
-   apk update && apk upgrade      # wanguard 1.0.5-r1 -> 1.0.6-r1 из фида
-   apk fix wanguard               # страховка пере-извлечения (урок NO-OP add)
+   apk del wanguard-ucode        # общие файлы падают с диска на ~100 с —
+                                 # keepalive логает not found и ретраится,
+                                 # сеть живёт (UCI/nft не тронуты)
+   apk update
+   apk add wanguard=1.0.6-r1     # ЖИВОЙ УРОК 2026-10-26: `apk upgrade`
+                                 # МОЖЕТ ПРОПУСТИТЬ пакет (двинул luci,
+                                 # wanguard оставил 1.0.5) — апгрейдить
+                                 # ЯВНО с версией из тега; `apk fix` после
+                                 # del тоже но-op (версии уже нет в индексе)
    grep -E '^[0-9a-f]{32}  /' /tmp/stage2/stage1-manifest.txt | md5sum -c -
    #   байты из фида = байты приёмки (wand.uc в пакете = тот же коммит)
    ```
-3. Батарея 5/5, ANCHORS 3/3. Откат с фида: `apk add --force-overwrite
-   wanguard=1.0.5-r1` или офлайн-apk из savepoint.
+3. Батарея 5/5, ANCHORS 3/3. Откат с фида: `apk add wanguard=1.0.5-r1`
+   невозможно (версии уходят из индекса фида) — только офлайн-apk из
+   savepoint: `apk add --allow-untrusted --force-overwrite
+   /root/rollback/<ts>/wanguard-1.0.5-r1.apk`.
 4. Агент: комментарий-протокол в issue #32, закрытие; приватный репо —
    PLAN.md (Этап 10, этап 2 принят).
 
