@@ -1,9 +1,11 @@
 #!/bin/sh
-# C6-metrics.sh — resource metrics in the live lab (issue #29 VERDICT):
-# 1) external spawns per tick: PATH shims wrap every external the tick can
-#    touch; each shim counts one invocation then execs the REAL tool, so
-#    the bus stays REAL (ubus counted, not mocked) and probes stay REAL
-#    curl. 5 settled ticks per CLI on identical fresh state.
+# C6-metrics.sh — resource metrics in the live lab (issue #29 VERDICT,
+# extended for stage 3 / #33 with per-apply spawn counts):
+# 1) external spawns per tick AND per apply: PATH shims wrap every
+#    external the CLI can touch; each shim counts one invocation then
+#    execs the REAL tool, so the bus stays REAL (ubus counted, not
+#    mocked) and probes stay REAL curl. 5 settled runs per CLI per
+#    subcommand on identical fresh state.
 #    NB shell-internal subshell forks (command substitution) are NOT
 #    counted — the metric is external tool invocations, the same family
 #    the VERDICT's mock-env 58->4 came from.
@@ -65,14 +67,14 @@ shim_on() {
 }
 shim_off() { rm -rf /tmp/shim; } # counters live in /tmp/cnt — survive
 
-forks_of() { # $1=cli -> prints "total uci curl" external spawns / 5 ticks
-	local cli=$1 t n total=0 uci=0 curl=0
+forks_of() { # $1=cli $2=subcommand -> "total uci curl" external spawns / 5 runs
+	local cli=$1 sub=${2:-wand-tick} t n total=0 uci=0 curl=0
 	reset_lab
 	shim_on
 	PATH=/tmp/shim:$PATH
-	$cli wand-tick >/dev/null 2>&1 # seed tick: settles homes (uncounted)
+	$cli $sub >/dev/null 2>&1 # seed run: settles state (uncounted)
 	rm -f /tmp/cnt/*
-	n=0; while [ $n -lt 5 ]; do $cli wand-tick >/dev/null 2>&1; n=$(( n + 1 )); done
+	n=0; while [ $n -lt 5 ]; do $cli $sub >/dev/null 2>&1; n=$(( n + 1 )); done
 	PATH=${PATH#"/tmp/shim:"}
 	shim_off # counters readable with the REAL grep only
 	for f in /tmp/cnt/*; do
@@ -97,6 +99,18 @@ printf '  sh    tick: %s external spawns / 5 ticks = %.1f per tick (uci=%s, curl
 	"$(echo $f_sh | cut -d' ' -f2)" \
 	"$(echo $f_sh | awk '{print $3/5}')" \
 	"$(echo $f_sh | awk '{print ($1-$3)/5}')"
+
+# ---------- 1b) external spawns per APPLY (stage-3 #33 verdict: the
+# ucode apply is native — no sh child, no grep/sed/awk pipeline; nft/ip
+# stay external BY DESIGN, so the honest floor is nonzero) ----------
+f_uc=$(forks_of $UG apply)
+f_sh=$(forks_of $SHG apply)
+printf '  ucode apply: %s external spawns / 5 applies = %.1f per apply\n' \
+	"$(echo $f_uc | cut -d' ' -f1)" \
+	"$(echo $f_uc | awk '{print $1/5}')"
+printf '  sh    apply: %s external spawns / 5 applies = %.1f per apply\n' \
+	"$(echo $f_sh | cut -d' ' -f1)" \
+	"$(echo $f_sh | awk '{print $1/5}')"
 
 # ---------- 2) wall-time: 40 live ticks per CLI ----------
 cat > /tmp/wall.uc <<'EOF'
