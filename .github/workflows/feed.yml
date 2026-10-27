@@ -36,8 +36,10 @@ jobs:
 
       - name: Download pinned apk.static 3.0.7
         run: |
-          curl -fsSL --retry 3 --connect-timeout 20 -o apk.static "$APK_STATIC_URL"
-          echo "$APK_STATIC_SHA256  apk.static" | sha256sum -c -
+          curl -fsSL --retry 3 --connect-timeout 20 -o apk.static "$APK_STATIC_URL" \
+            || curl -fsSL --retry 3 --connect-timeout 20 -o apk.static \
+              "https://github.com/sers88/wanguard/releases/download/ci-tools/apk.static"
+          echo "$APK_STATIC_SHA256  apk.static" | sha256sum -c - # pin gates EITHER source
           chmod +x apk.static
 
       - name: Build packages
@@ -72,8 +74,10 @@ jobs:
 
       - name: Download pinned apk.static 3.0.7
         run: |
-          curl -fsSL --retry 3 --connect-timeout 20 -o apk.static "$APK_STATIC_URL"
-          echo "$APK_STATIC_SHA256  apk.static" | sha256sum -c -
+          curl -fsSL --retry 3 --connect-timeout 20 -o apk.static "$APK_STATIC_URL" \
+            || curl -fsSL --retry 3 --connect-timeout 20 -o apk.static \
+              "https://github.com/sers88/wanguard/releases/download/ci-tools/apk.static"
+          echo "$APK_STATIC_SHA256  apk.static" | sha256sum -c - # pin gates EITHER source
           chmod +x apk.static
 
       - name: Verify signing key against committed public key
