@@ -1,8 +1,212 @@
 #!/bin/sh
-# mock ip / nft: the watchdog tests never exercise the data plane; accept
-# everything, print plausible defaults for the two read commands.
-case "$1 $2" in
-	"route show") echo "default via 192.0.2.1 dev mock-wan" ;;
-	"rule show") : ;;
-esac
-exit 0
+# mock ip — stateful emulation of the iproute2 subset `wanguard apply`
+# uses (stage-3 ucode migration, #33 render-parity fixtures).
+#
+# State lives in $IP_STATE (a directory). When $IP_STATE is UNSET the mock
+# degrades to the legacy no-op (watchdog suites keep passing untouched):
+#   `route show` -> one plausible default; `rule show` -> empty; rc 0.
+#
+# Files under $IP_STATE:
+#   rules       rendered ip-rule lines `<prio>:<TAB><form>` (sorted)
+#   route.<t>   route lines of table <t>, verbatim (no ` table N` suffix);
+#               `route.main` holds the main table
+#   links       existing devices, one per line (for `ip link show`)
+#
+# The rules file is seeded with the kernel base rules (0/32766/32767) on
+# first touch. Formats byte-shaped after real ip-full 25.12.5 (probe
+# transcripts: docs/spike-ucode/stage3/NOTES.md; busybox ip differs
+# cosmetically — trailing spaces on rule lines):
+#   8000:	from all fwmark 0x12c lookup 500        (rule: NO trailing space)
+#   default dev Meta scope link                -> rendered `default dev Meta `
+#   default via 172.30.10.10 dev eth1 metric 10 metric 200 <EOL>
+#
+# Semantics reproduced where the CLI depends on them:
+#   - ROUTE lines render with a TRAILING SPACE (real ip-full does; the sh
+#     CLI greps `default dev <dev> ` and ` metric 200($| )` — v2 probe I5/I8)
+#   - `rule del prio P` with no such rule: rc 2 (the sh reconcile loops
+#     `while ip rule del prio P` and MUST see the failure stop it)
+#   - `route show table <t>` on an absent/empty table: empty output, rc 0
+#   - `route replace` with a `dev` not in links: error rc 1
+#     (ip-full message `Cannot find device "X"`; on a device that exists
+#     but is DOWN real ip-full says `Device for nexthop is not up.` rc 2 —
+#     unreachable from the CLI: down ifaces have no l3_device and are
+#     skipped before replace; mock models existence only)
+#   - duplicate `metric` tokens: stored verbatim (real ip normalizes to
+#     the last one; divergence documented, lab battery covers the real
+#     binary — the mock stays deterministic for parity testing)
+set -u
+
+ST=${IP_STATE:-}
+if [ -z "$ST" ]; then
+	# legacy watchdog mode
+	case "$1 $2" in
+		"route show") echo "default via 192.0.2.1 dev mock-wan" ;;
+		"rule show") : ;;
+	esac
+	exit 0
+fi
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+seed() { # create base state on first touch
+	mkdir -p "$ST"
+	[ -f "$ST/rules" ] || {
+		{
+			printf '0:\tfrom all lookup local\n'
+			printf '32766:\tfrom all lookup main\n'
+			printf '32767:\tfrom all lookup default\n'
+		} > "$ST/rules"
+	}
+	[ -f "$ST/links" ] || : > "$ST/links"
+	[ -f "$ST/route.main" ] || : > "$ST/route.main"
+}
+
+# ---------- rule show / add / del ----------
+
+if [ "$1 $2" = "rule show" ]; then
+	seed
+	sort -n "$ST/rules"
+	exit 0
+fi
+
+if [ "$1 $2" = "rule add" ]; then
+	seed
+	shift; shift # prio P fwmark M table T
+	prio=""; mark=""; tbl=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			prio) prio=$2; shift ;;
+			fwmark) mark=$2; shift ;;
+			table) tbl=$2; shift ;;
+			*) die "syntax error" ;;
+		esac
+		shift
+	done
+	[ -n "$prio" ] && [ -n "$mark" ] && [ -n "$tbl" ] || die "syntax error"
+	hex=$(printf '0x%x' "$mark")
+	printf '%s:\tfrom all fwmark %s lookup %s\n' "$prio" "$hex" "$tbl" >> "$ST/rules"
+	sort -n "$ST/rules" > "$ST/rules.s"
+	mv "$ST/rules.s" "$ST/rules"
+	exit 0
+fi
+
+if [ "$1 $2" = "rule del" ]; then
+	seed
+	shift; shift
+	[ "$1" = prio ] || die "syntax error"
+	prio=$2
+	grep -q "^$prio:" "$ST/rules" || {
+		echo "RTNETLINK answers: No such file or directory" >&2
+		exit 2
+	}
+	grep -v "^$prio:" "$ST/rules" > "$ST/rules.s"
+	mv "$ST/rules.s" "$ST/rules"
+	exit 0
+fi
+
+# ---------- route show / replace / flush ----------
+
+if [ "$1 $2" = "route show" ]; then
+	seed
+	tbl=main
+	if [ "$3" = table ]; then
+		tbl=$4
+		if [ "$tbl" = all ]; then
+			sed 's/$/ /' "$ST/route.main"
+			for f in $(ls "$ST" 2>/dev/null | grep '^route\.' | grep -v 'route\.main' | sed 's/^route\.//' | sort -n); do
+				[ -s "$ST/route.$f" ] || continue
+				sed "s/\$/ table $f /" "$ST/route.$f"
+			done
+			exit 0
+		fi
+	fi
+	# trailing space = real ip-full rendering (NOTES.md I5/I8): the CLI
+	# greps `default dev <dev> ` and ` metric 200($| )` against it
+	[ -f "$ST/route.$tbl" ] && sed 's/$/ /' "$ST/route.$tbl"
+	exit 0
+fi
+
+if [ "$1" = "route" ] && [ "$2" = "replace" -o "$2" = "add" ]; then
+	seed
+	shift; shift
+	line="$*"
+	tbl=main
+	case "$line" in
+		*" table "*)
+			tbl=${line##* table }
+			tbl=${tbl%% *}
+			line=${line%% table *}
+			;;
+	esac
+	dev=""
+	case "$line" in
+		*" dev "*)
+			dev=${line##* dev }
+			dev=${dev%% *}
+			;;
+	esac
+	if [ -n "$dev" ] && ! grep -qx "$dev" "$ST/links"; then
+		echo "Cannot find device \"$dev\"" >&2
+		exit 1
+	fi
+	case "$line" in
+		default*)
+			# defaults with DIFFERENT metric keys coexist in one table
+			# (real ip: the CLI maintains `default dev X` AND
+			# `default via Y metric 200` side by side); replace = same
+			# default with the same LAST metric token, else append
+			key=$(printf '%s' "$line" | awk '{ for (i = 1; i < NF; i++) if ($i == "metric") m = $(i + 1); print m }')
+			[ -f "$ST/route.$tbl" ] || { # absent table: first entry
+				printf '%s\n' "$line" > "$ST/route.$tbl"
+				exit 0
+			}
+			kept=""
+			{
+				while IFS= read -r r; do
+					[ -n "$r" ] || continue
+					case "$r" in
+						default*)
+							rkey=$(printf '%s' "$r" | awk '{ for (i = 1; i < NF; i++) if ($i == "metric") m = $(i + 1); print m }')
+							if [ "$rkey" = "$key" ] && [ -z "$kept" ]; then
+								printf '%s\n' "$line"
+								kept=1
+							else
+								printf '%s\n' "$r"
+							fi
+							;;
+						*) printf '%s\n' "$r" ;;
+					esac
+				done
+				[ -n "$kept" ] || printf '%s\n' "$line"
+			} < "$ST/route.$tbl" > "$ST/route.$tbl.s"
+			mv "$ST/route.$tbl.s" "$ST/route.$tbl"
+			;;
+		*)
+			printf '%s\n' "$line" >> "$ST/route.$tbl"
+			;;
+	esac
+	exit 0
+fi
+
+if [ "$1 $2" = "route flush" ]; then
+	seed
+	tbl=$4
+	[ "$3" = table ] || die "syntax error"
+	: > "$ST/route.$tbl"
+	exit 0
+fi
+
+# ---------- link show ----------
+
+if [ "$1 $2" = "link show" ]; then
+	seed
+	if grep -qx "$3" "$ST/links"; then
+		printf '1: %s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN\n' "$3"
+		exit 0
+	fi
+	echo "Cannot find device \"$3\"" >&2
+	exit 2
+fi
+
+echo "mock ip: unsupported: $*" >&2
+exit 2
