@@ -61,8 +61,19 @@ objs['network.interface'] = {
 		call: function(req) {
 			state = load();
 			let out = [];
-			for (let name in keys(state))
+			let seen = {};
+			// REAL netifd lists every CONFIGURED interface in dump(),
+			// up or down — the fixed NAMES set is the configured set;
+			// fixture-only names are appended (stage-4 finding: the
+			// ucode CLI's wanset/backupset existence checks read the
+			// dump, so a fixture-omitted name must still be known)
+			for (let name in NAMES) {
 				push(out, render(name));
+				seen[name] = 1;
+			}
+			for (let name in keys(state))
+				if (!(name in seen))
+					push(out, render(name));
 			return { interface: out };
 		},
 		args: {}

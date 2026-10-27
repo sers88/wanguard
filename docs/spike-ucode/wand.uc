@@ -18,8 +18,17 @@
  * Stage 2 (#30/#32): the keepalive's whole tick->apply->flush cycle no
  * longer descends into sh for the flush leg (`conntrack` itself stays an
  * external call — fork reduction is not the goal there, leaving sh is).
- * Everything else (apply, ...) is passed through to the stock sh CLI so
- * the keepalive contract keeps working end to end.
+ *
+ * Stage 3 (#30/#33): apply native (full cmd_apply port; render parity
+ * gated by stage3/apply-parity.sh, 165 checks).
+ *
+ * Stage 4 (#30/#34): ALL remaining subcommands native (list/add/move/
+ * remove/grouplist/devices/groupadd/groupset/groupdel/wanstatus/wanset/
+ * wanauto/backupset/help) — the sh passthrough is GONE; `wanguard-sh`
+ * stays in the package until stage 5 as the offline rollback vehicle.
+ * Byte-parity gated by stage4/cli-parity.sh (method C4: every stdout/
+ * stderr byte, exit code and committed UCI byte vs the sh reference on
+ * identical state).
  *
  * PROBE NOTE (spike finding, Step 1.3): uclient.so exposes
  * new(url,auth,cb)/set_timeout/request/status but libuclient has NO
@@ -384,17 +393,6 @@ function probe_selftest() { // router window evidence (runbook window 2)
 			printf('  %s -> alive=%s rtt=%s\n', url,
 				state_read(`${wan}.alive`, '-'), state_read(`${wan}.rtt`, '-'));
 	}
-}
-
-function passthrough(args) { // stock sh CLI handles the rest of the contract
-	// default matches the spike package layout (both shipped side by
-	// side); on a stock router export WANGUARD_SH=/usr/bin/wanguard
-	let sh = getenv('WANGUARD_SH') ?? '/usr/bin/wanguard-sh';
-	let p = fs.popen(`${sh} ${join(' ', args)} 2>&1`, 'r');
-	let out = p.read('all') ?? '';
-	let rc = p.close();
-	print(out);
-	exit(rc);
 }
 
 // ---------- apply: UCI -> nft + ip rules + routes (stage 3, #33) ----------
@@ -799,9 +797,497 @@ function apply() {
 	print((changed == 1) ? 'applied\n' : 'in-sync\n'); // literal keepalive contract
 }
 
+// ---------- stage 4: CLI CRUD + view (issue #34) ----------
+//
+// 1:1 port of the remaining sh subcommands (router/wanguard lines
+// 649-1014): list/add/move/remove/grouplist/devices/groupadd/groupset/
+// groupdel/wanstatus/wanset/wanauto/backupset + help. With this the
+// passthrough is GONE — dispatch default is the sh `unknown command`
+// error, and every contract surface (stdout bytes, stderr bytes, exit
+// codes, committed UCI bytes) is gated by stage4/cli-parity.sh.
+//
+// Port notes (stage4/NOTES.md, probed live in the 25.12.5 container):
+//   - ucode printf width/flags are sh-printf byte-identical (probe P1)
+//   - ucode split(line, /[ \t]+/) reproduces awk field splitting
+//     including leading/trailing empty fields (probe P6) — the devices
+//     port is field-index-equal to the sh awk (ucode f[0] = awk f[1])
+//   - fs.readfile() works on size-0 /proc files (probe P5)
+//   - ucode uci has NO add_list: `set(conf, sid, opt, [array])` writes
+//     the same committed `list x 'y'` lines as sh `uci add_list`
+//     (probe P3/P4 — committed bytes identical to the sh edit)
+//   - 2-arg cursor.get(conf, sid) returns the section TYPE (the
+//     `uci -q get conf.sid` existence-check parity), null when absent
+//   - cursor.delete of a missing option/section is silent (sh -q parity)
+//   - after every mutation the cursor is REFRESHED (uci.cursor()):
+//     sh runs every uci call as a fresh process — the snapshot cursor
+//     must not leak stale reads into the trailing native apply()
+
+function normalize_mac(raw) { // prints MAC as aa:bb:cc:dd:ee:ff, null if invalid
+	let s = replace(lc('' + (raw ?? '')), /-/g, ':');
+	s = replace(s, /[:.]/g, '');
+	if (match(s, /^[0-9a-f]{12}$/) == null)
+		return null;
+	let out = '';
+	for (let i = 0; i < 12; i += 2)
+		out += ((i > 0) ? ':' : '') + substr(s, i, 2);
+	return out;
+}
+
+function member_ids() { // UCI sections of type member, in FILE order
+	// (sh: `uci show | grep '=member$'` — no sort; LuCI/board order)
+	let ids = [];
+	cursor.foreach(CONF, 'member', (s) => push(ids, s['.name']));
+	return ids;
+}
+
+function get_member_opt(sid, opt) {
+	let v = cursor.get(CONF, sid, opt);
+	return (v == null) ? '' : '' + v;
+}
+
+function group_exists(g) { // any section with this id (sh: `uci -q get` loop)
+	return (cursor.get(CONF, g) != null);
+}
+
+function proxy_ids() { return group_ids('proxy'); }
+
+function group_members(g) { // member count for group g
+	let n = 0;
+	cursor.foreach(CONF, 'member', (s) => {
+		if (s.group == g)
+			n++;
+	});
+	return n;
+}
+
+function find_by_mac(mac) { // first member section with this MAC (file order)
+	for (let sid in member_ids())
+		if (normalize_mac(get_member_opt(sid, 'mac')) == mac)
+			return sid;
+	return null;
+}
+
+function section_id_for_mac(mac) { // m_d8bbc1cc1771
+	return 'm_' + replace(mac, /:/g, '');
+}
+
+function valid_group_name(name) { // [A-Za-z0-9_]{1,15}, not globals/wan
+	if (name == 'globals' || name == 'wan')
+		return false;
+	return (match('' + name, /^[A-Za-z0-9_]{1,15}$/) != null);
+}
+
+function iface_known(name) { // sh `ubus call network.interface.X status` rc==0:
+	// netifd KNOWS the iface (up or down) — unlike iface_map(), which
+	// carries only UP ifaces
+	let conn = ubus_conn();
+	if (!conn)
+		return false;
+	let dump = conn.call('network.interface', 'dump', {});
+	conn.disconnect();
+	for (let rec in (dump?.interface ?? []))
+		if (rec.interface == name)
+			return true;
+	return false;
+}
+
+function uci_commit() { // sh `uci commit "$CONF" || err "uci commit failed"`
+	// + the snapshot refresh (see the port notes above)
+	try {
+		cursor.save(CONF);
+		cursor.commit(CONF);
+	}
+	catch (e) {
+		fail('uci commit failed');
+	}
+	cursor = uci.cursor();
+}
+
+// ---------- commands ----------
+
+function cmd_list() {
+	let bad = [], drift = false;
+	printf('%-16s %-20s %-8s\n', 'NAME', 'MAC', 'GROUP');
+	for (let sid in member_ids()) {
+		let name = get_member_opt(sid, 'name');
+		if (name == '')
+			name = '-';
+		let mac = get_member_opt(sid, 'mac');
+		let grp = get_member_opt(sid, 'group');
+		if (group_exists(grp))
+			printf('%-16s %-20s %-8s\n', name, mac, grp);
+		else {
+			printf('%-16s %-20s %-8s\n', name, mac, `${grp} (??)`);
+			push(bad, grp);
+		}
+	}
+	if (length(bad))
+		msg(`warning: members reference unknown group(s): ${join(' ', bad)} (fail-safe: main table)`);
+	for (let a in alloc_entries()) {
+		if (join('\n', sort(desired_group(a.g))) !=
+		    join('\n', sort(current_elements(`mac_${a.g}`))))
+			drift = true;
+	}
+	if (drift) {
+		msg('nft: DRIFT (UCI != nft sets; run: wanguard apply)');
+		exit(1);
+	}
+	msg('nft: in-sync');
+}
+
+function cmd_grouplist() {
+	printf('%-10s %-7s %-10s %-5s %-5s %-14s %s\n',
+		'GROUP', 'TYPE', 'IFACE', 'MARK', 'TABLE', 'DEVICE', 'MEMBERS');
+	for (let a in alloc_entries()) {
+		let ifc, dev;
+		if (a.typ == 'proxy') {
+			ifc = '-';
+			dev = (sh_rc(`ip link show Meta >/dev/null 2>&1`) == 0) ? 'Meta' : 'down';
+		}
+		else {
+			ifc = a.ifc;
+			dev = iface_map()[ifc]?.device ?? '';
+			if (dev == '')
+				dev = 'down';
+		}
+		printf('%-10s %-7s %-10s %-5s %-5s %-14s %s\n',
+			a.g, a.typ, ifc, a.m, a.t, dev, group_members(a.g));
+	}
+}
+
+function cmd_devices() { // LAN clients for the LuCI board (issue #14)
+	// prints: mac<TAB>ip<TAB>name<TAB>online — leases give name/ip, ARP
+	// gives online (complete entry). ARP-only devices (static IPs) show
+	// name "-". Field-index parity with the sh awk: ucode f[0] = awk f[1]
+	// (probe P6: split() reproduces awk leading/trailing empty fields).
+	const order = [], seen = {}, ipm = {}, nm = {}, onm = {};
+	function add(rawmac, ip, name, on) {
+		let mac = lc('' + rawmac);
+		if (match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) == null)
+			return;
+		if (!(mac in seen)) {
+			push(order, mac);
+			seen[mac] = 1;
+		}
+		if (!(mac in ipm) || ipm[mac] == '-')
+			ipm[mac] = ip;
+		if (!(mac in nm) || nm[mac] == '-')
+			nm[mac] = name;
+		if (on)
+			onm[mac] = 1;
+	}
+	let leases = fs.readfile('/tmp/dhcp.leases'); // awk getline: missing file
+	if (leases != null)                           // = no iterations
+		for (let line in split(leases, /\n/)) {
+			let f = split(line, /[ \t]+/);
+			if (length(f) >= 4)
+				add(f[1], f[2], (f[3] == '*') ? '-' : f[3], false);
+		}
+	let arp = fs.readfile('/proc/net/arp');
+	if (arp != null)
+		for (let line in split(arp, /\n/)) {
+			let f = split(line, /[ \t]+/);
+			// "IP address HW type Flags HW address Mask Device"; 0x2 = complete
+			if (length(f) >= 6 && f[2] == '0x2' && f[5] == BR)
+				add(f[3], f[0], '-', true);
+		}
+	for (let mac in order)
+		printf('%s\t%s\t%s\t%d\n', mac,
+			(mac in ipm) ? ipm[mac] : '-',
+			(mac in nm) ? nm[mac] : '-',
+			(mac in onm) ? 1 : 0);
+}
+
+function cmd_groupadd(name, val) {
+	if (!valid_group_name(name))
+		fail(`invalid group name: '${name}' ([A-Za-z0-9_], <=15, not globals/wan)`);
+	if (group_exists(name))
+		fail(`section '${name}' already exists in ${CONF}`);
+	if (val == 'proxy') {
+		let p = proxy_ids();
+		if (length(p))
+			fail(`proxy group already exists: ${join(' ', p)} (mihomo is a singleton)`);
+		cursor.set(CONF, name, 'group');
+		cursor.set(CONF, name, 'type', 'proxy');
+	}
+	else {
+		if (val == '')
+			fail('usage: wanguard groupadd <name> <iface|proxy>');
+		if (val == 'direct')
+			fail(`'direct' alone is not an interface name — pass a netifd iface (e.g. vpn, wan2; see: wanguard grouplist)`);
+		cursor.set(CONF, name, 'group');
+		cursor.set(CONF, name, 'type', 'direct');
+		cursor.set(CONF, name, 'iface', val);
+		if ((iface_map()[val]?.device ?? '') == '')
+			msg(`note: iface '${val}' is down or missing in netifd — routes will follow once it is up`);
+	}
+	uci_commit();
+	msg(`group '${name}' created (${(val == 'proxy') ? 'proxy' : `direct -> ${val}`})`);
+	apply();
+}
+
+function cmd_groupset(name, val) {
+	if (!group_exists(name))
+		fail(`no such group: '${name}' (see: wanguard grouplist)`);
+	let cur = group_opt(name, 'iface');
+	let old = '';
+	if (val == 'proxy') {
+		for (let other in proxy_ids())
+			if (other != name)
+				fail(`proxy group already exists: ${other} (mihomo is a singleton)`);
+		cursor.set(CONF, name, 'type', 'proxy');
+		cursor.delete(CONF, name, 'iface');
+		// stale watchdog options must not survive a direct->proxy retarget
+		cursor.delete(CONF, name, 'wan_home');
+		cursor.delete(CONF, name, 'wanmode');
+	}
+	else {
+		if (val == '')
+			fail('usage: wanguard groupset <name> <iface|proxy>');
+		if (val == 'direct')
+			fail(`'direct' alone is not an interface name — pass a netifd iface (e.g. vpn, wan2; see: wanguard grouplist)`);
+		cursor.set(CONF, name, 'type', 'direct');
+		if (cur != '')
+			old = cur; // direct->direct retarget flushes old (#24)
+		cursor.set(CONF, name, 'iface', val);
+		// permanent retarget redefines the watchdog home (issue #6)
+		cursor.set(CONF, name, 'wan_home', val);
+		cursor.set(CONF, name, 'wanmode', 'auto');
+		if ((iface_map()[val]?.device ?? '') == '')
+			msg(`note: iface '${val}' is down or missing in netifd — routes will follow once it is up`);
+	}
+	uci_commit();
+	msg(`group '${name}' updated (${(val == 'proxy') ? 'proxy' : `direct -> ${val}`})`);
+	apply();
+	if (old != '' && old != val) // re-route long sessions from the old
+		msg(`wand: ${conntrack_flush(name, old, iface_map())}`); // egress (#24)
+}
+
+function cmd_groupdel(name) {
+	if (!group_exists(name))
+		fail(`no such group: '${name}' (see: wanguard grouplist)`);
+	let members = '';
+	for (let sid in member_ids())
+		if (get_member_opt(sid, 'group') == name)
+			members += ` ${get_member_opt(sid, 'mac')}`;
+	if (members != '')
+		fail(`group '${name}' still has members:${members} (move them first: wanguard move <mac> <group>)`);
+	cursor.delete(CONF, name);
+	uci_commit();
+	msg(`group '${name}' deleted`);
+	apply();
+}
+
+function cmd_add(mac_raw, grp, name) {
+	let mac = normalize_mac(mac_raw);
+	if (mac == null)
+		fail(`invalid mac: ${mac_raw}`);
+	if (!group_exists(grp))
+		fail(`no such group: '${grp}' (see: wanguard grouplist)`);
+	if (name == '')
+		name = `mac-${substr(mac, index(mac, ':') + 1)}`;
+	let sid = find_by_mac(mac);
+	if (sid != null)
+		fail(`${mac} already registered as '${get_member_opt(sid, 'name')}' in group ${get_member_opt(sid, 'group')} (use: wanguard move ${mac} ${grp})`);
+	sid = section_id_for_mac(mac);
+	try {
+		cursor.set(CONF, sid, 'member');
+	}
+	catch (e) {
+		fail('uci set failed');
+	}
+	cursor.set(CONF, sid, 'name', name);
+	cursor.set(CONF, sid, 'mac', mac);
+	cursor.set(CONF, sid, 'group', grp);
+	uci_commit();
+	msg(`added ${mac} -> group ${grp} (${name})`);
+	apply();
+}
+
+function cmd_move(mac_raw, grp) {
+	let mac = normalize_mac(mac_raw);
+	if (mac == null)
+		fail(`invalid mac: ${mac_raw}`);
+	if (!group_exists(grp))
+		fail(`no such group: '${grp}' (see: wanguard grouplist)`);
+	let sid = find_by_mac(mac);
+	if (sid == null)
+		fail(`${mac} not registered (use: wanguard add ${mac} <group> [name])`);
+	let cur = get_member_opt(sid, 'group');
+	if (cur == grp) {
+		msg(`${mac} already in group ${grp}`);
+		return;
+	}
+	cursor.set(CONF, sid, 'group', grp);
+	uci_commit();
+	msg(`moved ${mac}: ${cur} -> ${grp}`);
+	apply();
+}
+
+function cmd_remove(mac_raw) {
+	let mac = normalize_mac(mac_raw);
+	if (mac == null)
+		fail(`invalid mac: ${mac_raw}`);
+	let sid = find_by_mac(mac);
+	if (sid == null)
+		fail(`${mac} not registered`);
+	let name = get_member_opt(sid, 'name');
+	cursor.delete(CONF, sid);
+	uci_commit();
+	msg(`removed ${mac} (${name})`);
+	apply();
+}
+
+function cmd_wanstatus() {
+	printf('%-8s %-14s %-12s %-9s %-9s %s\n', 'WAN', 'DEVICE', 'STATE', 'RTT(s)', 'ANCHORS', 'SINCE');
+	let total = length(anchors());
+	let map = iface_map(); // ONE dump for the whole table (sh resolves per
+			       // wan — rendered rows are identical, stage-2
+			       // precedent in wanflush)
+	for (let wan in wand_wans()) {
+		let dev = map[wan]?.device ?? '-';
+		let st = wan_state(wan);
+		if (fs.stat(`${WAND_DIR}/${wan}.force`)?.type == 'file')
+			st = `${st}/forced`;
+		let rtt = state_read(`${wan}.rtt`, '-');
+		let alive = state_read(`${wan}.alive`, '-');
+		let since = trim(fs.readfile(`${WAND_DIR}/${wan}.since`) ?? '');
+		if (since != '') {
+			// NB: rtrim — sh $(date) strips trailing newlines only
+			let d = rtrim(sh_read(`date -d @${since} +'%d.%m %H:%M:%S' 2>/dev/null`));
+			if (d != '')
+				since = d;
+		}
+		else {
+			since = '-';
+		}
+		printf('%-8s %-14s %-12s %-9s %-9s %s\n', wan, dev, st, rtt, `${alive}/${total}`, since);
+	}
+	msg('');
+	printf('%-8s %-8s %-8s %-9s %-20s %s\n', 'GROUP', 'HOME', 'CURRENT', 'MODE', 'BACKUP', 'MEMBERS');
+	for (let g in direct_ids()) {
+		let home = group_opt(g, 'wan_home');
+		if (home == '')
+			home = '-';
+		let cur = group_opt(g, 'iface');
+		let mode = group_opt(g, 'wanmode');
+		if (mode == '')
+			mode = 'auto';
+		let bk = group_opt(g, 'backup_iface');
+		if (type(bk) == 'array') // list option: sh `uci get` prints the
+			bk = join(' ', bk); // elements space-joined
+		if (bk == '')           // '*' = all watched WANs A-Z
+			bk = '*';
+		printf('%-8s %-8s %-8s %-9s %-20s %s\n', g, home, cur, mode, bk, group_members(g));
+	}
+	if (system('command -v curl >/dev/null 2>&1') != 0)
+		msg('note: curl missing — watchdog probes disabled');
+}
+
+function cmd_wanset(g, ifc) {
+	if (!group_exists(g))
+		fail(`no such group: '${g}' (see: wanguard grouplist)`);
+	if (group_opt(g, 'type') != 'direct')
+		fail(`group '${g}' is proxy — it follows mihomo, wanset does not apply`);
+	if (!iface_known(ifc))
+		fail(`unknown netifd iface: '${ifc}'`);
+	let old = group_opt(g, 'iface');
+	cursor.set(CONF, g, 'iface', ifc);
+	cursor.set(CONF, g, 'wanmode', 'override');
+	uci_commit();
+	msg(`group '${g}' pinned to '${ifc}' (manual override; watchdog skips it; resume: wanguard wanauto ${g})`);
+	apply();
+	if (old != '' && old != ifc) // re-route long sessions pinned away
+		msg(`wand: ${conntrack_flush(g, old, iface_map())}`); // from old (#24)
+}
+
+function cmd_wanauto(g) {
+	if (!group_exists(g))
+		fail(`no such group: '${g}' (see: wanguard grouplist)`);
+	if (group_opt(g, 'type') != 'direct')
+		fail(`group '${g}' is proxy - nothing to automate`);
+	cursor.set(CONF, g, 'wanmode', 'auto');
+	uci_commit();
+	msg(`group '${g}' back in auto mode (home: ${group_opt(g, 'wan_home')}; watchdog fails back once home is up)`);
+}
+
+function cmd_backupset(g, ifaces) { // explicit backup priority (#26):
+	// watchdog fails over to the first UP iface in this order; ifaces
+	// outside the list are NOT eligible. Reset to the default (all
+	// watched WANs, alphabetical): uci -q delete wanguard.<g>.backup_iface
+	if (!group_exists(g))
+		fail(`no such group: '${g}' (see: wanguard grouplist)`);
+	if (group_opt(g, 'type') != 'direct')
+		fail(`group '${g}' is proxy — backups are a direct-group feature`);
+	let home = group_opt(g, 'wan_home');
+	let cur = group_opt(g, 'iface');
+	let watched = {}; // NB: `x in obj` tests keys (sh case *" $e "* parity)
+	for (let w in wand_wans())
+		watched[w] = 1;
+	let out = [];
+	for (let ifc in ifaces) {
+		if (ifc == home || ifc == cur) { // conflict-check
+			msg(`note: '${ifc}' is the group's own iface — ignored (never its own backup)`);
+			continue;
+		}
+		if (!iface_known(ifc))
+			fail(`unknown netifd iface: '${ifc}'`);
+		let dup = false;
+		for (let o in out)
+			if (o == ifc)
+				dup = true;
+		if (dup)
+			continue; // duplicate: first wins
+		if (!(ifc in watched))
+			msg(`note: '${ifc}' is not watched by the watchdog (no direct group sits on it) — it is skipped until it becomes some group's iface/wan_home`);
+		push(out, ifc);
+	}
+	if (length(out) == 0)
+		fail('nothing left after conflict-checks — backup list not changed');
+	cursor.delete(CONF, g, 'backup_iface');
+	cursor.set(CONF, g, 'backup_iface', out); // list write (no add_list in
+						  // ucode uci — probe P3/P4)
+	uci_commit();
+	// NB: no space after the colon — sh strips it with ${out# } (#26)
+	msg(`group '${g}' backup order:${join(' ', out)} (first UP wins; see: wanguard wanstatus)`);
+}
+
+const HELP = `usage: wanguard <command> [args]
+  list                          members + drift status
+  add <mac> <group> [name]      register + apply
+  move <mac> <group>            change group + apply
+  remove <mac>                  unregister + apply
+  apply                         reconcile UCI -> nft + ip rules + routes (idempotent)
+  grouplist                     groups: type, iface, mark/table, device, members
+  devices                       LAN clients: mac, ip, name, online (board data)
+  groupadd <name> <iface|proxy> create group: direct on netifd iface, or proxy (mihomo, max 1)
+  groupset <name> <iface|proxy> change group target
+  groupdel <name>               delete an empty group
+  wanstatus                     WAN probe states + group home/current/mode (issue #6)
+  wanset <group> <iface>        pin group to iface manually (override; watchdog skips it)
+  wanauto <group>               resume watchdog auto failover/failback
+  backupset <group> <iface>...  backup priority order (#26): first UP wins;
+                                no list = all watched WANs, alphabetical
+
+group names: [A-Za-z0-9_], <=15 chars. marks/tables are allocated
+automatically: proxy = 300/500 fixed; direct (sorted by name) =
+100,200,400,... / tables 400+ (see docs/ARCHITECTURE.md §2).
+`;
+
+function cmd_help() {
+	print(HELP);
+}
+
 // ---------- dispatch ----------
+//
+// Stage 4 (#34): the passthrough is gone — every subcommand is native
+// here. `wanguard-sh` stays in the package until stage 5 (issue #30) as
+// the offline rollback vehicle; it is no longer called by the CLI.
 
 let cmd = ARGV[0] ?? '';
+let args = [];
+for (let i = 1; i < length(ARGV); i++)
+	push(args, ARGV[i]);
 switch (cmd) {
 	case 'wand-tick':
 		tick();
@@ -813,8 +1299,62 @@ switch (cmd) {
 		probe_selftest();
 		break;
 	case 'apply': // native since stage 3 (#33); sh parity gated by
-		apply();   // stage3/apply-parity.sh (165 checks)
+		apply();  // stage3/apply-parity.sh (165 checks)
+		break;
+	case 'list': // native since stage 4 (#34); parity gated by
+		cmd_list();     // stage4/cli-parity.sh
+		break;
+	case 'add':
+		(length(args) >= 2) || fail('usage: wanguard add <mac> <group> [name]');
+		cmd_add(args[0], args[1], args[2] ?? '');
+		break;
+	case 'move':
+		(length(args) >= 2) || fail('usage: wanguard move <mac> <group>');
+		cmd_move(args[0], args[1]);
+		break;
+	case 'remove':
+		(length(args) >= 1) || fail('usage: wanguard remove <mac>');
+		cmd_remove(args[0]);
+		break;
+	case 'grouplist':
+		cmd_grouplist();
+		break;
+	case 'devices':
+		cmd_devices();
+		break;
+	case 'groupadd':
+		(length(args) >= 2) || fail('usage: wanguard groupadd <name> <iface|proxy>');
+		cmd_groupadd(args[0], args[1]);
+		break;
+	case 'groupset':
+		(length(args) >= 2) || fail('usage: wanguard groupset <name> <iface|proxy>');
+		cmd_groupset(args[0], args[1]);
+		break;
+	case 'groupdel':
+		(length(args) >= 1) || fail('usage: wanguard groupdel <name>');
+		cmd_groupdel(args[0]);
+		break;
+	case 'wanstatus':
+		cmd_wanstatus();
+		break;
+	case 'wanset':
+		(length(args) >= 2) || fail('usage: wanguard wanset <group> <iface>');
+		cmd_wanset(args[0], args[1]);
+		break;
+	case 'wanauto':
+		(length(args) >= 1) || fail('usage: wanguard wanauto <group>');
+		cmd_wanauto(args[0]);
+		break;
+	case 'backupset':
+		(length(args) >= 2) || fail('usage: wanguard backupset <group> <iface>...');
+		cmd_backupset(args[0], slice(args, 1));
+		break;
+	case '':
+	case 'help':
+	case '-h':
+	case '--help':
+		cmd_help();
 		break;
 	default:
-		passthrough(ARGV);
+		fail(`unknown command: ${cmd} (try: wanguard help)`);
 }
