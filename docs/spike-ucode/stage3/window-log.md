@@ -49,7 +49,22 @@
 
 ## После soak — фид
 
-1. merge `spike/ucode` → main → тег `v1.0.7` → CI → фид.
-2. Роутер: `apk del wanguard-ucode && apk update && apk add
-   wanguard=1.0.7-r1` (ЯВНАЯ версия — урок #32) → md5-манифест → батарея.
-3. Протокол в #33, PLAN.md Этап 10 (этап 3 принят); этап 4 = CLI CRUD.
+**Выполнено 2026-10-28, soak сокращён решением владельца** (прецедент
+этапов 1–2):
+
+- merge `spike/ucode` → main `57eae6c` → тег **v1.0.7** → CI зелёная
+  (build → подпись индекса → ветка `feed` → install-тест `FEED-TEST-OK`);
+- роутер: `apk del wanguard-ucode` → `apk update` → `apk add
+  wanguard=1.0.7-r1` (явная версия, урок #32); md5-манифест окна 7/7 =
+  **байты фида** (`/usr/bin/wanguard` md5 `6595dbde…`); гейты повторно:
+  нативность (`WANGUARD_SH=/nonexistent` → in-sync rc=0), `in-sync`,
+  ANCHORS 3/3, лог тихий; финальная батарея владельца 5/5;
+- инцидент: gitlab.alpinelinux.org недоступен с GitHub-раннеров (curl 28,
+  два прогона подряд) — apk.static выложен байт-идентичным зеркалом в
+  `releases/ci-tools`, workflow получил фолбэк (sha256-пин гейтит оба
+  источника); тег v1.0.7 несёт один ci-only коммит `61cb336` поверх
+  мержа, содержимое пакетов идентично 57eae6c;
+- протокол в #33, issue закрыта; приватный PLAN.md — Этап 10, этап 3
+  принят. Откат с фида — офлайн-apk из savepoint (`rollback.sh --apk`).
+
+Следующий этап #30 — **4: CLI CRUD**.
