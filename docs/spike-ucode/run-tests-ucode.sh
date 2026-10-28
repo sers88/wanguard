@@ -1,12 +1,16 @@
 #!/bin/sh
-# run-tests-ucode.sh — ucode test runner (issue #29 Phase 2; #32 stage 2):
-# ports a representative subset of tests/mock/run-tests.sh T-tests to the
-# ucode wand-tick/wan-flush port and runs them against the REAL uci
-# (/etc/config) and the SAME PATH stubs (curl/date/conntrack) as the sh
-# suite; only ubus is intercepted differently (docs/spike-ucode/mock/
-# ubus.uc via `ucode -L`, reading the same UBUS_IFACES/UBUS_ADDRS
-# fixtures). F9 additionally diffs the native wan-flush against the stock
-# sh CLI on identical state (byte-parity acceptance of #32).
+# run-tests-ucode.sh — ucode test runner (issue #29 Phase 2; #32 stage 2;
+# #30 stage 5): FULL port of the tests/mock/run-tests.sh checks (67 sh
+# equivalents, T1-T24) plus ucode-native extras (B1/B2, F1-F11). Runs
+# against the REAL uci (/etc/config) and the SAME PATH stubs (curl/date/
+# conntrack) as the sh suite; only ubus is intercepted differently
+# (docs/spike-ucode/mock/ubus.uc via `ucode -L`, reading the same
+# UBUS_IFACES/UBUS_ADDRS fixtures). Native CLI subcommands (wanset,
+# backupset, wanstatus — stage 4) run through the same -L shadow; their
+# trailing apply() works under the legacy no-op nft/ip mocks (NFT_STATE/
+# IP_STATE unset). F9 additionally diffs the native wan-flush against the
+# stock sh CLI (kept in the repo as the differential reference; retired
+# from the PACKAGE in stage 5).
 #
 # Runs INSIDE the OpenWrt container (ucode is absent in WSL):
 #   docker run --rm -v <repo>:/repo:ro openwrt/rootfs:x86_64-25.12.5 \
@@ -28,10 +32,13 @@ mkdir -p "$TMP" "$WAND"
 # children, so PATH shims work); ubus/jsonfilter are additionally shimmed
 # for the SH differential (F9) — the ucode side never runs them (ubus is
 # mocked via -L, not PATH); uci stays REAL (both the runner and the ucode
-# cursor read/write /etc/config)
+# cursor read/write /etc/config). nft/ip: the stage-4 CLI subcommands
+# (wanset/backupset-adjacent groupset...) trail an apply() — the mocks'
+# legacy no-op mode (NFT_STATE/IP_STATE unset) covers it without a
+# render harness
 rm -rf /tmp/ucsuite-shim
 mkdir -p /tmp/ucsuite-shim
-for b in curl date conntrack ubus jsonfilter; do cp "$MOCKBIN/$b" /tmp/ucsuite-shim/$b; chmod +x /tmp/ucsuite-shim/$b; done
+for b in curl date conntrack ubus jsonfilter nft ip; do cp "$MOCKBIN/$b" /tmp/ucsuite-shim/$b; chmod +x /tmp/ucsuite-shim/$b; done
 PATH="/tmp/ucsuite-shim:$PATH"
 export PATH
 UBUS_IFACES=$TMP/ubus.ifaces
@@ -65,6 +72,12 @@ uci_list()       { uci add_list "wanguard.$1=$2"; uci commit wanguard; } # one e
 add_iface_dev()  { echo "$1=$2" >> "$UBUS_IFACES"; }
 add_iface_addr() { echo "$1=$2" >> "$UBUS_ADDRS"; }
 map_anchor()     { echo "$1" >> "$CURLMAP"; }
+remap_anchor()   { # change an existing mapping (stub: first match wins)
+	p="$1"; v="$2"
+	tmp="$CURLMAP.new"
+	{ grep -v "^$p=" "$CURLMAP" 2>/dev/null || :; printf '%s=%s\n' "$p" "$v"; } > "$tmp"
+	mv "$tmp" "$CURLMAP"
+}
 
 setup_two_wans() {
 	add_group a
@@ -77,8 +90,24 @@ setup_two_wans() {
 	add_iface_dev wan2 pppoe-wan2
 }
 
+setup_three_wans() { # three direct groups on three ifaces (a=vpn, b=wan2, c=wan3)
+	add_group a
+	add_group b
+	add_group c
+	uci_set a.type direct
+	uci_set a.iface vpn
+	uci_set b.type direct
+	uci_set b.iface wan2
+	uci_set c.type direct
+	uci_set c.iface wan3
+	add_iface_dev vpn pptp-freedom
+	add_iface_dev wan2 pppoe-wan2
+	add_iface_dev wan3 pppoe-wan3
+}
+
 tick()     { ucode -L "$MOCK" "$UC" wand-tick 2>&1; }
 flush()    { ucode -L "$MOCK" "$UC" wan-flush 2>&1; } # native since stage 2
+cli()      { ucode -L "$MOCK" "$UC" "$@" 2>&1; } # native CLI subcommands
 wanstate() { cat "$WAND/$1.state" 2>/dev/null || echo up; }
 field()    { cat "$WAND/$1" 2>/dev/null || echo "${2-}"; }
 flist()    { ls "$WAND"/*.flush 2>/dev/null || echo none; }
@@ -88,7 +117,7 @@ bad() { FAIL=$((FAIL + 1)); echo "FAIL $1 (got: '$2', want: '$3')"; }
 assert_eq()       { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 assert_contains() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "$2" "*$3*" ;; esac; }
 
-echo "== ucode port: #23 probe anchors (T1,T2,T4-T8,T10) =="
+echo "== ucode port: #23 probe anchors (T1-T8, T10) =="
 
 # T1: built-in defaults, 1 of 2 answering = OK (N=1); rtt recorded
 reset_router
@@ -98,6 +127,10 @@ map_anchor 'detectportal=fail'
 tick >/dev/null; tick >/dev/null
 assert_eq "T1 alive=1/2 (N=1 default: any anchor)" "$(field vpn.alive)" "1"
 assert_eq "T1 rtt recorded" "$(field vpn.rtt)" "0.050"
+case $(cli wanstatus) in
+	*1/2*) ok  "T1 wanstatus shows alive/total" ;;
+	*)	bad "T1 wanstatus shows alive/total" "$(cli wanstatus)" "*1/2*" ;;
+esac
 
 # T2: all anchors fail x3 -> down; ok x6 -> up
 reset_router
@@ -112,7 +145,18 @@ assert_eq "T2 still down at 5 oks" "$(wanstate vpn)" "down"
 tick >/dev/null
 assert_eq "T2 up after 6 ok probes" "$(wanstate vpn)" "up"
 
-# T4: M=3 N=2 — one dead anchor must not trip; two dead must
+# T3: legacy wan_anchor1/2 still read when list absent
+reset_router
+setup_two_wans
+uci_set globals.wan_anchor1 'http://legacy-one.example/anchor1'
+uci_set globals.wan_anchor2 'http://legacy-two.example/anchor2'
+map_anchor 'legacy-one=fail'
+map_anchor 'legacy-two=ok'
+tick >/dev/null; tick >/dev/null
+assert_eq "T3 legacy anchors: alive=1/2" "$(field vpn.alive)" "1"
+
+# T4: M=3 N=2 — one dead anchor must not trip; two dead must; recovery
+# is probe-driven (6 consecutive oks) and independent of any switching
 reset_router
 setup_two_wans
 uci_set globals.wan_anchors 'http://a1.example/ping http://a2.example/ping http://a3.example/ping'
@@ -123,6 +167,14 @@ map_anchor 'a3=ok'
 tick >/dev/null; tick >/dev/null
 assert_eq "T4 alive=2/3 passes (N=2)" "$(field vpn.alive)" "2"
 assert_eq "T4 state stays up" "$(wanstate vpn)" "up"
+remap_anchor 'a2' 'fail' # now a2 dies too: alive=1 < 2 -> 3 fails -> down
+tick >/dev/null; tick >/dev/null; tick >/dev/null
+assert_eq "T4 down when alive < N (x3)" "$(wanstate vpn)" "down"
+remap_anchor 'a2' 'ok' # recovery: N satisfied again, 6 oks -> up
+tick >/dev/null; tick >/dev/null; tick >/dev/null; tick >/dev/null; tick >/dev/null
+assert_eq "T4 still down at 5 good probes" "$(wanstate vpn)" "down"
+tick >/dev/null
+assert_eq "T4 up after 6 good probes" "$(wanstate vpn)" "up"
 
 # T5: N > M clamped to M
 reset_router
@@ -133,6 +185,7 @@ map_anchor 'a1=fail'
 map_anchor 'a2=ok'
 tick >/dev/null; tick >/dev/null
 assert_eq "T5 alive=1 < clamped N=2 -> probe fails (fails count)" "$(field vpn.fails)" "2"
+assert_eq "T5 no crash, state still optimistic-up" "$(wanstate vpn)" "up"
 
 # T6: garbage reliability treated as 1
 reset_router
@@ -143,6 +196,9 @@ map_anchor 'a1=fail'
 map_anchor 'a2=ok'
 tick >/dev/null; tick >/dev/null
 assert_eq "T6 reliability=abc -> N=1, alive=1 passes" "$(wanstate vpn)" "up"
+uci_set globals.wan_reliability 0
+tick >/dev/null; tick >/dev/null
+assert_eq "T6 reliability=0 -> N=1, still passes" "$(field vpn.alive)" "1"
 
 # T7: min rtt of the answering anchors
 reset_router
@@ -195,7 +251,6 @@ assert_eq "T9 a.iface back home" "$(uci -q get wanguard.a.iface)" "vpn"
 
 echo
 echo "== ucode port: #26 backup priority (core cases) =="
-
 # B1: explicit list order wins — first UP in THAT order is the target
 reset_router
 add_group a; add_group b; add_group c
@@ -224,6 +279,98 @@ tick >/dev/null
 echo fail > "$WAND/wan1.force"
 out=$(tick); out=$(tick); out=$(tick)
 assert_contains "B2 unusable list -> default A-Z: failover to wan2" "$out" "failover:a>wan2"
+
+echo
+echo "== ucode port: #26 full sh-suite coverage (T19-T24) =="
+
+# T19: head of the list dead -> next in order
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+cli backupset a wan2 wan3 >/dev/null
+echo fail > "$WAND/wan2.force" # first in the list dead from the start
+tick >/dev/null # seed
+echo fail > "$WAND/vpn.force"
+out=$(tick); out=$(tick); out=$(tick)
+assert_contains "T19 dead head of list skipped" "$out" "failover:a>wan3"
+assert_eq "T19 a.iface = wan3" "$(uci -q get wanguard.a.iface)" "wan3"
+
+# T20: conflict-check: home inside backup_iface is warned + dropped; the
+# runtime filter drops a hand-edited home entry as well
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+out=$(cli backupset a vpn wan3)
+assert_contains "T20 own-iface entry warned" "$out" "note: 'vpn' is the group's own iface"
+assert_eq "T20 home entry dropped from list" "$(uci -q get wanguard.a.backup_iface)" "wan3"
+out=$(cli backupset b wan3 wan3) # duplicate (wan3 is not b's own)
+assert_eq "T20 duplicate kept once" "$(uci -q get wanguard.b.backup_iface)" "wan3"
+# hand-edited UCI bypassing the CLI: the runtime filter drops home as well
+uci add_list wanguard.a.backup_iface=vpn; uci commit wanguard
+assert_eq "T20 raw add_list stored" "$(uci -q get wanguard.a.backup_iface)" "wan3 vpn"
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # vpn down x3
+assert_eq "T20 runtime filter: home never selected" "$(uci -q get wanguard.a.iface)" "wan3"
+
+# T21: no list -> default alphabetical (pre-#26 semantics intact)
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+tick >/dev/null # seed
+echo fail > "$WAND/vpn.force"
+out=$(tick); out=$(tick); out=$(tick)
+assert_contains "T21 default order is alphabetical" "$out" "failover:a>wan2"
+
+# T22: re-failover: sitting backup dies, home still down -> next in list.
+# lastswitch bypasses are the T9 dwell trick: ucode uses real time(),
+# the sh suite's stub date advances +60/call instead
+reset_router
+setup_three_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+cli backupset a wan2 wan3 >/dev/null
+tick >/dev/null # seed
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # failover a>wan2
+echo fail > "$WAND/wan2.force" # the backup dies too, home still down
+echo 0 > "$WAND/a.lastswitch"  # bypass dwell deterministically
+out=$(tick); out=$(tick); out=$(tick)
+assert_contains "T22 re-failover to next backup" "$out" "failover:a>wan3"
+assert_eq "T22 a.iface = wan3" "$(uci -q get wanguard.a.iface)" "wan3"
+assert_eq "T22 flush names the dead backup" "$(cat "$WAND/a.flush" 2>/dev/null)" "wan2"
+rm -f "$WAND/vpn.force"
+echo 0 > "$WAND/a.lastswitch" # dwell bypass again (real time() here)
+out=$(tick); out=$(tick); out=$(tick); out=$(tick); out=$(tick); out=$(tick) # vpn 6 oks
+assert_contains "T22 failback from second backup" "$out" "failback:a>vpn"
+assert_eq "T22 a.iface back home" "$(uci -q get wanguard.a.iface)" "vpn"
+
+# T23: backupset validation
+reset_router
+setup_three_wans
+add_iface_dev wan4 pppoe-wan4 # in netifd, but no group sits on it
+add_group p
+uci_set p.type proxy
+out=$(cli backupset a nosuch)
+assert_contains "T23 unknown iface rejected" "$out" "unknown netifd iface: 'nosuch'"
+out=$(cli backupset p wan2)
+assert_contains "T23 proxy group rejected" "$out" "backups are a direct-group feature"
+out=$(cli backupset b)
+assert_contains "T23 empty list usage" "$out" "usage: wanguard backupset"
+out=$(cli backupset a wan4)
+assert_contains "T23 unwatched iface warned" "$out" "not watched by the watchdog"
+assert_eq "T23 unwatched iface still listed" "$(uci -q get wanguard.a.backup_iface)" "wan4"
+out=$(cli backupset a wan2 wan3) # re-set: replaces, not appends
+assert_contains "T23 order echoed" "$out" "backup order:wan2 wan3"
+assert_eq "T23 re-set replaces the list" "$(uci -q get wanguard.a.backup_iface)" "wan2 wan3"
+
+# T24: wanstatus shows the backup order per group
+reset_router
+setup_three_wans
+cli backupset a wan3 wan2 >/dev/null
+out=$(cli wanstatus)
+row=$(echo "$out" | grep '^a ')
+assert_eq "T24 wanstatus shows the order" "$(echo "$row" | awk '{print $5, $6}')" "wan3 wan2"
+rowb=$(echo "$out" | grep '^b ')
+assert_eq "T24 default order shown as *" "$(echo "$rowb" | awk '{print $5}')" "*"
 
 echo
 echo "== ucode port: #24 conntrack flush (stage 2: wan-flush is native) =="
@@ -359,6 +506,24 @@ out=$(flush)
 assert_eq "F8 empty pending file: silent" "$out" ""
 assert_eq "F8 empty pending file: consumed" "$(flist)" "none"
 assert_eq "F8 empty pending file: no conntrack call" "$(cat "$CONNTRACKLOG")" ""
+
+# --- W1 (sh T14): wanset flushes the old egress immediately; same-iface
+# wanset does not. Native wanset since stage 4; its trailing apply() runs
+# under the legacy no-op nft/ip mocks (NFT_STATE/IP_STATE unset) — enough
+# for the runner, the assertions target the flush protocol itself ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+add_iface_addr vpn 198.51.100.10
+add_iface_addr wan2 198.51.100.20
+tick >/dev/null # seed
+: > "$CONNTRACKLOG"
+out=$(cli wanset a wan2)
+assert_contains "T14 wanset re-pins the group" "$out" "pinned to 'wan2'"
+assert_contains "T14 wanset flushed the old egress" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.10"
+: > "$CONNTRACKLOG"
+out=$(cli wanset a wan2) # same iface: no switch, no flush
+assert_eq "T14 same-iface wanset: no conntrack call" "$(cat "$CONNTRACKLOG")" ""
 
 # --- F11: a DIRECTORY named *.flush is left alone (sh `[ -f ]` parity) ---
 reset_router

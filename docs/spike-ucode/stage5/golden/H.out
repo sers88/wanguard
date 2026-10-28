@@ -1,0 +1,20 @@
+usage: wanguard <command> [args]
+  list                          members + drift status
+  add <mac> <group> [name]      register + apply
+  move <mac> <group>            change group + apply
+  remove <mac>                  unregister + apply
+  apply                         reconcile UCI -> nft + ip rules + routes (idempotent)
+  grouplist                     groups: type, iface, mark/table, device, members
+  devices                       LAN clients: mac, ip, name, online (board data)
+  groupadd <name> <iface|proxy> create group: direct on netifd iface, or proxy (mihomo, max 1)
+  groupset <name> <iface|proxy> change group target
+  groupdel <name>               delete an empty group
+  wanstatus                     WAN probe states + group home/current/mode (issue #6)
+  wanset <group> <iface>        pin group to iface manually (override; watchdog skips it)
+  wanauto <group>               resume watchdog auto failover/failback
+  backupset <group> <iface>...  backup priority order (#26): first UP wins;
+                                no list = all watched WANs, alphabetical
+
+group names: [A-Za-z0-9_], <=15 chars. marks/tables are allocated
+automatically: proxy = 300/500 fixed; direct (sorted by name) =
+100,200,400,... / tables 400+ (see docs/ARCHITECTURE.md §2).

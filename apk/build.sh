@@ -44,26 +44,29 @@ pkg() { # pkg <name> <description> <depends> <stage-dir>
 }
 
 # ---- wanguard (core) ----
-# Stage-4 shape (issues #30/#31/#32/#33/#34): /usr/bin/wanguard = the
+# Stage-5 shape (issues #30/#31/#32/#33/#34/#35): /usr/bin/wanguard = the
 # ucode CLI (wand.uc) with EVERY subcommand native — wand-tick/wan-flush/
 # probe-selftest (stage 1-2), apply (stage 3), CLI CRUD + view (stage 4);
-# `conntrack`/`nft`/`ip`/`curl` themselves stay external calls. The stock
-# POSIX sh CLI ships next to it as /usr/bin/wanguard-sh purely as the
-# stage-5 rollback vehicle — the CLI no longer calls it (passthrough was
-# removed in stage 4).
+# `conntrack`/`nft`/`ip`/`curl` themselves stay external calls. The POSIX
+# sh CLI is RETIRED from the package (stage 5, #35): there is no
+# /usr/bin/wanguard-sh anymore — the offline rollback is reinstalling the
+# previous feed tag's apk (single mechanism, same UCI/state; the sh source
+# stays in the repo only as the lab's differential reference).
 # keepalive/init.d/wan-watch are UNCHANGED (frozen contract 00-CLI-CONTRACT.md).
 # The ucode interpreter + 3 modules are declared: preinstalled on 25.12
 # (fw4/rpcd need them), but the declaration is the correct contract.
+# NB: cp+chmod, not install(1) — the OpenWrt container busybox has no
+# install(1) (spike грабля №4), and this script is smoke-tested there.
 W="$work/wanguard"
 mkdir -p "$W/usr/bin" "$W/etc/init.d" "$W/usr/share/wanguard"
-install -m 755 "$ROOT/docs/spike-ucode/wand.uc"           "$W/usr/bin/wanguard"
-install -m 755 "$ROOT/router/wanguard"                    "$W/usr/bin/wanguard-sh"
-install -m 755 "$ROOT/router/wanguard-keepalive"          "$W/usr/bin/wanguard-keepalive"
-install -m 755 "$ROOT/router/wan-watch"                   "$W/usr/bin/wan-watch"
-install -m 755 "$ROOT/router/init.d/wanguard"             "$W/etc/init.d/wanguard"
-install -m 755 "$ROOT/router/init.d/wan-watch"            "$W/etc/init.d/wan-watch"
-install -m 644 "$ROOT/router/wanguard.nft"                "$W/usr/share/wanguard/wanguard.nft"
-install -m 644 "$ROOT/router/etc.config.wanguard.example" "$W/usr/share/wanguard/etc.config.wanguard.example"
+inst() { cp "$1" "$2"; chmod "$3" "$2"; }
+inst "$ROOT/docs/spike-ucode/wand.uc"           "$W/usr/bin/wanguard"      755
+inst "$ROOT/router/wanguard-keepalive"          "$W/usr/bin/wanguard-keepalive" 755
+inst "$ROOT/router/wan-watch"                   "$W/usr/bin/wan-watch"     755
+inst "$ROOT/router/init.d/wanguard"             "$W/etc/init.d/wanguard"   755
+inst "$ROOT/router/init.d/wan-watch"            "$W/etc/init.d/wan-watch"  755
+inst "$ROOT/router/wanguard.nft"                "$W/usr/share/wanguard/wanguard.nft" 644
+inst "$ROOT/router/etc.config.wanguard.example" "$W/usr/share/wanguard/etc.config.wanguard.example" 644
 pkg wanguard \
 	"Per-MAC policy routing for OpenWrt: client groups, nft marking, main-egress health-watch" \
 	"ip-full nftables conntrack ucode ucode-mod-fs ucode-mod-uci ucode-mod-ubus" "$W"
@@ -71,9 +74,9 @@ pkg wanguard \
 # ---- luci-app-wanguard ----
 L="$work/luci-app-wanguard"
 mkdir -p "$L/www/luci-static/resources/view" "$L/usr/share/luci/menu.d" "$L/usr/share/rpcd/acl.d"
-install -m 644 "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard.js" "$L/www/luci-static/resources/view/wanguard.js"
-install -m 644 "$ROOT/luci-app-wanguard/usr/share/luci/menu.d/luci-app-wanguard.json"  "$L/usr/share/luci/menu.d/luci-app-wanguard.json"
-install -m 644 "$ROOT/luci-app-wanguard/usr/share/rpcd/acl.d/luci-app-wanguard.json"   "$L/usr/share/rpcd/acl.d/luci-app-wanguard.json"
+inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard.js" "$L/www/luci-static/resources/view/wanguard.js" 644
+inst "$ROOT/luci-app-wanguard/usr/share/luci/menu.d/luci-app-wanguard.json"  "$L/usr/share/luci/menu.d/luci-app-wanguard.json" 644
+inst "$ROOT/luci-app-wanguard/usr/share/rpcd/acl.d/luci-app-wanguard.json"   "$L/usr/share/rpcd/acl.d/luci-app-wanguard.json" 644
 pkg luci-app-wanguard \
 	"LuCI kanban board for wanguard client groups" \
 	"wanguard luci-base" "$L"

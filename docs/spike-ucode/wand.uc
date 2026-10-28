@@ -24,11 +24,17 @@
  *
  * Stage 4 (#30/#34): ALL remaining subcommands native (list/add/move/
  * remove/grouplist/devices/groupadd/groupset/groupdel/wanstatus/wanset/
- * wanauto/backupset/help) — the sh passthrough is GONE; `wanguard-sh`
- * stays in the package until stage 5 as the offline rollback vehicle.
- * Byte-parity gated by stage4/cli-parity.sh (method C4: every stdout/
- * stderr byte, exit code and committed UCI byte vs the sh reference on
- * identical state).
+ * wanauto/backupset/help) — the sh passthrough is GONE; dispatch default
+ * is the sh `unknown command` error.
+ *
+ * Stage 5 (#30/#35): the sh CLI is RETIRED from the package —
+ * /usr/bin/wanguard is the pure ucode CLI, there is no wanguard-sh
+ * companion anymore; the offline rollback is reinstalling the previous
+ * feed tag's apk (single mechanism, same UCI/state). The sh source stays
+ * in the repo (router/wanguard) purely as the lab's differential
+ * reference. Byte-parity gated by stage4/cli-parity.sh (method C4) and,
+ * after the retirement, by stage5/contract-gate.sh (golden bytes vs the
+ * frozen contract, no sh involved).
  *
  * PROBE NOTE (spike finding, Step 1.3): uclient.so exposes
  * new(url,auth,cb)/set_timeout/request/status but libuclient has NO
@@ -1281,8 +1287,8 @@ function cmd_help() {
 // ---------- dispatch ----------
 //
 // Stage 4 (#34): the passthrough is gone — every subcommand is native
-// here. `wanguard-sh` stays in the package until stage 5 (issue #30) as
-// the offline rollback vehicle; it is no longer called by the CLI.
+// here. Stage 5 (#35): wanguard-sh is retired from the package entirely;
+// the standalone ucode CLI is the only /usr/bin/wanguard.
 
 let cmd = ARGV[0] ?? '';
 let args = [];

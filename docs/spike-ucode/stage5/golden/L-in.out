@@ -1,0 +1,6 @@
+NAME             MAC                  GROUP   
+tower            d8:bb:c1:cc:17:71    freedom 
+-                11:aa:22:bb:33:cc    rostelecom
+ghost            99:88:77:66:55:44    nosuch (??)
+warning: members reference unknown group(s): nosuch (fail-safe: main table)
+nft: in-sync

@@ -1,0 +1,7 @@
+WAN      DEVICE         STATE        RTT(s)    ANCHORS   SINCE
+vpn      eth1           up           0.123     2/2       01.01 00:00:00
+wan2     -              down/forced  -         -/2       -
+
+GROUP    HOME     CURRENT  MODE      BACKUP               MEMBERS
+freedom  -        vpn      auto      rostelecom           1
+rostelecom -        wan2     auto      *                    1
