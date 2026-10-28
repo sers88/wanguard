@@ -127,6 +127,8 @@ jobs:
             apk update
             apk add wanguard luci-app-wanguard
             test -x /usr/bin/wanguard
+            head -1 /usr/bin/wanguard | grep -q ucode # the CLI is ucode (stage 5: sh retired)
+            test ! -e /usr/bin/wanguard-sh            # retired from the package (#35) — must never come back
             test -x /usr/bin/wanguard-keepalive
             test -x /usr/bin/wan-watch
             test -f /etc/init.d/wanguard
