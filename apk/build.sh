@@ -44,12 +44,13 @@ pkg() { # pkg <name> <description> <depends> <stage-dir>
 }
 
 # ---- wanguard (core) ----
-# Stage-2 shape (issues #30/#31/#32): /usr/bin/wanguard = the ucode CLI
-# (wand.uc, natively wand-tick/wan-flush/probe-selftest — the flush leg of
-# the tick->apply->flush cycle is ucode now, `conntrack` itself stays an
-# external call), the stock POSIX sh CLI ships next to it as
-# /usr/bin/wanguard-sh and receives everything else (apply until stage 3,
-# CLI CRUD until stage 4) via passthrough.
+# Stage-4 shape (issues #30/#31/#32/#33/#34): /usr/bin/wanguard = the
+# ucode CLI (wand.uc) with EVERY subcommand native — wand-tick/wan-flush/
+# probe-selftest (stage 1-2), apply (stage 3), CLI CRUD + view (stage 4);
+# `conntrack`/`nft`/`ip`/`curl` themselves stay external calls. The stock
+# POSIX sh CLI ships next to it as /usr/bin/wanguard-sh purely as the
+# stage-5 rollback vehicle — the CLI no longer calls it (passthrough was
+# removed in stage 4).
 # keepalive/init.d/wan-watch are UNCHANGED (frozen contract 00-CLI-CONTRACT.md).
 # The ucode interpreter + 3 modules are declared: preinstalled on 25.12
 # (fw4/rpcd need them), but the declaration is the correct contract.

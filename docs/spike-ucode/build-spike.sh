@@ -2,8 +2,9 @@
 # build-spike.sh — packaging probe (issue #29; window vehicle for stages
 # 1-2, issues #31/#32): build the SPIKE package `wanguard-ucode` = stock
 # package with /usr/bin/wanguard swapped for the ucode port (both binaries
-# shipped side by side; the ucode one passes apply/... through to
-# /usr/bin/wanguard-sh, while wand-tick and wan-flush are native).
+# shipped side by side; since stage 4 the ucode CLI is fully native and
+# does NOT pass anything through to /usr/bin/wanguard-sh — the sh binary
+# stays in the package as the rollback vehicle until stage 5).
 #
 # NOT a release artifact: exists to prove apk packaging works unchanged
 # with a ucode shebang, to pin the real depends delta, and to feed the
