@@ -10,18 +10,17 @@ migration: single agent, no-rush schedule, per-stage tests + tag + live
 tracker (sers88/wanguard-home); this document records the evidence and
 the original draft recommendation (kept below as history).
 
-**MIGRATION EXECUTED — FINAL STAGE IN ACCEPTANCE (2026-10-28).** All five
-stages executed, each with a green battery, a feed tag and a live 5/5
-router window: v1.0.5 (wand-tick) → v1.0.6 (wan-flush) → v1.0.7 (apply) →
-v1.0.8 (CLI CRUD). **Stage 5 (full test-suite port + sh retirement) is
-dev-complete and lab-green** (`docs/spike-ucode/stage5/`: NOTES/LAB/
-contract-gate + golden bytes; 87 ucode checks = 67 sh equivalents +
-extras; the package ships only the ucode CLI, rollback = reinstall the
-previous feed tag) — the final live window + the v1.1.0 tag close it
-out. Version note (owner, 2026-10-28): the stage-5 changes are not
-patch-level — the completed core migration bumps the MINOR version
-(1.0.x → 1.1.0); no major bump because the CLI contract is frozen
-byte-for-byte. The historical material below is kept as-is.
+**MIGRATION COMPLETE (2026-10-28, v1.1.0 shipped to the feed and live on
+the router).** All five stages executed, each with a green battery, a
+feed tag and a live 5/5 router window: v1.0.5 (wand-tick) → v1.0.6
+(wan-flush) → v1.0.7 (apply) → v1.0.8 (CLI CRUD) → **v1.1.0 (full
+test-suite port: 87 ucode checks = 67 sh equivalents + extras; sh
+retired from the package — the CLI is pure ucode, rollback = reinstall
+the previous feed tag)**. Version 1.1.0 by owner's call: the completed
+core migration is not patch-level; no major — the contract stayed
+frozen byte-for-byte. Stage-5 evidence: `docs/spike-ucode/stage5/`
+(NOTES/LAB/contract-gate + golden bytes/window-log). The historical
+material below is kept as-is.
 
 ## What was proven (all green, reproducible)
 
