@@ -95,7 +95,7 @@ the router must be followed by a tag so the feed matches the box again
 | Path | What it is |
 |---|---|
 | `docs/spike-ucode/wand.uc` | the ucode CLI installed as `/usr/bin/wanguard` (tick/flush/apply/CLI, v1.0.5+) |
-| `router/wanguard` | the RETIRED POSIX sh CLI — differential test reference only (not shipped since v1.0.9) |
+| `router/wanguard` | the RETIRED POSIX sh CLI — differential test reference only (not shipped since v1.1.0) |
 | `router/wanguard-keepalive` | procd daemon: apply every 10s |
 | `router/wan-watch` | main-path health check (main group from UCI), `ifup` on death (#18) |
 | `router/init.d/wanguard` | init script (apply at boot) |

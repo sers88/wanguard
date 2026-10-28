@@ -42,6 +42,6 @@ docker exec wanguard-lab sh /repo/docs/spike-ucode/lab/setup.sh
 менялся, что согласуется с дельтой wand.uc (только комментарии).
 
 Плюс вне лабы, в разовых контейнерах: contract-gate 28/28, release-пакет
-1.0.9-r1 собран и проверен (файлы манифеста на месте, wanguard-sh
+1.1.0-r1 собран и проверен (файлы манифеста на месте, wanguard-sh
 отсутствует, /usr/bin/wanguard байт-в-байт == wand.uc), install-test
 спайк-пакета зелёный.

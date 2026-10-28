@@ -17,8 +17,11 @@ v1.0.8 (CLI CRUD). **Stage 5 (full test-suite port + sh retirement) is
 dev-complete and lab-green** (`docs/spike-ucode/stage5/`: NOTES/LAB/
 contract-gate + golden bytes; 87 ucode checks = 67 sh equivalents +
 extras; the package ships only the ucode CLI, rollback = reinstall the
-previous feed tag) — the final live window + the v1.0.9 tag close it
-out. The historical material below is kept as-is.
+previous feed tag) — the final live window + the v1.1.0 tag close it
+out. Version note (owner, 2026-10-28): the stage-5 changes are not
+patch-level — the completed core migration bumps the MINOR version
+(1.0.x → 1.1.0); no major bump because the CLI contract is frozen
+byte-for-byte. The historical material below is kept as-is.
 
 ## What was proven (all green, reproducible)
 

@@ -295,7 +295,9 @@ Properties and constraints:
 - **No second runtime: the core is ucode, the POSIX sh core is retired**
   (issue #29 verdict: YES, 2026-10-25; staged migration #30 finished —
   stages v1.0.5 tick / v1.0.6 wan-flush / v1.0.7 apply / v1.0.8 CLI
-  CRUD / **v1.0.9 test-suite port + sh retirement, the closing stage**).
+  CRUD / **v1.1.0 test-suite port + sh retirement, the closing stage**;
+  minor bump by owner's call — the completed migration is a feature
+  milestone, the contract stays frozen so no major).
   `/usr/bin/wanguard` is a single ucode CLI (`docs/spike-ucode/wand.uc`):
   wand-tick / wan-flush / apply / all 16 subcommands are native; external
   calls stay external by design (`curl` probe: uclient.so cannot
@@ -304,7 +306,7 @@ Properties and constraints:
   The former 939-line sh core stays in the repo (`router/wanguard`) only
   as the lab's differential test reference — it is NOT in the package.
   **Rollback = reinstall the previous feed tag's apk** (single mechanism,
-  same UCI/state; since v1.0.9 there is no in-package sh companion to
+  same UCI/state; since v1.1.0 there is no in-package sh companion to
   fall back to). Contract surfaces are frozen:
   `docs/spike-ucode/00-CLI-CONTRACT.md` + golden byte fixtures
   (`stage5/contract-gate.sh`); evidence: `docs/spike-ucode/VERDICT.md`
