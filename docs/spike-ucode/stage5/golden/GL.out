@@ -1,0 +1,4 @@
+GROUP      TYPE    IFACE      MARK  TABLE DEVICE         MEMBERS
+proxy      proxy   -          300   500   Meta           0
+freedom    direct  vpn        100   400   eth1           1
+rostelecom direct  wan2       200   401   down           1

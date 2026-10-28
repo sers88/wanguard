@@ -8,7 +8,9 @@ mkdir -p /var/run /etc/config /tmp/lab
 # deps; ucode itself is preinstalled in 25.12.5
 apk add --quiet nftables ip-full conntrack curl iptables >/dev/null 2>&1
 
-# spike package: /usr/bin/wanguard = ucode port, /usr/bin/wanguard-sh = sh
+# spike package: /usr/bin/wanguard = pure ucode CLI (stage 5, #35: the
+# sh binary is retired from the package; lab scripts that still want the
+# sh reference call /repo/router/wanguard directly)
 if [ ! -s /tmp/apk.dl ]; then
 	cp /tmp/apk.static /tmp/apk.dl
 	chmod +x /tmp/apk.dl
@@ -46,5 +48,5 @@ ubus call network.interface dump >/dev/null && echo "lab: ubus netifd ok"
 nft -f /usr/share/wanguard/wanguard.nft
 echo "lab: nft table created"
 
-/usr/bin/wanguard-sh apply >/dev/null 2>&1 || true
+/usr/bin/wanguard apply >/dev/null 2>&1 || true
 echo "lab: ready"

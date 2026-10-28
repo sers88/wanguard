@@ -11,7 +11,10 @@
 set -u
 
 UG=/usr/bin/wanguard
-SHG=/usr/bin/wanguard-sh
+# sh reference (byte-parity on identical state): the repo source — the
+# binary is retired from the package in stage 5 (#35); the CONTRACT gate
+# proper (golden bytes, no sh) lives in stage5/contract-gate.sh
+SHG=/repo/router/wanguard
 A=172.30.10.10
 B=172.30.20.10
 ITER=100

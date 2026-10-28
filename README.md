@@ -94,7 +94,8 @@ the router must be followed by a tag so the feed matches the box again
 
 | Path | What it is |
 |---|---|
-| `router/wanguard` | CLI: list/devices/add/move/remove/group*/apply |
+| `docs/spike-ucode/wand.uc` | the ucode CLI installed as `/usr/bin/wanguard` (tick/flush/apply/CLI, v1.0.5+) |
+| `router/wanguard` | the RETIRED POSIX sh CLI — differential test reference only (not shipped since v1.1.0) |
 | `router/wanguard-keepalive` | procd daemon: apply every 10s |
 | `router/wan-watch` | main-path health check (main group from UCI), `ifup` on death (#18) |
 | `router/init.d/wanguard` | init script (apply at boot) |
@@ -106,10 +107,13 @@ the router must be followed by a tag so the feed matches the box again
 | `apk/build.sh` | apk package build (wanguard + luci-app-wanguard) |
 | `keys/wanguard.pem` | feed signing public key |
 | `scripts/deploy-*.ps1` | scp/ssh deploy to the router (development) |
+| `docs/spike-ucode/` | ucode migration: frozen CLI contract, mock/test harnesses, stage notes |
 
 ## Requirements
 
 - OpenWrt with apk (24.10+/25.x), nftables (fw4), bash-free busybox sh
+- ucode + ucode-mod-{fs,uci,ubus} (preinstalled on 25.x; declared as
+  package dependencies)
 - For the proxy group: mihomo with `redir-port` + TUN (a fw4 zone for TUN is
   mandatory)
 

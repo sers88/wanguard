@@ -8,7 +8,9 @@
 set -u
 
 UG=/usr/bin/wanguard
-SHG=/usr/bin/wanguard-sh
+# sh reference (differential checks): the repo source — the binary is
+# retired from the package in stage 5 (#35), the lab keeps the method
+SHG=/repo/router/wanguard
 ANCHOR_A=172.30.10.10
 
 fail() { echo "C2 FAIL: $1"; exit 1; }

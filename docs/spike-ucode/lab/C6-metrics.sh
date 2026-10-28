@@ -14,12 +14,15 @@
 #    ucode clock() [s,ns] around the loop.
 # 3) VmHWM (main-process peak RSS, children excluded on BOTH sides):
 #    ucode self-reports after include()'ing the real wand.uc; sh
-#    self-reports after sourcing the real wanguard-sh (its dispatch is a
-#    plain case at EOF — sources cleanly; children excluded equally).
+#    self-reports after sourcing the real sh CLI from the repo (its
+#    dispatch is a plain case at EOF — sources cleanly; children excluded
+#    equally).
 set -u
 
 UG=/usr/bin/wanguard
-SHG=/usr/bin/wanguard-sh
+# sh reference (differential metrics): the repo source — the binary is
+# retired from the package in stage 5 (#35), the lab keeps the method
+SHG=/repo/router/wanguard
 A=172.30.10.10
 B=172.30.20.10
 

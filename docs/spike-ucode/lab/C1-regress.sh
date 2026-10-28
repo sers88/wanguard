@@ -4,7 +4,7 @@
 set -u
 echo "== sh suite (67 checks):"
 sh /repo/tests/mock/run-tests.sh 2>&1 | tail -1
-echo "== ucode suite (20 checks):"
+echo "== ucode suite (87 checks = 67 sh equivalents + ucode-native extras):"
 sh /repo/docs/spike-ucode/run-tests-ucode.sh 2>&1 | tail -1
 echo "== differential scenarios (byte-parity):"
 sh /repo/docs/spike-ucode/scenario.sh sh > /tmp/a1 2>&1
