@@ -870,6 +870,21 @@ function reconcile_routes(alloc) { // -> change count (sh reconcile_routes)
 	return n;
 }
 
+function lb_cascade_group(tag) { // 'wg:<g>:s<cut>@<mark>' -> <g> | null
+	// #27 (session 2): identifies LB member-cascade rules, whose
+	// relative ORDER in the chain is load-bearing (see reconcile).
+	// 'wg:lb:stick' must NOT match (the ':s' tail must be <cut>@<mark>).
+	if (substr(tag, 0, 3) != 'wg:')
+		return null;
+	let rest = substr(tag, 3);
+	let p = index(rest, ':s');
+	if (p == -1)
+		return null;
+	if (match(substr(rest, p + 2), /^[0-9]+@[0-9]+$/) == null)
+		return null;
+	return substr(rest, 0, p);
+}
+
 function apply() {
 	migrate_legacy();
 
@@ -910,17 +925,45 @@ function apply() {
 	let want_tags = {};
 	for (let w in want)
 		want_tags[`${w.chain} ${w.tag}`] = 1;
-	for (let h in have)
-		if (!(`${h.chain} ${h.tag}` in want_tags))
-			push(batch, `delete rule ${TABLE} ${h.chain} handle ${h.handle}`);
-
-	// rule additions: desired tags not live
 	let have_tags = {};
 	for (let h in have)
 		have_tags[`${h.chain} ${h.tag}`] = 1;
-	for (let w in want)
-		if (!(`${w.chain} ${w.tag}` in have_tags))
+	// #27 (session 2, LIVE FINDING): LB member cascades are
+	// ORDER-SENSITIVE — the fall-through only balances while stick
+	// precedes the member rules and the members follow in slot order.
+	// `add rule` APPENDS at the chain end, so a tag-diff swap of ONE
+	// member rule (weight flip) moved the draw rule AFTER the
+	// unconditional remainder rule and every flow funneled into the
+	// last member (lab: 60/60 draws mark=400, draw rule 0 packets).
+	// If ANY member rule of a group changes, re-render that group's
+	// WHOLE cascade: appending the members back in slot order rebuilds
+	// the order (stick never moves — its tag/body are constant).
+	let casc = {};
+	for (let w in want) {
+		let g = lb_cascade_group(w.tag);
+		if (g != null && !(`${w.chain} ${w.tag}` in have_tags))
+			casc[g] = 1;
+	}
+	for (let h in have) {
+		let g = lb_cascade_group(h.tag);
+		if (g != null && !(`${h.chain} ${h.tag}` in want_tags))
+			casc[g] = 1;
+	}
+	for (let h in have) {
+		let g = lb_cascade_group(h.tag);
+		if ((g != null && (g in casc)) || !(`${h.chain} ${h.tag}` in want_tags))
+			push(batch, `delete rule ${TABLE} ${h.chain} handle ${h.handle}`);
+	}
+
+	// rule additions: desired tags not live; cascades re-added whole,
+	// in slot order (append preserves the cascade internally, and the
+	// member rules stay after stick — disjoint MAC sets make their
+	// position relative to OTHER groups irrelevant)
+	for (let w in want) {
+		let g = lb_cascade_group(w.tag);
+		if ((g != null && (g in casc)) || !(`${w.chain} ${w.tag}` in have_tags))
 			push(batch, `add rule ${TABLE} ${w.chain} ${w.body} comment "${w.tag}"`);
+	}
 
 	// element diffs, per group in alloc order, then no_mark (#27: dedupe)
 	let seen_g2 = {};

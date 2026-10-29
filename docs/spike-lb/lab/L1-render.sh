@@ -79,7 +79,14 @@ h1=$(printf '%s' "$st" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
 h2=$(printf '%s' "$r1" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
 [ -n "$h1" ] && [ -n "$h2" ] || fail "handles not readable"
 [ "$h1" -lt "$h2" ] || fail "stick (handle $h1) must precede member rules ($h2)"
-echo "ok: stick($h1) + numgen cascade($h2+) rendered"
+# session-2 live finding #2: the cascade is ORDER-SENSITIVE. The tag-diff
+# appends a replaced member rule at the chain END — after the
+# unconditional remainder — which silently funneled every flow into the
+# last member. The draw rule must precede the remainder, always.
+h3=$(printf '%s' "$r2" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+[ -n "$h3" ] || fail "handle not readable (member 2)"
+[ "$h2" -lt "$h3" ] || fail "cascade order broken: draw rule ($h2) must precede the unconditional remainder ($h3)"
+echo "ok: stick($h1) + numgen cascade($h2+), draw before remainder($h3)"
 
 # --- sets ---
 nft list set inet wanguard mac_lb | grep -q 'aa:bb:cc:dd:ee:55' || fail "mac_lb missing the client MAC"
@@ -115,6 +122,12 @@ $MARKING | grep -q 'comment "wg:lb:s30@200"' || fail "new member tag s30@200 mis
 $MARKING | grep -q 'comment "wg:lb:s100@400"' || fail "member tag s100@400 missing after flip"
 $MARKING | grep -q 'comment "wg:lb:s70@200"' && fail "old member tag s70@200 survived"
 $MARKING | grep -q 'comment "wg:lb:stick"' || fail "stick rule lost by weight flip"
+# post-flip cascade order (the exact place the append bug manifested):
+# the re-added draw rule (s30@200) must sit BEFORE the remainder (s100)
+pf1=$($MARKING | grep 'comment "wg:lb:s30@200"' | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+pf2=$($MARKING | grep 'comment "wg:lb:s100@400"' | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+[ -n "$pf1" ] && [ -n "$pf2" ] || fail "post-flip handles unreadable"
+[ "$pf1" -lt "$pf2" ] || fail "post-flip cascade order broken (append bug): draw($pf1) must precede remainder($pf2)"
 [ -z "$(nft -a list chain inet wanguard redir 2>/dev/null | grep 'wg:')" ] || fail "unexpected redir rules"
 after=$(snap_state)
 [ "$before" = "$after" ] || fail "weight flip moved ip-side state (must be nft-only)"
