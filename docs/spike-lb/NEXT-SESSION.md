@@ -148,7 +148,10 @@ mwan3); владелец подтвердил отзыв jhash 2026-10-29 (DESIG
    declared, помеченные lookup'ы проваливаются в ЖИВОЙ main-lane
    (fail-open demo: временный default через gw wanC при down eth0/eth1).
    ФИНАЛ СЕССИИ 2: **LAB-ALL-GREEN** (чистый прогон: net→client→up→
-   L1→L2→L4→L5).
+   L1→L2→L4→L5). ~~Вердикт~~ DONE: **ADOPT** (решение владельца
+   2026-10-29, VERDICT.md, опубликован в #27). След шаг — тикет
+   реализации (паттерн #13: mock-сьют с порядок-проверками каскада,
+   интеграция wand-tick, ARCHITECTURE §7).
 4. Коммит-док в #27: дизайн, находки nft (пивот jhash→numgen + return
    + порядок каскада), метрики, вердикт adopt/reject.
 
