@@ -864,6 +864,122 @@ mk=$(marking)
 out=$(rapply); assert_eq "LB10 post-flip: in-sync" "$out" "in-sync"
 
 echo
+echo "== #39: direct-lb tick (member_live / lbover / #24-flush) =="
+#
+# Fixture-driven, deterministic (force-hook probes, real time() never
+# gates anything here: the LB phase has NO dwell — the probe hysteresis
+# IS the debounce). The keepalive order tick -> apply -> wan-flush is
+# replayed manually in LT6; event forms are the prototype's:
+#   down:<member> ... lbover:<g>:<member>><live>, flush after apply.
+
+conf_lbt() { # direct witness + 2-member LB group (70/30)
+	cat > /etc/config/wanguard <<'EOF'
+config globals 'globals'
+
+config group 'a'
+	option type 'direct'
+	option iface 'vpn'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	option weight_wan1 '70'
+	option weight_wan2 '30'
+EOF
+}
+
+lbt_reset() { # reset_router (tick fixtures) + lb_reset (render fixtures):
+	# LT6 replays the keepalive order tick -> apply -> wan-flush, so the
+	# render leg needs links/tables too (eth9 = the vpn witness device)
+	reset_router
+	lb_reset
+	add_iface_dev vpn eth9
+	add_iface_addr vpn 198.51.100.30
+	add_iface_addr wan1 198.51.100.10
+	add_iface_addr wan2 198.51.100.20
+	printf '%s\n' eth9 >> "$RIP/links"
+}
+
+# --- LT1: LB members are IN the probe list (unwatched member = slot
+# that can neither fail over nor fail back) ---
+lbt_reset; conf_lbt
+map_anchor 'gstatic=ok'
+map_anchor 'detectportal=ok'
+tick >/dev/null; tick >/dev/null
+[ -s "$WAND/wan1.alive" ] && ok "LT1 wan1 (LB member) probed" || bad "LT1 wan1 (LB member) probed" "absent" "$WAND/wan1.alive"
+[ -s "$WAND/wan2.alive" ] && ok "LT1 wan2 (LB member) probed" || bad "LT1 wan2 (LB member) probed" "absent" "$WAND/wan2.alive"
+[ -s "$WAND/vpn.alive" ] && ok "LT1 direct witness still probed" || bad "LT1 direct witness still probed" "absent" "$WAND/vpn.alive"
+
+# --- LT2: member death x3 -> down + lbover + member_live + pending flush ---
+lbt_reset; conf_lbt
+map_anchor 'gstatic=ok'
+map_anchor 'detectportal=ok'
+tick >/dev/null # seed
+echo fail > "$WAND/wan1.force"
+out=$(tick); out=$(tick)
+out=$(tick)
+assert_contains "LT2 down event for the member" "$out" "down:wan1"
+assert_contains "LT2 lbover event (slot inherited by first alive)" "$out" "lbover:lb:wan1>wan2"
+assert_eq "LT2 member_live written (both slots on wan2)" "$(uci -q get wanguard.lb.member_live)" "wan2 wan2"
+assert_eq "LT2 pending flush names the dead member" "$(cat "$WAND/lb.flush" 2>/dev/null)" "wan1"
+
+# --- LT3: the #24 flush executes AFTER apply, aimed at the dead egress ---
+: > "$CONNTRACKLOG"
+out=$(flush)
+assert_eq "LT3 flush event byte-form" "$out" "wand:flush:lb>wan1(198.51.100.10)"
+assert_contains "LT3 conntrack aimed at the dead egress IP" "$(cat "$CONNTRACKLOG")" "-D -q 198.51.100.10"
+
+# --- LT4: recovery: the alive-in-slot member takes its slot BACK; no
+# flush on failback-to-self (alt == member) ---
+rm -f "$WAND/wan1.force"
+out=$(tick); out=$(tick); out=$(tick); out=$(tick); out=$(tick)
+out=$(tick) # 6 oks -> up + slot re-claim in the same tick
+assert_contains "LT4 up event after OKS_UP" "$out" "up:wan1"
+assert_contains "LT4 reverse lbover (slot back to its member)" "$out" "lbover:lb:wan1>wan1"
+assert_eq "LT4 member_live back to declared" "$(uci -q get wanguard.lb.member_live)" "wan1 wan2"
+assert_eq "LT4 no flush on failback-to-self" "$(flist)" "none"
+
+# --- LT5: zero alive -> slots hold declared, NO spurious events ---
+lbt_reset; conf_lbt
+map_anchor 'gstatic=ok'
+map_anchor 'detectportal=ok'
+tick >/dev/null # seed
+echo fail > "$WAND/wan1.force"
+echo fail > "$WAND/wan2.force"
+out=$(tick); out=$(tick)
+out=$(tick)
+assert_contains "LT5 both members reported down" "$out" "down:wan1"
+assert_contains "LT5 both members reported down" "$out" "down:wan2"
+case "$out" in
+	*lbover*) bad "LT5 no spurious lbover at zero-alive" "$out" "no lbover" ;;
+	*) ok "LT5 no spurious lbover at zero-alive" ;;
+esac
+assert_eq "LT5 member_live left unset (declared)" "$(uci -q get wanguard.lb.member_live 2>/dev/null || echo '')" ""
+assert_eq "LT5 no flush at zero-alive" "$(flist)" "none"
+
+# --- LT6: tick -> apply -> wan-flush: the inherited slot's TABLE
+# re-targets to the alive member; marks (slots) do not re-key ---
+lbt_reset; conf_lbt
+map_anchor 'gstatic=ok'
+map_anchor 'detectportal=ok'
+rapply >/dev/null
+out=$(rapply); assert_eq "LT6 baseline in-sync" "$out" "in-sync"
+case "$(rip route show table 401 | grep '^default')" in *'dev eth0'*) ok "LT6 slot wan1 on eth0 before death" ;; *) bad "LT6 slot wan1 on eth0 before death" "$(rip route show table 401)" "*dev eth0*" ;; esac
+tick >/dev/null # seed
+echo fail > "$WAND/wan1.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null # down + lbover + member_live
+out=$(rapply); case "$out" in applied*) ok "LT6 apply after lbover: applied" ;; *) bad "LT6 apply after lbover: applied" "$out" "applied*" ;; esac
+case "$(rip route show table 401 | grep '^default')" in *'dev eth1'*) ok "LT6 inherited slot re-targets table 401 to eth1" ;; *) bad "LT6 inherited slot re-targets table 401 to eth1" "$(rip route show table 401)" "*dev eth1*" ;; esac
+case "$(rip route show table 402 | grep '^default')" in *'dev eth1'*) ok "LT6 own slot wan2 untouched (eth1)" ;; *) bad "LT6 own slot wan2 untouched (eth1)" "$(rip route show table 402)" "*dev eth1*" ;; esac
+mk=$(marking)
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s70@200"' && ok "LT6 marks stable across failover (no re-key)" || bad "LT6 marks stable across failover (no re-key)" "$mk" "*wg:lb:s70@200*"
+out=$(rapply); assert_eq "LT6 post-failover apply: in-sync" "$out" "in-sync"
+: > "$CONNTRACKLOG"
+out=$(flush)
+assert_eq "LT6 flush consumed after apply (keepalive order)" "$out" "wand:flush:lb>wan1(198.51.100.10)"
+
+echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$TMP" "$WAND"
 [ "$FAIL" = 0 ]

@@ -85,11 +85,19 @@
  *   - apply(): type validation accepts 'direct-lb'; set creation and
  *     element diffs dedupe by group (N slots share ONE mac_<g> set).
  *
- *   - tick() is UNTOUCHED in #38: member failover (wand_wans watching
- *     LB members, list member_live, lbover events, the per-member #24
- *     flush) lands with issue #39. The render path already honors a
- *     hand-set member_live; until #39 writes it, slots render the
- *     declared members.
+ *   - tick(): the LB failover phase (#39). wand_wans() watches the LB
+ *     members (the probe hysteresis is the debounce — NO dwell); a dead
+ *     member's slot is inherited by the first ALIVE member in sorted
+ *     order (event `lbover:<g>:<member>><live>` + `list member_live`
+ *     written to UCI), a recovered member ALWAYS takes its slot back,
+ *     zero alive = slots stand declared (fail-open, same as every
+ *     group's table). The dead egress gets the #24 conntrack flush:
+ *     tick writes `<g>.flush`, the keepalive executes it AFTER apply —
+ *     the order tick -> apply -> wan-flush is unchanged. The render
+ *     path honors member_live: the inherited slot's table re-targets
+ *     to the alive member's device, pinned sessions survive on the ct
+ *     mark. override/wanauto semantics do NOT extend to LB groups
+ *     (weights are the owner's manual decision).
  *
  * Lab: docs/spike-lb/lab/ (topology of spike-ucode #30 + a lan bridge
  * with a client container; L1 render battery runs against THIS file —
@@ -266,12 +274,11 @@ function lb_member_ifcs(g) { // sorted member iface names of an LB group
 	return sort(raw);
 }
 
-function wand_wans() { // distinct CURRENT+HOME of direct groups, sorted:
-	// homes MUST be probed — else a failed-over group's dead home could
-	// never be seen recovering (live bug 2026-10-13)
-	// NB (#39): LB members join the watch list together with the tick
-	// LB phase — an unwatched member's slot could neither fail over nor
-	// fail back
+function wand_wans() { // distinct CURRENT+HOME of direct groups + LB
+	// members, sorted: homes MUST be probed — else a failed-over group's
+	// dead home could never be seen recovering (live bug 2026-10-13);
+	// LB members MUST be probed too (#27/#39: an unwatched member's
+	// slot could neither fail over nor fail back)
 	let wans = [];
 	for (let g in direct_ids()) {
 		let ifc = group_opt(g, 'iface');
@@ -279,6 +286,9 @@ function wand_wans() { // distinct CURRENT+HOME of direct groups, sorted:
 		let home = group_opt(g, 'wan_home');
 		if (home != '') push(wans, home);
 	}
+	for (let g in group_ids('direct-lb'))
+		for (let m in lb_member_ifcs(g))
+			push(wans, m);
 	return uniq(sort(wans));
 }
 
@@ -451,6 +461,48 @@ function tick() {
 		state_write(`${g}.lastswitch`, now);
 		state_write(`${g}.flush`, cur); // deferred conntrack flush (#24):
 		push(events, `failover:${g}>${backup}`); // processed after apply by wan-flush
+	}
+
+	// --- LB phase (#27/#39): member_live = the effective iface per slot ---
+	// A healthy member always takes its slot BACK (failback); a dead
+	// member's slot is inherited by the first ALIVE member in sorted
+	// order (no dwell: the probe hysteresis already debounces the
+	// flap). Zero alive members: slots stand declared (fail-open, the
+	// same behavior as every group's table). The dead egress gets the
+	// #24 conntrack flush: its NAT bindings are the only thing keeping
+	// pinned sessions on a dead path. override/wanauto semantics do NOT
+	// extend to LB groups (weights are the owner's manual decision).
+	for (let g in group_ids('direct-lb')) {
+		let mem = lb_member_ifcs(g);
+		if (length(mem) == 0)
+			continue;
+		let live = cursor.get(CONF, g, 'member_live');
+		if (type(live) != 'array' || length(live) != length(mem))
+			live = slice(mem, 0); // declared: every slot on its member
+		let want = [], dirty_lb = false;
+		for (let i = 0; i < length(mem); i++) {
+			let cur = live[i] ?? mem[i];
+			let alt = '';
+			if (wan_state(mem[i]) == 'up') {
+				alt = mem[i];
+			} else {
+				for (let m in mem)
+					if (wan_state(m) == 'up') { alt = m; break; }
+				if (alt == '')
+					alt = mem[i]; // nobody alive: hold declared
+			}
+			push(want, alt);
+			if (cur != alt) {
+				push(events, `lbover:${g}:${mem[i]}>${alt}`);
+				dirty_lb = true;
+				if (alt != mem[i])
+					state_write(`${g}.flush`, mem[i]); // #24, see wanflush
+			}
+		}
+		if (dirty_lb) {
+			cursor.set(CONF, g, 'member_live', want);
+			dirty = true;
+		}
 	}
 	if (dirty) {
 		cursor.save(CONF);
