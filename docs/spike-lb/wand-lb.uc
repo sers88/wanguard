@@ -672,13 +672,21 @@ function desired_rules(alloc, redir) { // [{chain, tag, body}] (sh DRF)
 		// the conntrack pin makes the flow stick. `ip proto` before
 		// `th dport` was the other dead end (parser chokes on the
 		// token after it) — moot with numgen.
+		// NB (session 2, LIVE FINDING): every member rule MUST end with
+		// `return` — a rule without a verdict does NOT stop traversal,
+		// so the packet fell through to the unconditional LAST rule and
+		// its mark OVERWROTE all earlier ones: 100% of flows funneled
+		// into the last member ("numgen random is not uniform" of the
+		// session-1 notes was THIS bug, not the draw). Lab proof: 40/40
+		// flows mark=400 while rule 1 had drawn <70 on 29/40 first
+		// SYNs (72.5% ≈ the honest 70%) — the draws were always fine.
 		let acc = 0;
 		for (let i = 0; i < length(mem); i++) {
 			let cut = acc + b[i];
 			let body = `iifname "${BR}" ether saddr @mac_${g} ip daddr != @local_v4 ip daddr != @no_mark `;
 			if (i < length(mem) - 1)
 				body += `numgen random mod 100 < ${cut} `;
-			body += `counter meta mark set ${mem[i].m} ct mark set meta mark`;
+			body += `counter meta mark set ${mem[i].m} ct mark set meta mark return`;
 			push(out, { chain: 'marking', tag: `wg:${g}:s${cut}@${mem[i].m}`,
 				body: body });
 			acc = cut;

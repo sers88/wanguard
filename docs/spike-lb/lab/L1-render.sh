@@ -68,6 +68,12 @@ r2=$($MARKING | grep 'comment "wg:lb:s100@400"')
 # behaviorally below (route get per mark), never by text
 case "$r1" in *'numgen random mod 100 < 70'*) ;; *) fail "member rule 1 body wrong: $r1" ;; esac
 case "$r2" in *'numgen'*) fail "last member must be the unconditional remainder: $r2" ;; esac
+# session-2 live finding: a member rule WITHOUT a verdict does not stop
+# traversal — the unconditional last rule overwrote every earlier mark
+# and 100% of flows funneled into the last member. The return is what
+# makes the cascade a cascade.
+case "$r1" in *'ct mark set meta mark return'*) ;; *) fail "member rule 1 must end with return (cascade verdict): $r1" ;; esac
+case "$r2" in *'ct mark set meta mark return'*) ;; *) fail "member rule 2 must end with return: $r2" ;; esac
 case "$r1$r2" in *'ct mark set meta mark'*) ;; *) fail "ct pin missing" ;; esac
 h1=$(printf '%s' "$st" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
 h2=$(printf '%s' "$r1" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')

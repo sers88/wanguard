@@ -63,12 +63,14 @@ iifname "br-lan" ether saddr @mac_lb ip daddr != @local_v4 ip daddr != @no_mark 
   tag: wg:lb:stick   (тело НИКОГДА не меняется — позиция в цепочке стабильна)
 
 # новый поток: каскад numgen-random (подход mwan3: statistic random на NEW
-# + connmark restore); правило i забирает долю < cut_i от ОСТАТКА
+# + connmark restore); правило i забирает долю < cut_i от ОСТАТКА.
+# КАЖДОЕ member-правило ЗАКАНЧИВАЕТСЯ return — без вердикта пакет
+# проваливается в следующее правило (см. находку ниже)
 iifname "br-lan" ether saddr @mac_lb ip daddr != @local_v4 ip daddr != @no_mark \
-    numgen random mod 100 < 70 counter meta mark set <M1> ct mark set meta mark
+    numgen random mod 100 < 70 counter meta mark set <M1> ct mark set meta mark return
   tag: wg:lb:s70@<M1>
 iifname "br-lan" ether saddr @mac_lb ip daddr != @local_v4 ip daddr != @no_mark \
-    counter meta mark set <M2> ct mark set meta mark
+    counter meta mark set <M2> ct mark set meta mark return
   tag: wg:lb:s100@<M2>   (последний член — безусловный остаток, без draw)
 ```
 
@@ -91,6 +93,21 @@ iifname "br-lan" ether saddr @mac_lb ip daddr != @local_v4 ip daddr != @no_mark 
   независимые draws безопасны, потому что правило срабатывает только на
   недобранную долю; последний член — безусловный остаток (заодно
   обходит отказ nft на `< 100`: «Value 100 exceeds valid range 0-99»).
+- **Member-правило без вердикта = каскад не каскад** (живая находка
+  сессии 2, корень «блокера» сессии 1): правило без `return` не
+  останавливает traversal — пакет после срабатывания rule₁ проваливался
+  в безусловный rule₂, и тот перезаписывал mark. Итог: 100% потоков
+  уходили последнему члену — «numgen random неравномерен (6/6 в один
+  бакет)» из заметок сессии 1 был ЭТИМ багом рендера, а не draw'ом.
+  Доказательство из лабы: rule₁ насчитал 29 первых SYN из 40 (72.5% ≈
+  честные 70%), а conntrack показывал 39/39 mark=400. После фикса
+  (return на каждом member-правиле): 40 потоков → 25×200/15×400
+  (62.5/37.5 — биномиальный шум вокруг 70/30), биекция исход↔метка
+  идеальная, L2 зелёная полностью (A: 11 succ/4 hang, B: 8/7; 10
+  riders пережили смену весов в полёте, stick-counter 592→14948;
+  post-flip remap наблюдён). Кандидаты-замены механизма (statistic
+  random, numgen inc, изолированный jhash) НЕ ПОНАДОБИЛИСЬ —
+  numgen random остаётся, владелец подтвердил отзыв jhash (2026-10-29).
 - Первый пакет (SYN) получает mark ДО fw4-MSS-clamp — конфликтов нет;
   ретранслированный SYN после confirm уже прилипает через stick.
 - `counter` на всех правилах — наблюдаемость спайка (распределение и
