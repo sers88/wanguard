@@ -172,6 +172,14 @@ iifname "br-lan" ether saddr @mac_lb ip daddr != @local_v4 ip daddr != @no_mark 
 - wand-tick (сессия 2, L4): wand_wans() + члены LB-групп; событие
   вида `lbover:<g>:<member>><live>`; override/wanauto-семантика на
   LB-группы не распространяется (веса — ручное решение владельца).
+  РЕАЛИЗОВАНО сессией 2 (L4-OK): tick-фаза пишет member_live (живой
+  член всегда забирает слот назад; мёртвого наследует первый живой
+  по сортировке; 0 живых — слоты стоят declared), мёртвому egress
+  пишется `<g>.flush` (#24), порядок ucode-деклараций важен (без
+  hoisting — tick-path зовёт ранний lb_member_ifcs). NB: миграция
+  pinned-riders — прод-свойство (без маскарада); в лабе доказуем
+  только control-plane + свежие потоки после recovery (шапка
+  L4-failover.sh).
 - QUIC/UDP: direct-клиенты шлют UDP маркированно — jhash считает
   `th dport` и для UDP, прилипание то же. (У proxy-группы UDP через TUN
   — LB его не касается, граница из issue сохранена.)

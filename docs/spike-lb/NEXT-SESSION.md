@@ -122,12 +122,24 @@ mwan3); владелец подтвердил отзыв jhash 2026-10-29 (DESIG
    numgen random; корень — отсутствие `return` в member-правилах.
 2. ~~Подогнать wand-lb.uc + L1, прогнать L1+L2~~ DONE: fix `return`
    (+ коммент-находка), L1 8/8 с новыми вердикт-проверками, L2-OK.
-3. L3 (iperf3 -P4, агрегат vs single-WAN), L4 (member failover через
-   netifd-фикстуру + member_live + #24-flush), L5 (MTU 1436/1492,
-   1 и 3 члена, 0 живых).
-4. Коммит-док в #27: дизайн, находки nft (ОБЯЗАТЕЛЬНО упомянуть
-   пивот jhash→numgen И находку про return — правило без вердикта
-   не завершает traversal), метрики, вердикт adopt/reject.
+3. ~~L3 (метрики)~~ DONE: счётчики ≈ весам (60 потоков → draw 47 /
+   remainder 13 = 78/22, биекция исход↔счётчик точная); iperf3 single
+   vs aggregate (A+B параллельно): 15 034 → 28 294 Mbit/s (1.88×,
+   пути физически параллельны; абсолюты — memory-speed виртуалки).
+   ~~L4 (failover)~~ DONE: реализована tick-фаза (member_live +
+   `lbover:<g>:<m>><live>` + #24-flush мёртвого egress), L4-OK:
+   down→lbover→слот 401→eth1→flush→failback→слот→eth0; zero-alive
+   держит declared слоты (fail-open stance), спурийных lbover нет.
+   НАХОДКА: ucode здесь не хоистит function-декларации — tick-path
+   вызывает ранний `lb_member_ifcs()` (веса ему не нужны), `lb_members()`
+   переиспользует хелпер. SCOPE-NOTE: миграция pinned-riders между
+   членами — ПРОД-свойство (публичные IP без маскарада); в лабе каждый
+   якорь живёт на своём мосту, moved rider не достанет dst, и #24-flush
+   сознательно убивает его NAT — лаба доказывает control-plane + свежие
+   потоки после recovery (честно записано в шапке L4-failover.sh).
+   Осталось: L5 (MTU 1436/1492, 1 и 3 члена, 0 живых) + вердикт.
+4. Коммит-док в #27: дизайн, находки nft (пивот jhash→numgen + return
+   + порядок каскада), метрики, вердикт adopt/reject.
 
 ## Инварианты (не нарушать)
 

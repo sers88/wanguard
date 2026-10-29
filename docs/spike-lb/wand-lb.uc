@@ -236,9 +236,23 @@ function probe(wan, dev, map) { // >= reliability anchors answered?
 
 // ---------- watched WANs + backup selection (#26) ----------
 
-function wand_wans() { // distinct CURRENT+HOME of direct groups, sorted:
-	// homes MUST be probed — else a failed-over group's dead home could
-	// never be seen recovering (live bug 2026-10-13)
+function lb_member_ifcs(g) { // sorted member iface names of an LB group
+	// EARLY helper: ucode does not hoist declarations here, so tick-path
+	// callers (wand_wans, the LB phase) must not reach lb_members() at
+	// its line — they use this (weights are irrelevant on those paths)
+	let raw = cursor.get(CONF, g, 'member_iface');
+	if (type(raw) == 'string') // single-element list tolerance
+		raw = (trim(raw) != '') ? [ raw ] : null;
+	if (type(raw) != 'array')
+		return [];
+	return sort(raw);
+}
+
+function wand_wans() { // distinct CURRENT+HOME of direct groups + LB
+	// members, sorted: homes MUST be probed — else a failed-over group's
+	// dead home could never be seen recovering (live bug 2026-10-13);
+	// LB members MUST be probed too (#27: an unwatched member's slot
+	// could neither fail over nor fail back)
 	let wans = [];
 	for (let g in direct_ids()) {
 		let ifc = group_opt(g, 'iface');
@@ -246,6 +260,9 @@ function wand_wans() { // distinct CURRENT+HOME of direct groups, sorted:
 		let home = group_opt(g, 'wan_home');
 		if (home != '') push(wans, home);
 	}
+	for (let g in group_ids('direct-lb'))
+		for (let m in lb_member_ifcs(g))
+			push(wans, m);
 	return uniq(sort(wans));
 }
 
@@ -419,6 +436,47 @@ function tick() {
 		state_write(`${g}.flush`, cur); // deferred conntrack flush (#24):
 		push(events, `failover:${g}>${backup}`); // processed after apply by wan-flush
 	}
+
+	// --- LB phase (#27): member_live = the effective iface per slot ---
+	// A healthy member always takes its slot BACK (failback); a dead
+	// member's slot is inherited by the first ALIVE member in sorted
+	// order (no dwell: the probe hysteresis already debounces the
+	// flap). Zero alive members: slots stand declared (fail-open, the
+	// same behavior as every group's table). The dead egress gets the
+	// #24 conntrack flush: its NAT bindings are the only thing keeping
+	// pinned sessions on a dead path.
+	for (let g in group_ids('direct-lb')) {
+		let mem = lb_member_ifcs(g);
+		if (length(mem) == 0)
+			continue;
+		let live = cursor.get(CONF, g, 'member_live');
+		if (type(live) != 'array' || length(live) != length(mem))
+			live = slice(mem, 0); // declared: every slot on its member
+		let want = [], dirty_lb = false;
+		for (let i = 0; i < length(mem); i++) {
+			let cur = live[i] ?? mem[i];
+			let alt = '';
+			if (wan_state(mem[i]) == 'up') {
+				alt = mem[i];
+			} else {
+				for (let m in mem)
+					if (wan_state(m) == 'up') { alt = m; break; }
+				if (alt == '')
+					alt = mem[i]; // nobody alive: hold declared
+			}
+			push(want, alt);
+			if (cur != alt) {
+				push(events, `lbover:${g}:${mem[i]}>${alt}`);
+				dirty_lb = true;
+				if (alt != mem[i])
+					state_write(`${g}.flush`, mem[i]); // #24, see wanflush
+			}
+		}
+		if (dirty_lb) {
+			cursor.set(CONF, g, 'member_live', want);
+			dirty = true;
+		}
+	}
 	if (dirty) {
 		cursor.save(CONF);
 		cursor.commit(CONF);
@@ -520,13 +578,8 @@ function ensure_table() { // skeleton hallmark: the local_v4 set
 // ---------- direct-lb helpers (SPIKE #27) ----------
 
 function lb_members(g) { // sorted members [{ ifc, w }]; weights default 50
-	let raw = cursor.get(CONF, g, 'member_iface');
-	if (type(raw) == 'string') // single-element list tolerance
-		raw = (trim(raw) != '') ? [ raw ] : null;
-	if (type(raw) != 'array')
-		return [];
 	let out = [];
-	for (let ifc in sort(raw)) {
+	for (let ifc in lb_member_ifcs(g)) {
 		let v = group_opt(g, `weight_${ifc}`);
 		let w = int(match(v, /^[0-9]+$/) ? v : '50');
 		push(out, { ifc: ifc, w: (w > 0) ? w : 50 });

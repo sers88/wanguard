@@ -138,14 +138,15 @@ client-shell)
 	docker exec -it $CLIENT sh
 ;;
 L1) docker exec $LAB sh /repo/$LB/L1-render.sh ;;
-# L2 is HOST-orchestrated: it drives BOTH sides (client curls + router
-# conntrack/nft), which no single container can do
+# L2 and L4 are HOST-orchestrated: they drive BOTH sides (client curls
+# + router conntrack/nft/tick), which no single container can do
 L2) sh "$HOSTREPO/$LB/L2-stickiness.sh" ;;
+L4) sh "$HOSTREPO/$LB/L4-failover.sh" ;;
 all)
 	"$0" net
 	"$0" client
 	"$0" up
-	for c in L1 L2; do
+	for c in L1 L2 L4; do
 		echo "===== $c ====="
 		"$0" $c || exit 1
 	done
