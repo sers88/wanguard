@@ -601,6 +601,16 @@ scenario('J13 degraded', 'lb2.uci', async (v, tag) => {
 		p.sub, 'wan1 70% 200/401 · wan2 30% 400/402 · 1');
 });
 
+/* --- J14: the shipped config template stays allocator-consistent --- */
+scenario('J14 config template', null, async (v, tag) => {
+	UCI.reset(fs.readFileSync(path.join(REPO, 'router', 'etc.config.wanguard.example'), 'utf8'));
+	assertEq(tag + ' a', v.allocPreview('a'), 'fwmark 100 → table 400');
+	assertEq(tag + ' b', v.allocPreview('b'), 'fwmark 200 → table 401');
+	assertEq(tag + ' lb (slots continue the cascade, 300 skipped)',
+		v.allocPreview('lb'), 'wan1 70% 400/402 · wan3 30% 500/403');
+	assertEq(tag + ' c', v.allocPreview('c'), 'fwmark 300 → table 500 (fixed)');
+});
+
 /* ============================ demo ============================ */
 
 async function demo() {

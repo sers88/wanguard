@@ -207,6 +207,12 @@ config group 'a'                      # name = [A-Za-z0-9_], referenced by membe
         option type 'direct'          # direct → netifd interface
         option iface 'vpn'
 
+config group 'lb'                     # direct-lb → balance across members
+        option type 'direct-lb'       # slots keyed by the SORTED member list
+        list member_iface 'wan1'      # (weight edits never re-key slots)
+        list member_iface 'wan3'
+        option weight_wan1 '70'       # weight_<iface>; absent/garbage/0 → 50
+
 config group 'c'
         option type 'proxy'           # proxy → mihomo (max 1 group)
 
@@ -285,7 +291,13 @@ Properties and constraints:
 ## 7. What we deliberately do NOT do
 
 - mwan3 — not needed: groups are hard-bound, switching is deliberate.
-- Channel bonding/balancing — flows don't get faster, complexity is high.
+- Channel bonding/balancing — the 2026-10-24 «reject» (flows don't get
+  faster, complexity is high) was REVERSED on 2026-10-29 for direct
+  groups: `direct-lb`, adopted by the owner's verdict on spike #27 —
+  see §7.1. Half of the old reasoning still holds: single flows do NOT
+  get faster; what changed — parallel WANs sum aggregate bandwidth
+  (1.88× proven on the real stack) and the complexity turned out to be
+  bounded by the spike.
 - Auto-failover for direct groups is done by `wand-tick` (#6), main-egress
   monitoring by `wan-watch` (#18); both exist by owner's decision after the
   incidents of 2026-10-12/14. The per-group fallback route (`metric 200`)
@@ -311,3 +323,73 @@ Properties and constraints:
   `docs/spike-ucode/00-CLI-CONTRACT.md` + golden byte fixtures
   (`stage5/contract-gate.sh`); evidence: `docs/spike-ucode/VERDICT.md`
   and the stage1–stage5 notes.
+
+### 7.1 direct-lb: WAN load balancing for direct groups (#27–#41)
+
+Decision history:
+- 2026-10-24 — «reject: flows don't get faster, complexity is high» (the
+  bonding bullet above carried that verdict).
+- 2026-10-29 — **ADOPT** (owner verdict on spike #27): LAB-ALL-GREEN
+  (net → client → up → L1 → L2 → L4 → L5, branch `spike/lb`, HEAD
+  989939c); aggregate bandwidth sums across parallel WANs — iperf3
+  single-WAN 15 034 Mbit/s → 28 294 Mbit/s with both WANs in parallel =
+  **1.88×**; stickiness and failover proven (long riders survive a
+  weight flip mid-flight with unmoved ct-marks; down → lbover →
+  #24-flush → failback; zero-alive fails open to main). Evidence:
+  `docs/spike-lb/VERDICT.md` + `docs/spike-lb/DESIGN.md`.
+  Implementation: #38 render, #39 tick, #40 LuCI; #41 = this doc + the
+  live rollout window — the CGNAT-contention benefit of Rostelecom is
+  measured THERE, and «no benefit» is a valid outcome (rollback + an
+  addendum here, per spike DESIGN §6).
+
+Model:
+- `option type 'direct-lb'` + `list member_iface` + `option
+  weight_<iface>` (absent/garbage/0 → 50). The group expands into N
+  slots of the SAME allocator — one slot per SORTED member_iface, the
+  cascade continues after the direct groups, marks ≥ 300 skip mihomo
+  (§2); marks/tables/prios are keyed by the sorted member names, so
+  weight edits never re-key slots. Member-set changes DO renumber the
+  slots — that is a #24-flush event by design (established flows are
+  re-homed explicitly).
+- Marking per group: the stick rule comes first (ct-mark restore +
+  `return`), then the numgen-random draw rules (`numgen random mod 100
+  < cut` — the mwan3 scheme: random on NEW + connmark restore), the
+  last member is the unconditional remainder (an nft `< 100` match is a
+  range error, hence the remainder form).
+- wand-tick watches the LB members (#39): member death →
+  `lbover:<g>:<member>><live>` → `member_live` → the slot re-targets to
+  a live member and the dead egress gets the targeted #24 conntrack
+  flush; recovery (failback) is automatic; zero-alive keeps the
+  declared slots (fail-open to main).
+- Boundaries kept from #27: proxy (mark 300) and wg_moscow are NOT
+  load-balanced; LB rules never touch the main table; only LAN→WAN
+  flows of the group's MAC set are affected (same local_v4/no_mark
+  guards as direct groups).
+
+nft findings / render-edit rules (nft 1.1.6 + OpenWrt 25.12; found live
+in the spike, primary source: `docs/spike-lb/VERDICT.md` §2):
+1. **jhash is unrepairable on this stack** → the renderer uses
+   `numgen random` (owner consent 2026-10-29): jhash input registers
+   are corrupted by any preceding expression of the same rule AND by
+   traversal of earlier rules; interval-map collapses to the first
+   bucket; `mod 100 0-69` never matches; a gated jhash always yields
+   bucket 0; `ip proto . th dport` is a parser dead-end.
+2. **A member rule without `return` is not a cascade**: without a
+   verdict the traversal continues into the unconditional remainder,
+   which overwrites the mark → 100% of flows to the last member. (The
+   «uneven numgen» of spike session 1 was exactly this bug; the draws
+   themselves were honest — 29/40 first SYNs ≈ 72.5% vs expected 70%.)
+3. **The cascade is order-sensitive**: the tag-diff APPENDS rules at
+   the end of the chain; replacing a single member rule (a weight flip)
+   used to put a draw AFTER the remainder → everything to one member
+   again. Fix: ANY member-tag change re-renders the WHOLE cascade of
+   the group.
+4. ucode does not hoist function declarations here (the tick path calls
+   the early `lb_member_ifcs`).
+
+**Standing requirement on any future render-path edit: the cascade
+order asserts stay mandatory — handle-based `stick < draw < remainder`
+at render AND after flips (mock LB3/LB5/LB7/LB9 + lab L1), the
+`return` verdict on every member rule, and the whole-cascade re-render
+on any member-tag change. These three are the load-bearing invariants
+of the LB render; do not "simplify" them away.**

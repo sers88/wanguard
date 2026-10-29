@@ -4,10 +4,16 @@
 #
 # A group is `config group '<name>'` (name = [A-Za-z0-9_]; members reference it):
 #   option type 'direct'  + option iface '<netifd iface>'  -> egress via that interface
+#   option type 'direct-lb' + list member_iface '<iface>'  -> balance across members
+#       + option weight_<iface> '<%>' (absent/garbage/0 -> 50; member_live
+#         is written by wand-tick failover — do not hand-edit)
 #   option type 'proxy'                                    -> egress via mihomo (max 1)
-# Allocation is automatic and deterministic (direct groups, alphabetical):
-#   proxy  = fwmark 300 / table 500 (fixed)
-#   direct = fwmark 100,200,400,... / tables 400,401,...  (see docs/ARCHITECTURE.md §2)
+# Allocation is automatic and deterministic:
+#   proxy     = fwmark 300 / table 500 (fixed)
+#   direct    = fwmark 100,200,400,... / tables 400,401,...
+#   direct-lb = one slot per SORTED member_iface; the cascade continues after
+#               the direct groups (marks >= 300 skip mihomo's 300)
+#   (see docs/ARCHITECTURE.md §2 and §7.1)
 
 config globals 'globals'
 	option redir_port '7892'
@@ -32,6 +38,15 @@ config group 'b'
 	option type 'direct'
 	option iface 'wan2'
 
+# Load balance a client across two WANs (slots continue the cascade after
+# a and b: wan1 = fwmark 400/table 402, wan3 = fwmark 500/table 403):
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan3'
+	option weight_wan1 '70'
+	option weight_wan3 '30'
+
 config group 'c'
 	option type 'proxy'
 
@@ -44,6 +59,11 @@ config member 'm_001122334466'
 	option name 'desktop-wifi'
 	option mac '00:11:22:33:44:66'
 	option group 'c'
+
+config member 'm_001122334477'
+	option name 'laptop-lb'
+	option mac '00:11:22:33:44:77'
+	option group 'lb'
 
 # Legacy (pre-#13): the `config wan 'wan'` section is no longer used by the
 # current code; remove manually after migrating:
