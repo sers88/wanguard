@@ -142,11 +142,12 @@ L1) docker exec $LAB sh /repo/$LB/L1-render.sh ;;
 # + router conntrack/nft/tick), which no single container can do
 L2) sh "$HOSTREPO/$LB/L2-stickiness.sh" ;;
 L4) sh "$HOSTREPO/$LB/L4-failover.sh" ;;
+L5) sh "$HOSTREPO/$LB/L5-edges.sh" ;;
 all)
 	"$0" net
 	"$0" client
 	"$0" up
-	for c in L1 L2 L4; do
+	for c in L1 L2 L4 L5; do
 		echo "===== $c ====="
 		"$0" $c || exit 1
 	done
