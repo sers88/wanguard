@@ -340,7 +340,11 @@ Decision history:
   Implementation: #38 render, #39 tick, #40 LuCI; #41 = this doc + the
   live rollout window — the CGNAT-contention benefit of Rostelecom is
   measured THERE, and «no benefit» is a valid outcome (rollback + an
-  addendum here, per spike DESIGN §6).
+  addendum here, per spike DESIGN §6). **Live window 2026-10-30: keep
+  verdict, rollback never triggered** (distribution ≈ weights, stick
+  through apply + weight flips, ifdown/ifup failover → failback clean);
+  the CGNAT benefit was NOT measured (owner call — a valid outcome per
+  DESIGN §6, measurable in a separate session). **Live since v1.2.0.**
 
 Model:
 - `option type 'direct-lb'` + `list member_iface` + `option
