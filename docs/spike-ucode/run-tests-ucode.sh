@@ -562,6 +562,308 @@ assert_eq "F10 missing wand dir: silent" "$out" ""
 assert_eq "F10 missing wand dir: rc=0" "$rc" "0"
 
 echo
+echo "== #38: direct-lb render (mock-сьют, render mode) =="
+#
+# The LB tests run the apply renderer against the STATEFUL nft/ip mocks
+# (NFT_STATE/IP_STATE render mode, stage-3 harness): the only fixtures
+# able to pin tags/bodies/handle order/idempotency/orphan cleanup. Env
+# is set INSIDE the wrappers (never as `VAR=v func` prefixes — busybox
+# ash persists those into the suite shell, apply-parity.sh lesson).
+#
+# Allocation pinned by these tests (witness 'a' first, slots keyed by
+# SORTED member name, 300 = mihomo skipped):
+#   a:wan3        mark 100 table 400 prio 8100   (direct, witness)
+#   lb:wan1       mark 200 table 401 prio 8101
+#   lb:wan2       mark 400 table 402 prio 8102
+#   lb:wan3       mark 500 table 403 prio 8103   (3-member fixture)
+
+# one-time: the skeleton at the apk path (ensure_table loads it in
+# render mode; the tick path above never touches nft)
+mkdir -p /usr/share/wanguard
+cp "$ROOT/router/wanguard.nft" /usr/share/wanguard/wanguard.nft
+
+RSTATE=$TMP/lb-nft.db
+RIP=$TMP/lb-ip
+
+rapply() { NFT_STATE=$RSTATE IP_STATE=$RIP ucode -L "$MOCK" "$UC" apply 2>&1; }
+rcli()   { NFT_STATE=$RSTATE IP_STATE=$RIP ucode -L "$MOCK" "$UC" "$@" 2>&1; }
+rnft()   { NFT_STATE=$RSTATE "$MOCKBIN/nft" "$@" 2>&1; }
+rip()    { IP_STATE=$RIP "$MOCKBIN/ip" "$@" 2>&1; }
+marking() { rnft -a list chain inet wanguard marking; }
+handle_of() { printf '%s' "$1" | sed -n 's/.*# handle \([0-9]*\).*/\1/p'; }
+
+lb_reset() { # render state + fixtures to zero (keepalive-contract seed:
+	rm -rf "$RSTATE" "$RIP" /tmp/.uci # main default + links, as stage 3)
+	mkdir -p "$RIP"
+	: > "$UBUS_IFACES"
+	: > "$UBUS_ADDRS"
+	printf 'default via 192.0.2.1 dev mockwan metric 10\n' > "$RIP/route.main"
+	: > "$RIP/links"
+	for d in mockwan eth0 eth1 eth2 Meta; do printf '%s\n' "$d" >> "$RIP/links"; done
+	add_iface_dev wan1 eth0
+	add_iface_dev wan2 eth1
+	add_iface_dev wan3 eth2
+}
+
+conf_lb2() { # the lab-shaped fixture: witness + 2 members 70/30
+	cat > /etc/config/wanguard <<'EOF'
+config globals 'globals'
+
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	option weight_wan1 '70'
+	option weight_wan2 '30'
+
+config member
+	option mac 'aa:bb:cc:dd:ee:55'
+	option group 'lb'
+	option name 'client'
+EOF
+}
+
+conf_lb1() { # single member: the unconditional-remainder-only form
+	cat > /etc/config/wanguard <<'EOF'
+config globals 'globals'
+
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+
+config member
+	option mac 'aa:bb:cc:dd:ee:55'
+	option group 'lb'
+	option name 'client'
+EOF
+}
+
+conf_lb3() { # three members, NO weight options (defaults 50/50/50)
+	cat > /etc/config/wanguard <<'EOF'
+config globals 'globals'
+
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	list member_iface 'wan3'
+
+config member
+	option mac 'aa:bb:cc:dd:ee:55'
+	option group 'lb'
+	option name 'client'
+EOF
+}
+
+conf_lbpx() { # proxy + witness + lb: the #27 boundary (proxy/witness
+	# must be untouched by LB rules); no member sections needed here
+	cat > /etc/config/wanguard <<'EOF'
+config globals 'globals'
+
+config group 'p'
+	option type 'proxy'
+
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	option weight_wan1 '70'
+	option weight_wan2 '30'
+EOF
+}
+
+# --- LB1: applied -> in-sync (keepalive contract on an LB config) ---
+lb_reset; conf_lb2
+out=$(rapply); case "$out" in applied*) ok "LB1 first apply: applied" ;; *) bad "LB1 first apply: applied" "$out" "applied*" ;; esac
+out=$(rapply); assert_eq "LB1 second apply: exactly in-sync" "$out" "in-sync"
+
+# --- LB2: tags and bodies, INCLUDING the cascade verdict (return) ---
+mk=$(marking)
+st=$(printf '%s\n' "$mk" | grep 'comment "wg:lb:stick"')
+case "$st" in
+	*'ct mark != 0 counter meta mark set ct mark return'*) ok "LB2 stick body (restore + return)" ;;
+	*) bad "LB2 stick body (restore + return)" "$st" "*ct mark != 0*meta mark set ct mark return*" ;;
+esac
+r1=$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s70@200"')
+r2=$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s100@400"')
+case "$r1" in
+	*'numgen random mod 100 < 70 counter meta mark set 200 ct mark set meta mark return'*) ok "LB2 member 1: draw < 70, mark 200, ct pin, return" ;;
+	*) bad "LB2 member 1: draw < 70, mark 200, ct pin, return" "$r1" "*numgen random mod 100 < 70*mark set 200*ct mark set meta mark return*" ;;
+esac
+case "$r2" in
+	*numgen*) bad "LB2 member 2: unconditional remainder (no draw)" "$r2" "no numgen" ;;
+	*) ok "LB2 member 2: unconditional remainder (no draw)" ;;
+esac
+case "$r2" in
+	*'counter meta mark set 400 ct mark set meta mark return'*) ok "LB2 member 2: mark 400, ct pin, return" ;;
+	*) bad "LB2 member 2: mark 400, ct pin, return" "$r2" "*mark set 400*ct mark set meta mark return*" ;;
+esac
+printf '%s\n' "$mk" | grep -q 'comment "wg:a:m100"' && ok "LB2 witness rule wg:a:m100 present" || bad "LB2 witness rule wg:a:m100 present" "$mk" "*wg:a:m100*"
+
+# --- LB3: cascade order pinned by HANDLES (first render) ---
+h1=$(handle_of "$st"); h2=$(handle_of "$r1"); h3=$(handle_of "$r2")
+if [ -n "$h1" ] && [ -n "$h2" ] && [ -n "$h3" ] && [ "$h1" -lt "$h2" ] && [ "$h2" -lt "$h3" ]; then
+	ok "LB3 handle order stick($h1) < draw($h2) < remainder($h3)"
+else
+	bad "LB3 handle order stick($h1) < draw($h2) < remainder($h3)" "$h1 $h2 $h3" "ordered"
+fi
+
+# --- LB4: slot allocation on the ip side + grouplist rows ---
+rip rule show | grep -q '8100:.*fwmark 0x64.*lookup 400' && ok "LB4 witness slot 8100/0x64/400" || bad "LB4 witness slot 8100/0x64/400" "$(rip rule show)" "*8100*0x64*400*"
+rip rule show | grep -q '8101:.*fwmark 0xc8.*lookup 401' && ok "LB4 slot wan1 8101/0xc8/401" || bad "LB4 slot wan1 8101/0xc8/401" "$(rip rule show)" "*8101*0xc8*401*"
+rip rule show | grep -q '8102:.*fwmark 0x190.*lookup 402' && ok "LB4 slot wan2 8102/0x190/402 (300 skipped)" || bad "LB4 slot wan2 8102/0x190/402" "$(rip rule show)" "*8102*0x190*402*"
+case "$(rip route show table 400 | grep '^default')" in *'dev eth2'*) ok "LB4 table 400 -> eth2 (witness)" ;; *) bad "LB4 table 400 -> eth2" "$(rip route show table 400)" "*dev eth2*" ;; esac
+case "$(rip route show table 401 | grep '^default')" in *'dev eth0'*) ok "LB4 table 401 -> eth0 (wan1)" ;; *) bad "LB4 table 401 -> eth0" "$(rip route show table 401)" "*dev eth0*" ;; esac
+case "$(rip route show table 402 | grep '^default')" in *'dev eth1'*) ok "LB4 table 402 -> eth1 (wan2)" ;; *) bad "LB4 table 402 -> eth1" "$(rip route show table 402)" "*dev eth1*" ;; esac
+for t in 400 401 402; do
+	case "$(rip route show table $t)" in
+		*' metric 200'*) ok "LB4 table $t: metric-200 fallback" ;;
+		*) bad "LB4 table $t: metric-200 fallback" "$(rip route show table $t)" "* metric 200*" ;;
+	esac
+done
+gl=$(rcli grouplist)
+printf '%s\n' "$gl" | grep -q 'lb.*direct-lb.*wan1.*200.*401' && ok "LB4 grouplist row lb:wan1 200/401" || bad "LB4 grouplist row lb:wan1 200/401" "$gl" "*lb*direct-lb*wan1*200*401*"
+printf '%s\n' "$gl" | grep -q 'lb.*direct-lb.*wan2.*400.*402' && ok "LB4 grouplist row lb:wan2 400/402" || bad "LB4 grouplist row lb:wan2 400/402" "$gl" "*lb*direct-lb*wan2*400*402*"
+
+# --- LB5: weight flip = whole-cascade swap, ip-side snapshot frozen ---
+before=$( { rip rule show; rip route show table 400; rip route show table 401; \
+	rip route show table 402; rnft list set inet wanguard mac_lb; } 2>/dev/null )
+uci_set lb.weight_wan1 '30'
+uci_set lb.weight_wan2 '70'
+out=$(rapply); case "$out" in applied*) ok "LB5 flip: applied" ;; *) bad "LB5 flip: applied" "$out" "applied*" ;; esac
+mk=$(marking)
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s30@200"' && ok "LB5 new tag s30@200" || bad "LB5 new tag s30@200" "$mk" "*wg:lb:s30@200*"
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s100@400"' && ok "LB5 remainder tag s100@400 kept" || bad "LB5 remainder tag s100@400 kept" "$mk" "*wg:lb:s100@400*"
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s70@200"' && bad "LB5 old tag s70@200 gone" "still there" "removed" || ok "LB5 old tag s70@200 gone"
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:stick"' && ok "LB5 stick survived the flip" || bad "LB5 stick survived the flip" "$mk" "*wg:lb:stick*"
+pf1=$(handle_of "$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s30@200"')")
+pf2=$(handle_of "$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s100@400"')")
+if [ -n "$pf1" ] && [ -n "$pf2" ] && [ "$pf1" -lt "$pf2" ]; then
+	ok "LB5 post-flip order: draw($pf1) < remainder($pf2) — append-bug regression"
+else
+	bad "LB5 post-flip order: draw($pf1) < remainder($pf2)" "$pf1 $pf2" "ordered"
+fi
+after=$( { rip rule show; rip route show table 400; rip route show table 401; \
+	rip route show table 402; rnft list set inet wanguard mac_lb; } 2>/dev/null )
+assert_eq "LB5 ip-side snapshot unchanged by the flip" "$before" "$after"
+out=$(rapply); assert_eq "LB5 post-flip apply: in-sync" "$out" "in-sync"
+
+# --- LB6: single member = unconditional rule without draw, one slot ---
+lb_reset; conf_lb1
+rapply >/dev/null
+out=$(rapply); assert_eq "LB6 single: in-sync" "$out" "in-sync"
+mk=$(marking)
+sr=$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s100@200"')
+case "$sr" in
+	*'numgen'*) bad "LB6 single: no draw in the only member rule" "$sr" "no numgen" ;;
+	*'counter meta mark set 200 ct mark set meta mark return'*) ok "LB6 single: unconditional, mark 200, return" ;;
+	*) bad "LB6 single: unconditional, mark 200, return" "$sr" "*mark set 200*return*" ;;
+esac
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s100@200"' && printf '%s\n' "$mk" | grep -c 'comment "wg:lb:s[0-9]' | grep -q '^1$' \
+	&& ok "LB6 single: exactly one member rule" || bad "LB6 single: exactly one member rule" "$(printf '%s\n' "$mk" | grep -c 'comment "wg:lb:s[0-9]')" "1"
+rip rule show | grep -q '8101:.*lookup 401' && ok "LB6 single: slot 8101/401 present" || bad "LB6 single: slot 8101/401 present" "$(rip rule show)" "*8101*401*"
+rip rule show | grep -qE '810[23]:' && bad "LB6 single: no second slot" "$(rip rule show)" "no 8102/8103" || ok "LB6 single: no second slot"
+case "$(rip route show table 401 | grep '^default')" in *'dev eth0'*) ok "LB6 single: table 401 -> eth0" ;; *) bad "LB6 single: table 401 -> eth0" "$(rip route show table 401)" "*dev eth0*" ;; esac
+
+# --- LB7: three members, default weights: buckets 33/33/34 -> 200/400/500 ---
+lb_reset; conf_lb3
+out=$(rapply); case "$out" in applied*) ok "LB7 three: applied" ;; *) bad "LB7 three: applied" "$out" "applied*" ;; esac
+mk=$(marking)
+t1=$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s33@200"')
+t2=$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s66@400"')
+t3=$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s100@500"')
+case "$t1" in *'numgen random mod 100 < 33'*) ok "LB7 member 1 draws < 33" ;; *) bad "LB7 member 1 draws < 33" "$t1" "*< 33*" ;; esac
+case "$t2" in *'numgen random mod 100 < 66'*) ok "LB7 member 2 draws < 66" ;; *) bad "LB7 member 2 draws < 66" "$t2" "*< 66*" ;; esac
+case "$t3" in *numgen*) bad "LB7 member 3: unconditional remainder" "$t3" "no numgen" ;; *) ok "LB7 member 3: unconditional remainder" ;; esac
+h1=$(handle_of "$t1"); h2=$(handle_of "$t2"); h3=$(handle_of "$t3")
+if [ -n "$h1" ] && [ -n "$h2" ] && [ -n "$h3" ] && [ "$h1" -lt "$h2" ] && [ "$h2" -lt "$h3" ]; then
+	ok "LB7 cascade order 33($h1) < 66($h2) < remainder($h3)"
+else
+	bad "LB7 cascade order 33($h1) < 66($h2) < remainder($h3)" "$h1 $h2 $h3" "ordered"
+fi
+rip rule show | grep -q '8103:.*fwmark 0x1f4.*lookup 403' && ok "LB7 third slot 8103/0x1f4/403" || bad "LB7 third slot 8103/0x1f4/403" "$(rip rule show)" "*8103*0x1f4*403*"
+out=$(rapply); assert_eq "LB7 three: in-sync" "$out" "in-sync"
+
+# --- LB8: groupdel -> orphan cleanup of BOTH slots, witness intact ---
+lb_reset; conf_lb2
+rapply >/dev/null
+uci delete wanguard.lb
+uci commit wanguard
+out=$(rapply); case "$out" in applied*) ok "LB8 delete: applied" ;; *) bad "LB8 delete: applied" "$out" "applied*" ;; esac
+mk=$(marking)
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:' && bad "LB8 no wg:lb: rules survive" "$(printf '%s\n' "$mk" | grep 'wg:lb:' | head -n 1)" "none" || ok "LB8 no wg:lb: rules survive"
+rnft list set inet wanguard mac_lb >/dev/null 2>&1 && bad "LB8 mac_lb set deleted" "still there" "removed" || ok "LB8 mac_lb set deleted"
+rip rule show | grep -qE '810[12]:' && bad "LB8 slot ip rules deleted" "$(rip rule show)" "no 8101/8102" || ok "LB8 slot ip rules deleted"
+[ -s "$RIP/route.401" ] && bad "LB8 table 401 flushed" "$(rip route show table 401)" "empty" || ok "LB8 table 401 flushed"
+[ -s "$RIP/route.402" ] && bad "LB8 table 402 flushed" "$(rip route show table 402)" "empty" || ok "LB8 table 402 flushed"
+printf '%s\n' "$mk" | grep -q 'comment "wg:a:m100"' && ok "LB8 witness rule intact" || bad "LB8 witness rule intact" "$mk" "*wg:a:m100*"
+case "$(rip route show table 400 | grep '^default')" in *'dev eth2'*) ok "LB8 witness table intact" ;; *) bad "LB8 witness table intact" "$(rip route show table 400)" "*dev eth2*" ;; esac
+out=$(rapply); assert_eq "LB8 post-delete: in-sync" "$out" "in-sync"
+
+# --- LB9: member SHRINK (3 -> 2): the dropped slot is cleaned precisely,
+# the remaining slots keep their keyed marks, cascade re-renders in order ---
+lb_reset; conf_lb3
+rapply >/dev/null
+uci del_list wanguard.lb.member_iface='wan3'
+uci commit wanguard
+out=$(rapply); case "$out" in applied*) ok "LB9 shrink: applied" ;; *) bad "LB9 shrink: applied" "$out" "applied*" ;; esac
+mk=$(marking)
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s100@500"' && bad "LB9 dropped-slot rule s100@500 gone" "still there" "removed" || ok "LB9 dropped-slot rule s100@500 gone"
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s33@200"' && bad "LB9 re-keyed old tag s33@200 gone" "still there" "removed" || ok "LB9 re-keyed old tag s33@200 gone"
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s50@200"' && ok "LB9 renormalized tag s50@200" || bad "LB9 renormalized tag s50@200" "$mk" "*wg:lb:s50@200*"
+printf '%s\n' "$mk" | grep -q 'comment "wg:lb:s100@400"' && ok "LB9 remainder s100@400" || bad "LB9 remainder s100@400" "$mk" "*wg:lb:s100@400*"
+sf1=$(handle_of "$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s50@200"')")
+sf2=$(handle_of "$(printf '%s\n' "$mk" | grep 'comment "wg:lb:s100@400"')")
+if [ -n "$sf1" ] && [ -n "$sf2" ] && [ "$sf1" -lt "$sf2" ]; then
+	ok "LB9 post-shrink order: draw($sf1) < remainder($sf2)"
+else
+	bad "LB9 post-shrink order: draw($sf1) < remainder($sf2)" "$sf1 $sf2" "ordered"
+fi
+rip rule show | grep -qE '8103:' && bad "LB9 orphan slot rule 8103 deleted" "$(rip rule show)" "no 8103" || ok "LB9 orphan slot rule 8103 deleted"
+[ -s "$RIP/route.403" ] && bad "LB9 orphan table 403 flushed" "$(rip route show table 403)" "empty" || ok "LB9 orphan table 403 flushed"
+rip rule show | grep -q '8101:.*fwmark 0xc8.*lookup 401' && ok "LB9 kept slot wan1 200/401 intact" || bad "LB9 kept slot wan1 200/401 intact" "$(rip rule show)" "*8101*0xc8*401*"
+printf '%s\n' "$mk" | grep -q 'comment "wg:a:m100"' && ok "LB9 witness intact" || bad "LB9 witness intact" "$mk" "*wg:a:m100*"
+
+# --- LB10: #27 boundary — proxy and witness untouched by the LB cascade ---
+lb_reset; conf_lbpx
+rapply >/dev/null
+mk=$(marking)
+pr=$(printf '%s\n' "$mk" | grep 'comment "wg:p:m300"')
+case "$pr" in
+	*'meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set 300'*) ok "LB10 proxy rule shape unchanged (no cascade involvement)" ;;
+	*) bad "LB10 proxy rule shape unchanged" "$pr" "*l4proto != tcp*mark set 300*" ;;
+esac
+rd=$(rnft -a list chain inet wanguard redir)
+printf '%s\n' "$rd" | grep -q 'comment "wg:p:r7892"' && ok "LB10 redir rule intact" || bad "LB10 redir rule intact" "$rd" "*wg:p:r7892*"
+printf '%s\n' "$mk" | grep 'comment "wg:lb:' | grep -q '@300' && bad "LB10 no cascade rule carries mark 300" "found" "none" || ok "LB10 no cascade rule carries mark 300"
+prh=$(handle_of "$pr"); wh=$(handle_of "$(printf '%s\n' "$mk" | grep 'comment "wg:a:m100"')")
+uci_set lb.weight_wan1 '30'
+uci_set lb.weight_wan2 '70'
+out=$(rapply); case "$out" in applied*) ok "LB10 flip: applied" ;; *) bad "LB10 flip: applied" "$out" "applied*" ;; esac
+mk=$(marking)
+[ "$(handle_of "$(printf '%s\n' "$mk" | grep 'comment "wg:p:m300"')")" = "$prh" ] \
+	&& ok "LB10 proxy rule handle untouched by the flip" || bad "LB10 proxy rule handle untouched by the flip" "$(printf '%s\n' "$mk" | grep 'wg:p:m300')" "handle $prh"
+[ "$(handle_of "$(printf '%s\n' "$mk" | grep 'comment "wg:a:m100"')")" = "$wh" ] \
+	&& ok "LB10 witness rule handle untouched by the flip" || bad "LB10 witness rule handle untouched by the flip" "$(printf '%s\n' "$mk" | grep 'wg:a:m100')" "handle $wh"
+out=$(rapply); assert_eq "LB10 post-flip: in-sync" "$out" "in-sync"
+
+echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$TMP" "$WAND"
 [ "$FAIL" = 0 ]

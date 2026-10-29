@@ -36,6 +36,65 @@
  * after the retirement, by stage5/contract-gate.sh (golden bytes vs the
  * frozen contract, no sh involved).
  *
+ * direct-lb (#27 adopt -> #38 impl): load balancing between WANs for
+ * direct groups — the mwan3 idea (weights + per-flow stickiness via
+ * conntrack), lab-proven in spike/lb (docs/spike-lb/, LAB-ALL-GREEN,
+ * VERDICT.md ADOPT 2026-10-29). Delta vs the stage-5 renderer above,
+ * everything else byte-identical:
+ *
+ *   - new group type 'direct-lb': option type 'direct-lb',
+ *     list member_iface (sorted members; slot = sorted position),
+ *     option weight_<iface> (absent/garbage/0 -> 50; normalized to
+ *     buckets mod 100, remainder to the last member).
+ *
+ *   - alloc_entries(): a direct-lb group expands into N slots (one per
+ *     member), each slot = an ordinary (mark, table, prio) from the SAME
+ *     allocator — so reconcile_rules/reconcile_routes, the metric-200
+ *     fallback and orphan cleanup work unchanged. Slots are keyed by
+ *     SORTED member name: marks/tables are STABLE across weight edits
+ *     and re-renders (established flows keep their mark; only member
+ *     add/remove re-keys a member — a deliberate restructure, class #24).
+ *
+ *   - desired_rules(): per LB group 1+N rules instead of per-slot marks.
+ *     stick (tag wg:<g>:stick): restore ct mark + return — established
+ *     flows keep their egress. members (tag wg:<g>:s<cut>@<mark>): a
+ *     numgen-random CASCADE — rule i takes `numgen random mod 100 < cut`
+ *     of the remaining share, the LAST member is the unconditional
+ *     remainder (no draw; also sidesteps nft's rejection of `< 100`).
+ *     Each new flow's first packet draws once, the conntrack pin keeps
+ *     it there. TWO LIVE LAB FINDINGS (spike sessions 1-2, nft 1.1.6 +
+ *     the 25.12 kernel) shape this code:
+ *       1. every member rule MUST end with `return` — a rule without a
+ *          verdict does NOT stop traversal; the unconditional last rule
+ *          overwrote all earlier marks and 100% of flows funneled into
+ *          the last member. jhash was REJECTED entirely: its concat
+ *          input registers are clobbered by any preceding expression
+ *          (set lookups, iifname, meta mark match) — interval maps,
+ *          range forms and gated relationals all degenerate on this
+ *          nft/kernel; numgen draws from prandom and is immune (owner
+ *          confirmed the jhash withdrawal, 2026-10-29).
+ *       2. LB member cascades are ORDER-SENSITIVE: `add rule` APPENDS at
+ *          the chain end, so a tag-diff swap of ONE member rule (weight
+ *          flip) placed the draw rule AFTER the unconditional remainder
+ *          and every flow funneled into the last member. If ANY member
+ *          tag of a group changes, apply() re-renders that group's
+ *          WHOLE cascade: appending the members back in slot order
+ *          rebuilds the order (stick never moves — its tag/body are
+ *          constant; disjoint MAC sets make cross-group order inert).
+ *
+ *   - apply(): type validation accepts 'direct-lb'; set creation and
+ *     element diffs dedupe by group (N slots share ONE mac_<g> set).
+ *
+ *   - tick() is UNTOUCHED in #38: member failover (wand_wans watching
+ *     LB members, list member_live, lbover events, the per-member #24
+ *     flush) lands with issue #39. The render path already honors a
+ *     hand-set member_live; until #39 writes it, slots render the
+ *     declared members.
+ *
+ * Lab: docs/spike-lb/lab/ (topology of spike-ucode #30 + a lan bridge
+ * with a client container; L1 render battery runs against THIS file —
+ * the #38 acceptance vehicle `lab-up.sh up-prod`).
+ *
  * PROBE NOTE (spike finding, Step 1.3): uclient.so exposes
  * new(url,auth,cb)/set_timeout/request/status but libuclient has NO
  * interface/device binding (no SO_BINDTODEVICE anywhere, uclient-fetch
@@ -194,9 +253,25 @@ function probe(wan, dev, map) { // >= reliability anchors answered?
 
 // ---------- watched WANs + backup selection (#26) ----------
 
+function lb_member_ifcs(g) { // sorted member iface names of an LB group
+	// EARLY helper: ucode does not hoist declarations here, so callers
+	// that execute before lb_members()'s line use this one (the apply
+	// path via lb_members; the tick LB phase of #39 will do the same —
+	// weights are irrelevant on those paths)
+	let raw = cursor.get(CONF, g, 'member_iface');
+	if (type(raw) == 'string') // single-element list tolerance
+		raw = (trim(raw) != '') ? [ raw ] : null;
+	if (type(raw) != 'array')
+		return [];
+	return sort(raw);
+}
+
 function wand_wans() { // distinct CURRENT+HOME of direct groups, sorted:
 	// homes MUST be probed — else a failed-over group's dead home could
 	// never be seen recovering (live bug 2026-10-13)
+	// NB (#39): LB members join the watch list together with the tick
+	// LB phase — an unwatched member's slot could neither fail over nor
+	// fail back
 	let wans = [];
 	for (let g in direct_ids()) {
 		let ifc = group_opt(g, 'iface');
@@ -475,6 +550,36 @@ function ensure_table() { // skeleton hallmark: the local_v4 set
 	return sh_rc(`nft -f ${NFT_FILE}`) == 0;
 }
 
+// ---------- direct-lb helpers (#27/#38) ----------
+
+function lb_members(g) { // sorted members [{ ifc, w }]; weights default 50
+	let out = [];
+	for (let ifc in lb_member_ifcs(g)) {
+		let v = group_opt(g, `weight_${ifc}`);
+		let w = int(match(v, /^[0-9]+$/) ? v : '50');
+		push(out, { ifc: ifc, w: (w > 0) ? w : 50 });
+	}
+	return out;
+}
+
+function lb_buckets(w) { // weights -> buckets summing to 100 (floor +
+	let out = [], sum = 0, acc = 0; // remainder to the LAST member)
+	for (let x in w)
+		sum += x;
+	if (sum == 0)
+		sum = 1;
+	for (let i = 0; i < length(w); i++) {
+		if (i == length(w) - 1) {
+			push(out, 100 - acc);
+			break;
+		}
+		let b = (100 * w[i]) / sum; // ucode int division (operands int)
+		push(out, int(b));
+		acc += int(b);
+	}
+	return out;
+}
+
 function alloc_entries() { // [{g, typ, m, t, p, ifc}] (sh alloc_lines)
 	let out = [], nproxy = 0, k = 0;
 	for (let g in group_ids('proxy')) {
@@ -496,12 +601,57 @@ function alloc_entries() { // [{g, typ, m, t, p, ifc}] (sh alloc_lines)
 		push(out, { g: g, typ: 'direct', m: m, t: 400 + k - 1, p: 8100 + k - 1,
 			ifc: group_opt(g, 'iface') });
 	}
+	for (let g in group_ids('direct-lb')) {
+		// #27/#38: one slot per member, keyed by SORTED member name
+		// (marks/tables stable across weight edits — see header)
+		let mem = lb_members(g);
+		if (length(mem) == 0) {
+			warn(`wanguard: lb group '${g}' has no member_iface — ignoring\n`);
+			continue;
+		}
+		if (length(mem) > 20) {
+			warn(`wanguard: lb group '${g}': >20 members — ignoring\n`);
+			continue;
+		}
+		// tick-owned effective iface per slot (#39 starts writing it;
+		// until then slots render the declared member — a hand-set
+		// value is honored)
+		let live = cursor.get(CONF, g, 'member_live');
+		if (type(live) != 'array')
+			live = null;
+		for (let i = 0; i < length(mem); i++) {
+			k++;
+			if (k > 99) {
+				warn(`wanguard: too many group slots (>99), ignoring '${g}' member '${mem[i].ifc}'\n`);
+				break;
+			}
+			let m = 100 * k;
+			if (m >= 300) // 300 = mihomo
+				m += 100;
+			let live_ifc = (live != null && type(live[i]) == 'string' && trim(live[i]) != '') ?
+				live[i] : mem[i].ifc;
+			push(out, { g: g, typ: 'direct-lb', m: m, t: 400 + k - 1, p: 8100 + k - 1,
+				ifc: live_ifc, mi: mem[i].ifc });
+		}
+	}
 	return out;
 }
 
 function desired_rules(alloc, redir) { // [{chain, tag, body}] (sh DRF)
 	let out = [];
+	// #27/#38: collect LB groups (marks by sorted member name) while
+	// walking the alloc; per-slot marking rules are NOT emitted for them
+	let lbg = {};
 	for (let a in alloc) {
+		if (a.typ == 'direct-lb') {
+			let mem = lbg[a.g] ?? [];
+			let w = 50;
+			for (let m in lb_members(a.g))
+				if (m.ifc == a.mi) { w = m.w; break; }
+			push(mem, { ifc: a.mi, m: a.m, w: w });
+			lbg[a.g] = mem;
+			continue;
+		}
 		if (a.typ == 'proxy') {
 			// TCP is handled by the redirect rule and MUST NOT be marked —
 			// after DNAT-to-local a marked packet would be policy-routed
@@ -513,6 +663,61 @@ function desired_rules(alloc, redir) { // [{chain, tag, body}] (sh DRF)
 		} else {
 			push(out, { chain: 'marking', tag: `wg:${a.g}:m${a.m}`,
 				body: `iifname "${BR}" ether saddr @mac_${a.g} ip daddr != @local_v4 ip daddr != @no_mark meta mark set ${a.m}` });
+		}
+	}
+	// #27/#38: one stick + N member rules per LB group, in group order.
+	// stick MUST precede its member rules (restore wins for established
+	// flows); on any re-render the stick tag never changes, so its
+	// position survives, and the member rules re-added by the tag-diff
+	// append AFTER it — order is preserved by construction (mac sets
+	// partition traffic, so cross-group chain order is irrelevant).
+	for (let g in sort(keys(lbg))) {
+		let mem = lbg[g]; // sorted member name order (alloc order)
+		let b = lb_buckets((map(mem, (m) => m.w)));
+		// stick: established flows follow their ct mark and skip the
+		// rest of the chain (base chain return = policy accept);
+		// counter BEFORE return (return ends the rule)
+		push(out, { chain: 'marking', tag: `wg:${g}:stick`,
+			body: `iifname "${BR}" ether saddr @mac_${g} ip daddr != @local_v4 ip daddr != @no_mark ct mark != 0 counter meta mark set ct mark return` });
+		// member selection: NUMGEN RANDOM cascade (mwan3's own approach:
+		// statistic random on NEW + connmark restore). LIVE LAB FINDING
+		// (spike session 1, nft 1.1.6 + the 25.12 kernel): jhash is
+		// UNUSABLE here — its concat input registers are clobbered by
+		// ANY prior expression in the same rule (set lookups, iifname,
+		// meta mark match) AND by lookups executed in earlier rules of
+		// the packet's traversal (a bare jhash in a jump sub-chain still
+		// reads garbage). Manifestations: the anonymous interval map
+		// degenerated to the first bucket, the normalized range form
+		// never matched, the gated relational form always bucket 0.
+		// numgen draws from prandom instead of packet registers — the
+		// full prefix + numgen rules behave honestly (70/30 observed).
+		// CASCADE: rule i takes `numgen random mod 100 < cum_i` of the
+		// REMAINING share, the LAST member needs no draw (it gets the
+		// remainder — also avoids `< 100`, which nft rejects: "Value
+		// 100 exceeds valid range 0-99"). Independent draws are safe
+		// exactly because each rule fires only on the not-yet-taken
+		// remainder. Established flows never reach these rules (stick
+		// above returns them); each new flow's FIRST packet draws once,
+		// the conntrack pin makes the flow stick.
+		// NB (spike session 2, LIVE FINDING): every member rule MUST end
+		// with `return` — a rule without a verdict does NOT stop
+		// traversal, so the packet fell through to the unconditional
+		// LAST rule and its mark OVERWROTE all earlier ones: 100% of
+		// flows funneled into the last member ("numgen random is not
+		// uniform" of the session-1 notes was THIS bug, not the draw).
+		// Lab proof: 40/40 flows mark=400 while rule 1 had drawn <70 on
+		// 29/40 first SYNs (72.5% ≈ the honest 70%) — the draws were
+		// always fine.
+		let acc = 0;
+		for (let i = 0; i < length(mem); i++) {
+			let cut = acc + b[i];
+			let body = `iifname "${BR}" ether saddr @mac_${g} ip daddr != @local_v4 ip daddr != @no_mark `;
+			if (i < length(mem) - 1)
+				body += `numgen random mod 100 < ${cut} `;
+			body += `counter meta mark set ${mem[i].m} ct mark set meta mark return`;
+			push(out, { chain: 'marking', tag: `wg:${g}:s${cut}@${mem[i].m}`,
+				body: body });
+			acc = cut;
 		}
 	}
 	return out;
@@ -693,13 +898,28 @@ function reconcile_routes(alloc) { // -> change count (sh reconcile_routes)
 	return n;
 }
 
+function lb_cascade_group(tag) { // 'wg:<g>:s<cut>@<mark>' -> <g> | null
+	// #27/#38: identifies LB member-cascade rules, whose relative ORDER
+	// in the chain is load-bearing (see the reconcile below).
+	// 'wg:lb:stick' must NOT match (the ':s' tail must be <cut>@<mark>).
+	if (substr(tag, 0, 3) != 'wg:')
+		return null;
+	let rest = substr(tag, 3);
+	let p = index(rest, ':s');
+	if (p == -1)
+		return null;
+	if (match(substr(rest, p + 2), /^[0-9]+@[0-9]+$/) == null)
+		return null;
+	return substr(rest, 0, p);
+}
+
 function apply() {
 	migrate_legacy();
 
 	for (let g in group_ids()) {
 		let t = group_opt(g, 'type');
-		if (t != 'direct' && t != 'proxy')
-			msg(`warning: group '${g}' has no valid type (direct|proxy) — ignored`);
+		if (t != 'direct' && t != 'proxy' && t != 'direct-lb') // #38: lb
+			msg(`warning: group '${g}' has no valid type (direct|direct-lb|proxy) — ignored`);
 	}
 
 	if (!ensure_table())
@@ -714,35 +934,74 @@ function apply() {
 	let have = live_rule_tags();
 	let batch = [];
 
-	// sets: create the wanted ones that are missing
+	// sets: create the wanted ones that are missing (dedupe by group —
+	// #38: a direct-lb group owns N alloc slots but ONE mac_<g> set)
 	let have_sets = live_set_names();
 	let have_set = {};
 	for (let s in have_sets)
 		have_set[s] = 1;
-	for (let a in alloc)
+	let seen_g = {};
+	for (let a in alloc) {
+		if (seen_g[a.g])
+			continue;
+		seen_g[a.g] = 1;
 		if (!(`mac_${a.g}` in have_set))
 			push(batch, `add set ${TABLE} mac_${a.g} { type ether_addr; flags interval; }`);
+	}
 
 	// rule deletions: live tags no longer desired (incl. changed marks)
 	let want_tags = {};
 	for (let w in want)
 		want_tags[`${w.chain} ${w.tag}`] = 1;
-	for (let h in have)
-		if (!(`${h.chain} ${h.tag}` in want_tags))
-			push(batch, `delete rule ${TABLE} ${h.chain} handle ${h.handle}`);
-
-	// rule additions: desired tags not live
 	let have_tags = {};
 	for (let h in have)
 		have_tags[`${h.chain} ${h.tag}`] = 1;
-	for (let w in want)
-		if (!(`${w.chain} ${w.tag}` in have_tags))
-			push(batch, `add rule ${TABLE} ${w.chain} ${w.body} comment "${w.tag}"`);
+	// #27 (spike session 2, LIVE FINDING): LB member cascades are
+	// ORDER-SENSITIVE — the fall-through only balances while stick
+	// precedes the member rules and the members follow in slot order.
+	// `add rule` APPENDS at the chain end, so a tag-diff swap of ONE
+	// member rule (weight flip) moved the draw rule AFTER the
+	// unconditional remainder rule and every flow funneled into the
+	// last member (lab: 60/60 draws mark=400, draw rule 0 packets).
+	// If ANY member rule of a group changes, re-render that group's
+	// WHOLE cascade: appending the members back in slot order rebuilds
+	// the order (stick never moves — its tag/body are constant).
+	let casc = {};
+	for (let w in want) {
+		let g = lb_cascade_group(w.tag);
+		if (g != null && !(`${w.chain} ${w.tag}` in have_tags))
+			casc[g] = 1;
+	}
+	for (let h in have) {
+		let g = lb_cascade_group(h.tag);
+		if (g != null && !(`${h.chain} ${h.tag}` in want_tags))
+			casc[g] = 1;
+	}
+	for (let h in have) {
+		let g = lb_cascade_group(h.tag);
+		if ((g != null && (g in casc)) || !(`${h.chain} ${h.tag}` in want_tags))
+			push(batch, `delete rule ${TABLE} ${h.chain} handle ${h.handle}`);
+	}
 
-	// element diffs, per group in alloc order, then no_mark
-	for (let a in alloc)
-		render_diff(`mac_${a.g}`, desired_group(a.g),
-			sort(current_elements(`mac_${a.g}`)), batch);
+	// rule additions: desired tags not live; cascades re-added whole,
+	// in slot order (append preserves the cascade internally, and the
+	// member rules stay after stick — disjoint MAC sets make their
+	// position relative to OTHER groups irrelevant)
+	for (let w in want) {
+		let g = lb_cascade_group(w.tag);
+		if ((g != null && (g in casc)) || !(`${w.chain} ${w.tag}` in have_tags))
+			push(batch, `add rule ${TABLE} ${w.chain} ${w.body} comment "${w.tag}"`);
+	}
+
+	// element diffs, per group in alloc order, then no_mark (#38: dedupe)
+	let seen_g2 = {};
+	for (let a in alloc) {
+		if (!seen_g2[a.g]) {
+			seen_g2[a.g] = 1;
+			render_diff(`mac_${a.g}`, desired_group(a.g),
+				sort(current_elements(`mac_${a.g}`)), batch);
+		}
+	}
 	let nm_want = [];
 	{
 		let v = cursor.get(CONF, 'globals', 'no_mark');

@@ -150,9 +150,17 @@ do_fixture() {
 		eval "out_$s=\$OUTF out2_$s=\$OUT2F rc_$s=\$RCT batch_$s=\$BATCHF"
 		cp "$TMP/snap.$s" "$TMP/snap.$s.keep"
 	done
-	assert_eq   "$label: stdout parity"       "$out_sh"   "$out_uc"
 	assert_eq   "$label: rc parity"           "$rc_sh"    "$rc_uc"
-	assert_eq   "$label: batch parity"        "$batch_sh" "$batch_uc"
+	# #38: the ucode CLI knows 'direct-lb' (the sh differential reference
+	# does not), so its invalid-type warning line INTENTIONALLY differs —
+	# strip that line from both sides before the byte comparison; the
+	# exact per-side texts are asserted at P14 below
+	assert_eq   "$label: stdout parity (ex type warning)" \
+		"$(printf '%s' "$out_sh" | grep -v 'has no valid type')" \
+		"$(printf '%s' "$out_uc" | grep -v 'has no valid type')"
+	assert_eq   "$label: batch parity (ex type warning)" \
+		"$(printf '%s' "$batch_sh" | grep -v 'has no valid type')" \
+		"$(printf '%s' "$batch_uc" | grep -v 'has no valid type')"
 	assert_eq   "$label: state parity"        "$(cat "$TMP/snap.sh.keep")" "$(cat "$TMP/snap.uc.keep")"
 	if [ -z "$hook" ]; then
 		# the keepalive contract: the SECOND run must not report changes.
@@ -625,8 +633,12 @@ assert_contains "P13: c is proxy"  "$batch_sh" 'wg:c:r7892'
 assert_contains "P13: a mark 100"  "$batch_sh" 'wg:a:m100'
 assert_contains "P13: b mark 200"  "$batch_sh" 'wg:b:m200'
 
-# --- P14 type garbage: warning + ignored ---
+# --- P14 type garbage: warning + ignored.
+# #38: the warning TEXT differs by design — the ucode side enumerates
+# direct-lb (the sh reference predates it); assert both exact texts ---
 do_fixture "P14-type-garbage" f14_type_garbage
+assert_contains "P14: sh warning (pre-#38 text)"        "$out_sh" "(direct|proxy) — ignored"
+assert_contains "P14: uc warning (direct-lb added)"     "$out_uc" "(direct|direct-lb|proxy) — ignored"
 assert_contains "P14: warning"     "$out_sh" "group 'x' has no valid type"
 assert_contains "P14: a rendered"  "$batch_sh" 'wg:a:m100'
 case "$batch_sh" in *"wg:x"*) bad "P14: x not rendered" "leaked" "ignored" ;; *) ok "P14: x not rendered" ;; esac

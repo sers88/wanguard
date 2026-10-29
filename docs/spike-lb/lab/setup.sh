@@ -1,24 +1,35 @@
 #!/bin/sh
 # setup.sh — in-container bootstrap for the SPIKE #27 Docker lab:
-# installs the spike package (wanguard-lb), writes the router-shaped UCI
+# installs the package under test, writes the router-shaped UCI
 # config with a direct group AND a direct-lb group, starts real ubusd +
 # fake-netifd, creates the nft table, and builds br-lan (eth3 enslaved —
 # the LAN side the marking rules match on) + LAN->WAN masquerade in a
 # SEPARATE spike table (never in table inet wanguard).
 # Runs INSIDE wanguard-lab.
+#
+# WG_PKG=spike (default): the LB spike package (wanguard-lb — /usr/bin/
+# wanguard = wand-lb.uc). WG_PKG=prod: the PRODUCTION package (stock
+# apk/build.sh — /usr/bin/wanguard = docs/spike-ucode/wand.uc), the #38
+# acceptance vehicle for the L1 battery against production.
 set -eu
 mkdir -p /var/run /etc/config /tmp/lab
 
 # deps; ucode itself is preinstalled in 25.12.5
 apk add --quiet nftables ip-full conntrack curl iptables >/dev/null 2>&1
 
-# spike package: /usr/bin/wanguard = wand-lb.uc (direct-lb renderer)
+# package under test
 if [ ! -s /tmp/apk.dl ]; then
 	cp /tmp/apk.static /tmp/apk.dl
 	chmod +x /tmp/apk.dl
 fi
-sh /repo/docs/spike-lb/build-lb-spike.sh /repo /tmp/apk.dl 0.0.0-r99 /tmp/out >/dev/null
-apk add --quiet --allow-untrusted /tmp/out/wanguard-lb-0.0.0-r99.apk >/dev/null
+if [ "${WG_PKG:-spike}" = prod ]; then
+	sh /repo/apk/build.sh /repo /tmp/apk.dl 0.0.0-r99 /tmp/out >/dev/null
+	apk add --quiet --allow-untrusted /tmp/out/wanguard-0.0.0-r99.apk >/dev/null
+	echo "lab: PROD package installed ($(ucode /usr/bin/wanguard help >/dev/null 2>&1 && echo native))"
+else
+	sh /repo/docs/spike-lb/build-lb-spike.sh /repo /tmp/apk.dl 0.0.0-r99 /tmp/out >/dev/null
+	apk add --quiet --allow-untrusted /tmp/out/wanguard-lb-0.0.0-r99.apk >/dev/null
+fi
 
 # the router config: one direct group (wan3, regression witness: its
 # rendering must be byte-identical to the pre-spike shape) + one LB group

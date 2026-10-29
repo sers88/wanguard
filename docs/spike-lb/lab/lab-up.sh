@@ -32,7 +32,7 @@
 # pairs (dst is local on another NIC), killing the honest-timeout
 # property the whole lab verdict method rests on.
 #
-# Usage: lab-up.sh net|client|up|shell|client-shell|L1|L2|all|down
+# Usage: lab-up.sh net|client|up|up-prod|shell|client-shell|L1|L2|all|down
 set -eu
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"   # /repo = repo root (in-container)
 HOSTREPO="$(cd "$(dirname "$0")/../../.." && pwd)" # host path of the repo
@@ -118,8 +118,14 @@ client)
 		ip -o link show eth0 | grep -q "aa:bb:cc:dd:ee:55" || ip link set dev eth0 address aa:bb:cc:dd:ee:55'
 	docker exec $CLIENT sh -c 'ip -o link show eth0 | grep -q aa:bb:cc:dd:ee:55 && ip route | grep -q "default via 198.18.0.2" && echo client: ok'
 ;;
-up)
-	# rebuild the spike package + install it into the lab container
+up|up-prod)
+	# `up` installs the LB SPIKE package (wanguard-lb, build-lb-spike.sh);
+	# `up-prod` installs the PROD package instead (stock apk/build.sh —
+	# /usr/bin/wanguard = docs/spike-ucode/wand.uc byte-identically):
+	# the #38 acceptance vehicle — the L1 battery runs against
+	# production, not the spike
+	flav=spike
+	[ "$1" = up-prod ] && flav=prod
 	docker rm -f $LAB 2>/dev/null || true
 	docker run -d --name $LAB --cap-add=NET_ADMIN --network wanA --ip 203.0.113.2 \
 		--sysctl net.ipv4.ip_forward=1 \
@@ -129,7 +135,7 @@ up)
 	docker network connect --ip 198.51.100.2 wanB $LAB
 	docker network connect --ip 192.0.2.2 wanC $LAB
 	docker network connect --ip 198.18.0.2 lan $LAB
-	docker exec $LAB sh /repo/$LB/setup.sh
+	docker exec -e WG_PKG="$flav" $LAB sh /repo/$LB/setup.sh
 ;;
 shell)
 	docker exec -it $LAB sh
