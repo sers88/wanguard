@@ -336,7 +336,10 @@ const L = {
 		const pre = Array.prototype.slice.call(arguments, 2);
 		return function() { return fn.apply(scope, pre.concat(Array.prototype.slice.call(arguments))); };
 	},
-	isArray: Array.isArray,
+	/* NB: deliberately MINIMAL — the real luci.js exposes no isArray
+	 * (only the builtin Array.isArray), so the stub must not either;
+	 * stub-API divergence is exactly what live window findings are
+	 * made of (L.isArray hit the router, 2026-10-30). */
 	isObject: (o) => !!o && typeof o === 'object'
 };
 const _ = (s) => s;

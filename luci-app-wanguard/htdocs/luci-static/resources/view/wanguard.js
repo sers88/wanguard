@@ -114,7 +114,7 @@ function allocPreview(sid) {
 /* UCI list option as array (tolerates the single-string form) */
 function listOpt(sid, opt) {
 	var v = uci.get('wanguard', sid, opt);
-	if (L.isArray(v))
+	if (Array.isArray(v))
 		return v.filter(function(x) { return x != null && '' + x != ''; });
 	return (v != null && '' + v != '') ? [ '' + v ] : [];
 }
