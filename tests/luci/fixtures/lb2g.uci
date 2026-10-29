@@ -1,0 +1,19 @@
+config globals 'globals'
+
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	option weight_wan1 '70'
+	option weight_wan2 '30'
+
+config group 'lb2'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan3'
+	option weight_wan1 '60'
+	option weight_wan3 '40'

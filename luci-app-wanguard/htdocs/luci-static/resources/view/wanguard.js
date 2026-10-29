@@ -8,6 +8,13 @@
  * Drop applies instantly (uci save -> apply -> confirm, no modal); tap on a
  * card is the touch/keyboard fallback ("Move to" menu). Table view (#8)
  * stays for bulk edits — toggle on top, persisted in localStorage.
+ *
+ * direct-lb groups (issue #40): board columns show the UCI-derived slot
+ * plan (sorted member_iface, weights, mark/table — the same cascade as
+ * the CLI allocator), enriched with device state from `wanguard grouplist`
+ * when the installed CLI is new enough. Member interfaces and their
+ * weight_<iface> options are edited in the group modal; inactive weight
+ * fields auto-remove stray options on save (form.js parse semantics).
  */
 'use strict';
 'require view';
@@ -81,6 +88,8 @@ function allocPreview(sid) {
 		return '';
 	if (g.type == 'proxy')
 		return 'fwmark 300 → table 500 (fixed)';
+	if (g.type == 'direct-lb')
+		return lbPreview(sid);
 	var names = (uci.sections('wanguard', 'group') || [])
 		.filter(function(s) { return s.type == 'direct'; })
 		.map(function(s) { return s['.name']; })
@@ -94,6 +103,113 @@ function allocPreview(sid) {
 	return 'fwmark %d → table %d'.format(mark, 400 + k - 1);
 }
 
+/* ---------- direct-lb helpers (issue #40) ----------
+ * JS mirror of the CLI allocator (wand.uc alloc_entries, LB branch):
+ * a direct-lb group expands into one slot per SORTED member_iface, the
+ * numeric cascade continues after all direct groups (proxy occupies no
+ * slot), marks >= 300 skip the mihomo mark, >20 members or a slot
+ * number > 99 drops/truncates the group exactly like the CLI. Pinned
+ * against the ucode mock numbers by tests/luci. */
+
+/* UCI list option as array (tolerates the single-string form) */
+function listOpt(sid, opt) {
+	var v = uci.get('wanguard', sid, opt);
+	if (L.isArray(v))
+		return v.filter(function(x) { return x != null && '' + x != ''; });
+	return (v != null && '' + v != '') ? [ '' + v ] : [];
+}
+
+function lbMembers(sid) { /* sorted member iface names */
+	return listOpt(sid, 'member_iface').map(function(s) { return '' + s; }).sort();
+}
+
+function lbWeight(sid, ifc) { /* CLI rule: absent/garbage/0 -> 50 */
+	var v = uci.get('wanguard', sid, 'weight_' + ifc);
+	v = (v != null) ? '' + v : '';
+	if (!/^[0-9]+$/.test(v))
+		return 50;
+	var w = parseInt(v, 10);
+	return (w > 0) ? w : 50;
+}
+
+function lbBuckets(w) { /* CLI lb_buckets: floor + remainder to LAST */
+	var out = [], sum = 0, acc = 0;
+	for (var i = 0; i < w.length; i++)
+		sum += w[i];
+	if (sum == 0)
+		sum = 1;
+	for (i = 0; i < w.length; i++) {
+		if (i == w.length - 1) {
+			out.push(100 - acc);
+			break;
+		}
+		var b = Math.floor((100 * w[i]) / sum);
+		out.push(b);
+		acc += b;
+	}
+	return out;
+}
+
+function lbSlotMap() { /* { group: { slots: [...], note: '' } } */
+	var secs = (uci.sections('wanguard', 'group') || []);
+	var k = secs.filter(function(s) { return s.type == 'direct'; })
+		.map(function(s) { return s['.name']; }).sort().length;
+	var out = {};
+	secs.filter(function(s) { return s.type == 'direct-lb'; })
+		.map(function(s) { return s['.name']; }).sort()
+		.forEach(function(name) {
+			var mem = lbMembers(name);
+			if (!mem.length || mem.length > 20) {
+				out[name] = { slots: [], note: !mem.length ? 'no members — ignored' : '>20 members — ignored' };
+				return;
+			}
+			var live = listOpt(name, 'member_live'); /* tick-owned (#39) */
+			var slots = [];
+			for (var i = 0; i < mem.length; i++) {
+				k++;
+				if (k > 99) {
+					out[name] = { slots: slots, note: '>99 slots — truncated' };
+					return;
+				}
+				var m = 100 * k;
+				if (m >= 300) /* 300 = mihomo */
+					m += 100;
+				var li = (live[i] != null && '' + live[i] != '') ? '' + live[i] : mem[i];
+				slots.push({ iface: li, member: mem[i], mark: m, table: 400 + k - 1, weight: lbWeight(name, mem[i]) });
+			}
+			/* the displayed % is the EFFECTIVE bucket (what the nft draw
+			 * rules render: numgen mod 100 < bucket), not the raw weight */
+			var b = lbBuckets(slots.map(function(s) { return s.weight; }));
+			for (i = 0; i < slots.length; i++)
+				slots[i].b = b[i];
+			out[name] = { slots: slots, note: '' };
+		});
+	return out;
+}
+
+/* `wanguard grouplist` rows for direct-lb groups (authoritative device
+ * state), refreshed in load()/reloadState(); empty on old CLIs */
+var LB_GROUPLIST = {};
+
+function lbPreview(sid) {
+	var plan = lbSlotMap()[sid] || {};
+	if (!(plan.slots || []).length)
+		return (plan.note) ? '— (%s)'.format(plan.note) : '—';
+	var cli = LB_GROUPLIST[sid] || [];
+	var parts = plan.slots.map(function(s) {
+		/* failed-over slot: "declared→live" (member_live, tick #39) */
+		var ifc = (s.iface != s.member) ? '%s→%s'.format(s.member, s.iface) : s.iface;
+		var txt = '%s %d%% %d/%d'.format(ifc, s.b, s.mark, s.table);
+		for (var j = 0; j < cli.length; j++)
+			if (cli[j].mark == s.mark && cli[j].device) {
+				txt += ' (%s)'.format(cli[j].device);
+				break;
+			}
+		return txt;
+	});
+	return parts.join(' · ');
+}
+
 function groupChoices() {
 	var out = [];
 	(uci.sections('wanguard', 'group') || []).forEach(function(g) {
@@ -102,7 +218,9 @@ function groupChoices() {
 		if (g.type == 'proxy') {
 			if (lbl != 'mihomo')
 				lbl += ' — mihomo';
-		} else if (g.iface != lbl)
+		} else if (g.type == 'direct-lb')
+			lbl += ' — LB';
+		else if (g.iface != lbl)
 			lbl += ' — ' + (g.iface || '?');
 		out.push([ g['.name'], lbl ]);
 	});
@@ -144,7 +262,8 @@ return view.extend({
 			callLeaseFile('/tmp/dhcp.leases').catch(function() { return ''; }),
 			callWanguard('/usr/bin/wanguard', [ 'list' ]).catch(function() { return null; }),
 			callIfaceDump().catch(function() { return null; }),
-			callWanguard('/usr/bin/wanguard', [ 'devices' ]).catch(function() { return null; })
+			callWanguard('/usr/bin/wanguard', [ 'devices' ]).catch(function() { return null; }),
+			callWanguard('/usr/bin/wanguard', [ 'grouplist' ]).catch(function() { return null; })
 		]).then(L.bind(function(data) {
 			/* /tmp/dhcp.leases lines: "expiry mac ip hostname clientid" */
 			this.leases = (data[1] || '').split('\n').map(function(line) {
@@ -176,6 +295,10 @@ return view.extend({
 					.sort();
 			else
 				this.ifaces = [];
+
+			/* `wanguard grouplist` (#40): authoritative device state for
+			 * direct-lb slots; empty on CLIs without direct-lb support */
+			LB_GROUPLIST = this.parseGrouplist((data[5] && data[5].stdout) || '');
 		}, this));
 	},
 
@@ -187,6 +310,27 @@ return view.extend({
 			return { mac: f[0], ip: (f[1] == '-' ? '' : f[1]), name: (f[2] == '-' ? '' : f[2]), online: (f[3] == '1') };
 		}).filter(function(d) { return d && normalizeMac(d.mac); });
 	},
+
+	parseGrouplist: function(out) {
+		/* `wanguard grouplist` (issue #40): columns are
+		 * GROUP TYPE IFACE MARK TABLE DEVICE MEMBERS(count); only the
+		 * direct-lb rows are needed (direct/proxy previews are computed
+		 * from UCI as before). Degrades to {} on old CLIs (no rows). */
+		var rows = {};
+		(out || '').split('\n').forEach(function(line) {
+			var f = line.trim().split(/\s+/);
+			if (f.length < 7 || f[0] == 'GROUP' || f[1] != 'direct-lb')
+				return;
+			(rows[f[0]] = rows[f[0]] || []).push({
+				iface: f[2], mark: parseInt(f[3], 10), table: f[4], device: f[5]
+			});
+		});
+		return rows;
+	},
+
+	/* exposed for the tests/luci harness (same code paths the board and
+	 * the _alloc grid column use) */
+	allocPreview: allocPreview,
 
 	parseStatus: function(res) {
 		if (res && res.stdout) {
@@ -275,7 +419,9 @@ return view.extend({
 			if (g.type == 'proxy') {
 				if (g.name != 'mihomo')
 					lbl += ' — mihomo';
-			} else if (g.iface != g.name)
+			} else if (g.type == 'direct-lb')
+				lbl += ' — LB';
+			else if (g.iface != g.name)
 				lbl += ' — ' + (g.iface || '?');
 			return { name: g.name, label: lbl };
 		});
@@ -570,6 +716,9 @@ return view.extend({
 				if (inv.length)
 					self.inventory = inv;
 			}).catch(function() {}),
+			callWanguard('/usr/bin/wanguard', [ 'grouplist' ]).then(function(res) {
+				LB_GROUPLIST = self.parseGrouplist((res && res.stdout) || '');
+			}).catch(function() {}),
 			this.refreshStatus(this._statusNode)
 		]).then(function() {
 			self.rebuildBoard();
@@ -706,13 +855,15 @@ return view.extend({
 		groups.modaltitle = _('Group');
 		groups.description = _('Group names: letters/digits/underscore (members reference this name). Marks and ' +
 			'routing tables are allocated automatically from the sorted direct-group names: proxy = 300/500 fixed, ' +
-			'direct = 100,200,400,… → tables 400,401,… Renaming = create new + move members + delete.');
+			'direct = 100,200,400,… → tables 400,401,…; direct-lb = one slot per SORTED member_iface, same cascade, ' +
+			'weights via weight_<iface> (0/empty = 50). Renaming = create new + move members + delete.');
 
 		o = groups.option(form.DummyValue, '_alloc', _('Allocation'));
 		o.cfgvalue = function(sid) { return allocPreview(sid); };
 
 		o = groups.option(form.ListValue, 'type', _('Type'));
 		o.value('direct', _('direct — via netifd interface'));
+		o.value('direct-lb', _('direct-lb — load balance across member interfaces'));
 		o.value('proxy', _('proxy — via mihomo (singleton)'));
 		o.rmempty = false;
 		o.default = 'direct';
@@ -736,6 +887,55 @@ return view.extend({
 			if (!Object.keys(seen).length)
 				o.value('', _('(interface list unavailable — check ACL/ubus)'));
 		}
+
+		/* direct-lb members/weights live in the modal only (#40): the grid
+		 * rows keep the direct/proxy layout unchanged, and GridSection.save
+		 * skips modal-only options, so staging stays untouched until the
+		 * modal itself is saved. addModalOptions is called after the modal
+		 * clone — the fields are rebuilt from live UCI on every open, so a
+		 * member added mid-session gets its weight field right away. */
+		groups.addModalOptions = function(s, sid) {
+			var sec = uci.get('wanguard', sid);
+			if (!sec || sec.type != 'direct-lb')
+				return;
+
+			var cur = lbMembers(sid);
+			var names = (self.ifaces || []).slice();
+			if (!names.length) {
+				/* ACL/ubus degraded: fall back to ifaces referenced by groups */
+				(uci.sections('wanguard', 'group') || []).forEach(function(g) {
+					if (g.iface && names.indexOf(g.iface) == -1)
+						names.push(g.iface);
+				});
+			}
+			cur.forEach(function(m) {
+				if (names.indexOf(m) == -1)
+					names.push(m);
+			});
+			names.sort();
+
+			var o = s.option(form.MultiValue, 'member_iface', _('Member interfaces'));
+			o.modalonly = true;
+			o.rmempty = false;
+			o.description = _('WAN interfaces to balance across. Slots are allocated by the SORTED list — ' +
+				'adding/removing a member renumbers the group\'s slots (flush of established flows, #24).');
+			names.forEach(function(n) { o.value(n, n); });
+
+			/* one weight field per candidate iface; visible (and written)
+			 * only while the iface is staged as a member of THIS group —
+			 * 'direct-lb' matches via substring containment of itself, and
+			 * unchecking the member makes the field inactive, which removes
+			 * its stray weight option on save (form.js parse semantics) */
+			names.forEach(function(n) {
+				var w = s.option(form.Value, 'weight_' + n, _('Weight %s').format(n));
+				w.modalonly = true;
+				w.datatype = 'uinteger';
+				w.placeholder = '50';
+				w.rmempty = true;
+				w.description = _('Relative share of this member (%). Empty or 0 = 50.');
+				w.depends({ type: 'direct-lb', member_iface: n, '!contains': true });
+			});
+		};
 
 		/* deleting a group that still has members would silently drop them
 		 * to the main table (fail-safe, but a surprise) — the CLI refuses

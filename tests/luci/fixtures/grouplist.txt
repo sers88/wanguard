@@ -1,0 +1,4 @@
+GROUP      TYPE    IFACE      MARK  TABLE DEVICE         MEMBERS
+a          direct  wan3       100   400   eth2           0
+lb         direct-lb wan1     200   401   eth0           1
+lb         direct-lb wan2     400   402   eth1           1

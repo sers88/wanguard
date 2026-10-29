@@ -1,0 +1,16 @@
+config globals 'globals'
+
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+
+config group 'b'
+	option type 'direct'
+	option iface 'wan1'
+
+config group 'c'
+	option type 'direct'
+	option iface 'wan2'
+
+config group 'p'
+	option type 'proxy'

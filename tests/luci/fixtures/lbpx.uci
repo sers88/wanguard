@@ -1,0 +1,15 @@
+config globals 'globals'
+
+config group 'p'
+	option type 'proxy'
+
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	option weight_wan1 '70'
+	option weight_wan2 '30'

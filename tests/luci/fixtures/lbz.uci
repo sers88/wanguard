@@ -1,0 +1,18 @@
+config globals 'globals'
+
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	option weight_wan1 '70'
+	option weight_wan2 '30'
+	list member_live 'wan2'
+
+config member
+	option mac 'aa:bb:cc:dd:ee:55'
+	option group 'lb'
+	option name 'client'
