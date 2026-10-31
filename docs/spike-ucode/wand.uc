@@ -167,6 +167,71 @@ function state_int(name) {
 	return int(match(s, /^[0-9]+$/) ? s : '0');
 }
 
+// ---------- diagnostics data plane: wand state + event ring (#44) ----------
+//
+// tmpfs UI feed for the LuCI status badge / Diagnostics page (issue #44):
+// a bounded event ring and the last-successful-apply stamp, next to the
+// existing wand state files. NOT a syslog replacement (#21) — the ring
+// lives in WAND_DIR and is lost on reboot by design; keepalive's logger
+// pipe stays the durable record. Every write is BEST-EFFORT: a ring
+// failure must never break the tick -> apply -> flush path, hence the
+// catch-all and the atomic tmp+rename persist.
+// NB: declared here, BEFORE tick()/apply()/wanflush() — ucode does not
+// hoist function declarations, the whole file is define-before-use.
+
+const EVENTS_MAX = 200; // ring clamp (lines; ~weeks of incident events,
+let ev_seq = 0;         // one heartbeat line per apply-outcome change)
+
+function state_dir() { // WAND_DIR may not exist before the first tick
+	if (!fs.access(WAND_DIR))
+		fs.mkdir(WAND_DIR);
+}
+
+function events_append(code, detail) { // one `ts<TAB>code<TAB>detail` row
+	try {
+		state_dir();
+		let d = replace(replace('' + (detail ?? ''), /\t/g, ' '), /\n/g, ' ');
+		let path = `${WAND_DIR}/events`;
+		let cur = fs.readfile(path);
+		let lines = ((cur != null) && (trim(cur) != '')) ? split(trim(cur), /\n/) : [];
+		push(lines, `${time()}\t${code}\t${d}`);
+		while (length(lines) > EVENTS_MAX)
+			shift(lines);
+		// unique tmp (same-second appends within one process), then
+		// atomic rename: a crash mid-write never truncates the ring
+		let tmp = `${WAND_DIR}/.evtmp.${time()}.${ev_seq++}`;
+		fs.writefile(tmp, join('\n', lines) + '\n');
+		fs.rename(tmp, path);
+	} catch (e) { /* best-effort: the caller's path is sacred */ }
+}
+
+function events_apply_ok(changed) { // the `in-sync` heartbeat repeats every
+	// 10 s keepalive cycle — recording each one would fill the 200-line
+	// ring in ~33 quiet minutes and scroll the real events out. Write the
+	// FIRST of a run only (dedupe by the ring's last row); every `applied`
+	// outcome is a real render and is always recorded.
+	if (changed == 1) {
+		events_append('apply_ok', 'applied');
+		return;
+	}
+	let cur = fs.readfile(`${WAND_DIR}/events`);
+	if (cur != null) {
+		let lines = split(trim(cur), /\n/);
+		let last = (length(lines) > 0) ? lines[length(lines) - 1] : '';
+		if (match(last, /\tapply_ok\tin-sync$/) != null)
+			return; // heartbeat continuation — the ring already says it
+	}
+	events_append('apply_ok', 'in-sync');
+}
+
+function desired_signature(alloc, want) { // desired-side fingerprint (rule
+	let s = [];                            // tags + set memberships). Drift
+	for (let w in want)                    // (#44) = a live diff while THIS
+		push(s, `${w.chain} ${w.tag}`);    // is unchanged since the last
+	for (let a in alloc)                   // successful apply — i.e. UCI did
+		push(s, join(',', desired_group(a.g))); // not change, live did (a
+	return join('|', s);                   // manual nft edit, a foreign tool)
+}
 // ---------- UCI (single cursor snapshot; tick never re-reads what it set) ----------
 
 let cursor = uci.cursor();
@@ -399,8 +464,10 @@ function wanflush() { // process pending flush requests written by tick (#24):
 		let old = trim(fs.readfile(f) ?? '');
 		fs.unlink(f); // errors ignored (rm -f parity)
 		let ev = conntrack_flush((m != null) ? m[1] : '', old, map);
-		if (ev != '')
+		if (ev != '') {
 			push(events, ev);
+			events_append('flush', ev); // #44 ring: detail = flush:<g>><old>(<ip>)
+		}
 	}
 	if (length(events))
 		print(`wand:${join(' ', events)}\n`); // byte-identical to sh
@@ -468,6 +535,7 @@ function tick() {
 			state_write(`${g}.lastswitch`, now);
 			state_write(`${g}.flush`, cur); // backup being left gets flushed
 			push(events, `failback:${g}>${home}`);
+			events_append('failback', `${g}>${home}`); // #44 ring
 			continue;
 		}
 		// home down: failover — or re-failover when the backup died too
@@ -488,6 +556,7 @@ function tick() {
 		state_write(`${g}.lastswitch`, now);
 		state_write(`${g}.flush`, cur); // deferred conntrack flush (#24):
 		push(events, `failover:${g}>${backup}`); // processed after apply by wan-flush
+		events_append('failover', `${g}>${backup}`); // #44 ring
 	}
 
 	// --- LB phase (#27/#39): member_live = the effective iface per slot ---
@@ -521,6 +590,7 @@ function tick() {
 			push(want, alt);
 			if (cur != alt) {
 				push(events, `lbover:${g}:${mem[i]}>${alt}`);
+				events_append('lbover', `${g}:${mem[i]}>${alt}`); // #44 ring
 				dirty_lb = true;
 				if (alt != mem[i])
 					state_write(`${g}.flush`, mem[i]); // #24, see wanflush
@@ -554,6 +624,7 @@ function probe_selftest() { // router window evidence (runbook window 2)
 				state_read(`${wan}.alive`, '-'), state_read(`${wan}.rtt`, '-'));
 	}
 }
+
 
 // ---------- apply: UCI -> nft + ip rules + routes (stage 3, #33) ----------
 //
@@ -992,17 +1063,42 @@ function lb_cascade_group(tag) { // 'wg:<g>:s<cut>@<mark>' -> <g> | null
 	return substr(rest, 0, p);
 }
 
-function apply() {
-	migrate_legacy();
-
+function config_warnings() { // the apply pipeline's validation pass, made
+	// reusable with no side effects (#45 `diag health` reports it; apply
+	// prints the same bytes as before)
+	let out = [];
 	for (let g in group_ids()) {
 		let t = group_opt(g, 'type');
 		if (t != 'direct' && t != 'proxy' && t != 'direct-lb') // #38: lb
-			msg(`warning: group '${g}' has no valid type (direct|direct-lb|proxy) — ignored`);
+			push(out, `group '${g}' has no valid type (direct|direct-lb|proxy) — ignored`);
 	}
+	return out;
+}
 
-	if (!ensure_table())
+function desired_signature(alloc, want) { // desired-side fingerprint (rule
+	let s = [];                            // tags + set memberships). Drift
+	for (let w in want)                    // (#44) = a live diff while THIS
+		push(s, `${w.chain} ${w.tag}`);    // is unchanged since the last
+	for (let a in alloc)                   // successful apply — i.e. UCI did
+		push(s, join(',', desired_group(a.g))); // not change, live did (a
+	return join('|', s);                   // manual nft edit, a foreign tool)
+	// NB: lives HERE, not with the other #44 helpers — ucode has no
+	// hoisting, and this needs desired_group (declared above)
+}
+
+function apply() {
+	migrate_legacy();
+
+	let cfgwarn = config_warnings(); // #44: the ring hears about anomalies
+	for (let w in cfgwarn)           // only (a healthy pass is already
+		msg(`warning: ${w}`);        // told by the apply_ok heartbeat)
+	if (length(cfgwarn))
+		events_append('config_validated', join('; ', cfgwarn));
+
+	if (!ensure_table()) {
+		events_append('apply_err', 'cannot create nft table');
 		fail(`cannot create nft table (see ${NFT_FILE})`);
+	}
 
 	let redir = globals_opt('redir_port');
 	if (redir == '')
@@ -1121,22 +1217,45 @@ function apply() {
 			e.read('all');                                           // stderr passthrough
 			e.close();
 			fs.unlink(tf);
+			events_append('apply_err', 'nft check failed, nothing applied');
 			fail('nft check failed, nothing applied');
 		}
 		if (sh_rc(`nft -f ${tf}`) != 0) {
 			fs.unlink(tf);
+			events_append('apply_err', 'nft apply failed');
 			fail('nft apply failed');
 		}
 		fs.unlink(tf);
 		changed = 1;
 	}
 
-	let n = reconcile_rules(alloc);
-	if (n > 0)
+	let n_rules = reconcile_rules(alloc);
+	if (n_rules > 0)
 		changed = 1;
-	n = reconcile_routes(alloc);
-	if (n > 0)
+	let n_routes = reconcile_routes(alloc);
+	if (n_routes > 0)
 		changed = 1;
+
+	// --- diagnostics events (#44): drift/restore detection AFTER the ---
+	// diff is known, BEFORE the contract print (stdout stays byte-frozen;
+	// `last-apply` stamps BOTH outcomes — the badge wants the age of the
+	// last successful pass, quiet or not)
+	let is_drift = false;
+	state_dir(); // the stamps need the dir even before the first tick
+	             // (init.d apply on a fresh boot: no wand state yet)
+	if (changed == 1) {
+		let sig = desired_signature(alloc, want);
+		let prev = state_read('last-render', '');
+		is_drift = (prev != '' && prev == sig); // desired unchanged but
+		if (is_drift)                           // live differed: drift
+			events_append('drift',
+				`live differs from UCI (nft:${length(batch)} rules:${n_rules} routes:${n_routes})`);
+		state_write('last-render', sig);
+	}
+	state_write('last-apply', time());
+	events_apply_ok(changed);
+	if (is_drift)
+		events_append('restored', 'apply repaired the drift');
 
 	print((changed == 1) ? 'applied\n' : 'in-sync\n'); // literal keepalive contract
 }
@@ -1375,14 +1494,12 @@ function cmd_devset(mac_raw, t) { // #43: write/clear the devtype override
 	// no apply: devtype is board-decoration only, the render never reads it
 }
 
-function cmd_devices() { // LAN clients for the LuCI board (issue #14)
-	// prints: mac<TAB>ip<TAB>name<TAB>online<TAB>type — leases give
-	// name/ip, ARP gives online (complete entry). ARP-only devices
-	// (static IPs) show name "-". Field-index parity with the sh awk:
-	// ucode f[0] = awk f[1] (probe P6: split() reproduces awk
-	// leading/trailing empty fields). TYPE (#43) is ADDITIVE: the frozen
-	// contract is the 4-column prefix; type = member `option devtype`
-	// override > hostname heuristic > generic (ARP-only has no name).
+function lan_inventory() { // leases + ARP merge -> { order, ip, name,
+	// online } maps keyed by MAC (the cmd_devices source, shared with
+	// `inspect` #45). leases give name/ip, ARP gives online (complete
+	// entry); ARP-only devices (static IPs) show name "-". Field-index
+	// parity with the sh awk: ucode f[0] = awk f[1] (probe P6: split()
+	// reproduces awk leading/trailing empty fields).
 	const order = [], seen = {}, ipm = {}, nm = {}, onm = {};
 	function add(rawmac, ip, name, on) {
 		let mac = lc('' + rawmac);
@@ -1414,13 +1531,22 @@ function cmd_devices() { // LAN clients for the LuCI board (issue #14)
 			if (length(f) >= 6 && f[2] == '0x2' && f[5] == BR)
 				add(f[3], f[0], '-', true);
 		}
+	return { order: order, ip: ipm, name: nm, online: onm };
+}
+
+function cmd_devices() { // LAN clients for the LuCI board (issue #14)
+	// prints: mac<TAB>ip<TAB>name<TAB>online<TAB>type. TYPE (#43) is
+	// ADDITIVE: the frozen contract is the 4-column prefix; type = member
+	// `option devtype` override > hostname heuristic > generic (ARP-only
+	// has no name).
+	let inv = lan_inventory();
 	let dv = member_devtypes(); // override > heuristic > generic (#43)
-	for (let mac in order)
+	for (let mac in inv.order)
 		printf('%s\t%s\t%s\t%d\t%s\n', mac,
-			(mac in ipm) ? ipm[mac] : '-',
-			(mac in nm) ? nm[mac] : '-',
-			(mac in onm) ? 1 : 0,
-			dv[mac] ?? devtype_heuristic((mac in nm) ? nm[mac] : '-'));
+			(mac in inv.ip) ? inv.ip[mac] : '-',
+			(mac in inv.name) ? inv.name[mac] : '-',
+			(mac in inv.online) ? 1 : 0,
+			dv[mac] ?? devtype_heuristic((mac in inv.name) ? inv.name[mac] : '-'));
 }
 
 function cmd_groupadd(name, val) {
@@ -1736,7 +1862,236 @@ automatically: proxy = 300/500 fixed; direct (sorted by name) =
       [-color V] ...            '' clears; color: blue green purple orange gray
   devset <mac> <type|->         device type override (board icons):
                                 watch|tv|pc|printer|phone|tablet|generic; '-' clears
+
+#44/#45 diagnostics (read-only, ucode-only; data plane for the LuCI
+Diagnostics page and the header status badge):
+  events [N]                    event ring tail (default 20): ts, code, detail
+  syncstatus                    status=|last_apply=|age= (live drift probe)
+  diag [all|rules|tables|nft|health]
+                                read-only diagnostics sections
+  inspect <mac|ip|hostname>     one device: configured vs live
+  diag-report                   full secrets-free report (LuCI download)
 `;
+
+// ---------- diagnostics commands (#44/#45, ucode-only) ----------
+//
+// Read-only data plane for the LuCI Diagnostics page and the status
+// badge. Precedent: groupmeta (#42) — ucode-only, no cli-parity pairs,
+// pinned by stage-5 goldens instead. Sources are ONLY read verbs the
+// apply/diff paths already use (`nft list`, `ip rule show`, `ip route
+// show table N`, ubus netifd dump + procd service list, leases/ARP,
+// UCI wanguard, the ring) — NEVER /etc/config/network or any other
+// secret-bearing config (PPPoE/WG secrets); the diag-report gate greps
+// the output for secret markers (run-tests DR-secrets).
+//
+// Output grammar: TAB-separated rows, no decorations; long dumps
+// (rules/nft) are grouped under `section<TAB><name>` headers so a
+// parser can split the report without knowing the dumps' shapes.
+
+const VERSION_FILE = '/usr/share/wanguard/version'; // stamped by apk/build.sh
+
+function svc_status(name) { // procd state via ubus `service list`:
+	let conn = ubus.connect(); // running | stopped | absent | unknown
+	if (conn == null)          // (unknown: no ubus at all — say so)
+		return 'unknown';
+	let st = conn.call('service', 'list');
+	conn.disconnect();
+	if (st == null)
+		return 'unknown';
+	if (!(name in st))
+		return 'absent';
+	let inst = st[name]?.instances ?? {};
+	for (let k in keys(inst))
+		if (inst[k]?.running)
+			return 'running';
+	return 'stopped';
+}
+
+function pkg_version() { // build stamp; missing file (dev/lab runs) -> '-'
+	return trim(fs.readfile(VERSION_FILE) ?? '') || '-';
+}
+
+function diag_rules() { // FULL `ip rule show`: a foreign/stale rule (prio
+	msg('section\trules'); // 1000 in front of our 8000+) is exactly what
+	let out = sh_read('ip rule show 2>/dev/null'); // debugging needs to see
+	for (let line in split(trim(out), /\n/))
+		if (trim(line) != '')
+			msg(line);
+}
+
+function diag_tables() { // per-slot: device + the table's routes verbatim
+	msg('section\ttables');
+	let map = iface_map();
+	for (let a in alloc_entries()) {
+		let dev = (a.typ == 'proxy')
+			? ((sh_rc('ip link show Meta >/dev/null 2>&1') == 0) ? 'Meta' : 'down')
+			: (map[a.ifc]?.device ?? '');
+		msg(`slot\t${a.g}\t${a.typ}\t${(dev != '') ? dev : 'down'}\tmark=${a.m}\ttable=${a.t}\tprio=${a.p}`);
+		for (let line in split(trim(sh_read(`ip route show table ${a.t} 2>/dev/null`)), /\n/))
+			if (trim(line) != '')
+				msg(`route\t${a.g}\t${line}`);
+	}
+}
+
+function diag_nft() { // the whole table verbatim (the applied state)
+	msg('section\tnft');
+	let out = sh_read(`nft list table ${TABLE} 2>/dev/null`);
+	if (trim(out) != '')
+		print(out); // dump already ends with \n — print it untouched
+}
+
+function diag_health() { // procd services, config validity, build stamp
+	msg('section\thealth');
+	msg(`service\twanguard\t${svc_status('wanguard')}`);
+	msg(`service\tmihomo\t${svc_status('mihomo')}`);
+	let w = config_warnings();
+	msg(`config\t${(length(w) == 0) ? 'valid' : 'invalid'}`);
+	for (let x in w)
+		msg(`warning\t${x}`);
+	msg(`version\t${pkg_version()}`);
+}
+
+function cmd_diag(sec) { // all|rules|tables|nft|health
+	if (sec == 'rules') { diag_rules(); return; }
+	if (sec == 'tables') { diag_tables(); return; }
+	if (sec == 'nft') { diag_nft(); return; }
+	if (sec == 'health') { diag_health(); return; }
+	if (sec == 'all') { diag_rules(); diag_tables(); diag_nft(); diag_health(); return; }
+	fail(`unknown diag section: '${sec}' (sections: all|rules|tables|nft|health)`);
+}
+
+function sync_rows() { // [status, last_apply, age] — the drift HALF is live
+	let drift = false;    // (the same sets-diff `list` uses), NOT ring-fed:
+	for (let a in alloc_entries())   // the ring tells the story, the probe
+		if (join('\n', sort(desired_group(a.g))) != // tells the NOW
+		    join('\n', sort(current_elements(`mac_${a.g}`))))
+			drift = true;
+	let ts = state_read('last-apply', '');
+	return [ drift ? 'drift' : 'in-sync',
+		(ts != '') ? ts : '-',
+		(ts != '') ? `${time() - int(ts)}` : '-' ];
+}
+
+function cmd_syncstatus() { // machine probe, exit 0 always (#44): LuCI
+	let r = sync_rows();       // reads it on every header render — DRIFT
+	printf('status=%s\nlast_apply=%s\nage=%s\n', r[0], r[1], r[2]); // verdict
+}                            // semantics stay exclusive to `list`
+
+function cmd_events(n) { // ring tail (#44): last N rows (default 20),
+	if (n != '')          // unix-ts<TAB>code<TAB>detail, no header
+		(match('' + n, /^[0-9]+$/) != null) || fail('usage: wanguard events [N]');
+	let k = (n != '') ? int(n) : 20;
+	let cur = fs.readfile(`${WAND_DIR}/events`);
+	if (cur == null || trim(cur) == '')
+		return; // empty ring: silence (the machine reader sees nothing)
+	let lines = split(trim(cur), /\n/);
+	let start = (length(lines) > k) ? length(lines) - k : 0;
+	for (let i = start; i < length(lines); i++)
+		msg(lines[i]);
+}
+
+function cmd_inspect(q) { // one device: configured vs live (#45)
+	// resolve: MAC literal > lease/ARP ip or hostname > member name.
+	// Unresolvable = the contract error path (stderr, rc 1); resolvable
+	// but unregistered is a VALID answer (group '-') — the "outside the
+	// groups" case. Every row names its fact: a divergence between the
+	// configured and live worlds is visible row by row.
+	let t = lc('' + q);
+	let mac = null;
+	if ((match(t, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) != null) ||
+	    (match(replace(t, /[-.]/g, ''), /^[0-9a-f]{12}$/) != null)) {
+		mac = normalize_mac(t);
+		if (mac == null)
+			fail(`invalid mac: ${q}`);
+	}
+	let inv = lan_inventory();
+	if (mac == null)
+		for (let m in inv.order)
+			if (inv.ip[m] == q || lc(inv.name[m]) == t) { mac = m; break; }
+	if (mac == null) // registered but never leased: member name match
+		for (let sid in member_ids()) {
+			let nm = get_member_opt(sid, 'name');
+			if (nm != '' && lc(nm) == t) {
+				mac = normalize_mac(get_member_opt(sid, 'mac'));
+				break;
+			}
+		}
+	if (mac == null)
+		fail(`cannot resolve: '${q}' (not a MAC, and no lease/ARP/inventory match)`);
+	msg(`device\t${q}`);
+	msg(`mac\t${mac}`);
+	msg(`name\t${(mac in inv.name) ? inv.name[mac] : '-'}`);
+	msg(`ip\t${(mac in inv.ip) ? inv.ip[mac] : '-'}`);
+	msg(`online\t${(mac in inv.online) ? 1 : 0}`);
+	let sid = find_by_mac(mac);
+	if (sid == null) { // known to the LAN, outside the groups
+		msg('group\t-');
+		msg('note\tnot registered (use: wanguard add <mac> <group>)');
+		return;
+	}
+	let g = get_member_opt(sid, 'group');
+	msg(`group\t${g}`);
+	if (!group_exists(g)) {
+		msg('note\tmember references an unknown group (fail-safe: main table)');
+		return;
+	}
+	let map = iface_map();
+	let slots = filter(alloc_entries(), (a) => a.g == g);
+	if (length(slots) == 0) { // e.g. invalid type: apply warned, render skipped
+		msg('note\tgroup has no allocation slot (invalid type?)');
+		return;
+	}
+	for (let a in slots) {
+		let dev = (a.typ == 'proxy')
+			? ((sh_rc('ip link show Meta >/dev/null 2>&1') == 0) ? 'Meta' : 'down')
+			: (map[a.ifc]?.device ?? '');
+		msg(`slot\t${a.typ}\tmark=${a.m}\ttable=${a.t}\tprio=${a.p}\tconfigured=${(a.typ == 'proxy') ? 'proxy' : a.ifc}\t${(a.mi != null) ? `member=${a.mi}\t` : ''}live=${(dev != '') ? dev : 'down'}`);
+	}
+	let in_set = filter(current_elements(`mac_${g}`), (e) => lc(e) == mac);
+	msg(`set\tmac_${g}\t${(length(in_set) > 0) ? 'member' : 'absent'}`);
+	for (let h in live_rule_tags()) // applied rules of this group
+		if (substr(h.tag, 0, length(`wg:${g}:`)) == `wg:${g}:`)
+			msg(`rule\t${h.chain}\t${h.tag}\thandle=${h.handle}`);
+}
+
+function cmd_diag_report() { // the LuCI "Download report" one-liner (#45):
+	// sync + every diag section + the registered members' configured-vs-
+	// live lines + the event ring. Secrets-free BY CONSTRUCTION (see the
+	// section header above) and test-gated (DR-secrets greps the output
+	// against markers planted in /etc/config/network).
+	msg('# wanguard diag-report');
+	msg(`generated\t${trim(sh_read(`date '+%Y-%m-%d %H:%M:%S' 2>/dev/null`))} (${time()})`);
+	let r = sync_rows();
+	msg(`sync\t${r[0]}\tlast_apply=${r[1]}\tage=${r[2]}`);
+	diag_rules();
+	diag_tables();
+	diag_nft();
+	diag_health();
+	msg('section\tdevices');
+	let map = iface_map();
+	for (let sid in member_ids()) { // configured vs live, one line each
+		let mac = get_member_opt(sid, 'mac');
+		let g = get_member_opt(sid, 'group');
+		let name = get_member_opt(sid, 'name');
+		let live = '-';
+		if (group_exists(g)) {
+			let slots = filter(alloc_entries(), (a) => a.g == g);
+			if (length(slots) > 0) {
+				let a = slots[0];
+				let dev = (a.typ == 'proxy')
+					? ((sh_rc('ip link show Meta >/dev/null 2>&1') == 0) ? 'Meta' : 'down')
+					: (map[a.ifc]?.device ?? '');
+				if (dev != '')
+					live = dev;
+			}
+		}
+		msg(`member\t${(mac != '') ? mac : '-'}\t${(name != '') ? name : '-'}\t${(g != '') ? g : '-'}\t${live}`);
+	}
+	msg('section\tevents');
+	let ev = fs.readfile(`${WAND_DIR}/events`);
+	if (ev != null && trim(ev) != '')
+		print(ev); // the ring verbatim (bounded by EVENTS_MAX)
+}
 
 function cmd_help() {
 	print(HELP);
@@ -1819,6 +2174,22 @@ switch (cmd) {
 	case 'backupset':
 		(length(args) >= 2) || fail('usage: wanguard backupset <group> <iface>...');
 		cmd_backupset(args[0], slice(args, 1));
+		break;
+	case 'events': // #44
+		cmd_events(args[0] ?? '');
+		break;
+	case 'syncstatus': // #44
+		cmd_syncstatus();
+		break;
+	case 'diag': // #45
+		cmd_diag(args[0] ?? 'all');
+		break;
+	case 'inspect': // #45
+		(length(args) >= 1) || fail('usage: wanguard inspect <mac|ip|hostname>');
+		cmd_inspect(args[0]);
+		break;
+	case 'diag-report': // #45
+		cmd_diag_report();
 		break;
 	case '':
 	case 'help':

@@ -9,6 +9,9 @@
  * Reads the SAME fixture files as tests/mock/bin/ubus (the sh suite):
  *   UBUS_IFACES: `name=device` lines; empty device = iface down
  *   UBUS_ADDRS:  `name=ip` lines (default 10.99.0.1)
+ *   UBUS_SERVICES: `name=running|stopped` lines (procd `service list`,
+ *     #45 diag health); services absent from the file are absent from
+ *     the list
  *
  * Semantics map onto the ONE call the ucode port makes:
  *   network.interface dump -> every fixture iface as a netifd status
@@ -40,6 +43,13 @@ function connect() {
 			return [ 'network.interface' ];
 		},
 		call: function(obj, method, args) {
+			if (obj == 'service' && method == 'list') { // procd registry
+				let svc = fixtures(getenv('UBUS_SERVICES') ?? '/dev/null');
+				let out = {};
+				for (let name in keys(svc))
+					out[name] = { instances: { instance1: { running: (svc[name] == 'running') } } };
+				return out;
+			}
 			if (obj != 'network.interface' || method != 'dump')
 				return null; // the real ubus raises; the port never does this
 			let ifaces = fixtures(getenv('UBUS_IFACES') ?? '/dev/null');

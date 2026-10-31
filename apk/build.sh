@@ -67,6 +67,10 @@ inst "$ROOT/router/init.d/wanguard"             "$W/etc/init.d/wanguard"   755
 inst "$ROOT/router/init.d/wan-watch"            "$W/etc/init.d/wan-watch"  755
 inst "$ROOT/router/wanguard.nft"                "$W/usr/share/wanguard/wanguard.nft" 644
 inst "$ROOT/router/etc.config.wanguard.example" "$W/usr/share/wanguard/etc.config.wanguard.example" 644
+# build stamp: `wanguard diag health` reports the running package version
+# (#45); wand.uc has no version constant — the apk build is the source of
+# truth. Missing file (dev/lab runs) renders as '-'.
+printf '%s\n' "$VER" > "$W/usr/share/wanguard/version"
 pkg wanguard \
 	"Per-MAC policy routing for OpenWrt: client groups, nft marking, main-egress health-watch" \
 	"ip-full nftables conntrack ucode ucode-mod-fs ucode-mod-uci ucode-mod-ubus" "$W"
