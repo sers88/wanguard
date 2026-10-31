@@ -114,12 +114,14 @@ jobs:
 
   feed-test:
     name: Install test (OpenWrt 25.12.6 container)
-    needs: feed
+    needs: [build, feed]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install from feed in OpenWrt container
+        env:
+          VER: ${{ needs.build.outputs.ver }}
         run: |
           docker run --rm -v "$PWD/keys:/hostkeys:ro" openwrt/rootfs:x86_64-25.12.6 sh -exc '
             cp /hostkeys/wanguard.pem /etc/apk/keys/
@@ -143,6 +145,7 @@ jobs:
             test ! -e /www/luci-static/resources/view/wanguard.js # retired monolith (#46) — must never come back
             test -f /usr/share/luci/menu.d/luci-app-wanguard.json
             test -f /usr/share/rpcd/acl.d/luci-app-wanguard.json
+            test "$(cat /usr/share/wanguard/version)" = "'"$VER"'" # build stamp for `diag health` (#45)
             /usr/bin/wanguard list >/dev/null 2>&1 || echo "wanguard list fails without /etc/config/wanguard (expected)"
             echo FEED-TEST-OK
           '
