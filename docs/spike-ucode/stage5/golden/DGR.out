@@ -1,0 +1,7 @@
+section	rules
+0:	from all lookup local
+8000:	from all fwmark 0x12c lookup 500
+8100:	from all fwmark 0x64 lookup 400
+8101:	from all fwmark 0xc8 lookup 401
+32766:	from all lookup main
+32767:	from all lookup default

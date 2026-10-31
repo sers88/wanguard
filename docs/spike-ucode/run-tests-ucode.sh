@@ -1166,6 +1166,270 @@ out_sh=$(sh "$SH" devices 2>&1 | cut -f1-4)
 assert_eq "DT4 4-column prefix byte-identical to the sh reference" "$out_uc" "$out_sh"
 assert_contains "DT4 sanity: sh actually printed rows" "$out_sh" "aa:bb:cc:dd:ee:01	192.168.88.35	watch-hall	0"
 
+echo
+echo "== #44/#45: diagnostics data plane (events / syncstatus / diag / inspect / diag-report) =="
+#
+# The ring and the probes are ucode-only (groupmeta precedent): no sh
+# differential here, the surfaces are pinned by stage-5 goldens in the
+# contract gate. The ring rows are `ts<TAB>code<TAB>detail`; ts is REAL
+# time() (the date stub is irrelevant), so assertions match code/detail.
+
+UBUS_SERVICES=$TMP/ubus.svc
+export UBUS_SERVICES
+
+evrow() { awk -F '\t' -v c="$1" -v d="$2" '$2 == c && $3 == d { n++ } END { print n + 0 }' "$WAND/events" 2>/dev/null; }
+evcode() { awk -F '\t' -v c="$1" '$2 == c { n++ } END { print n + 0 }' "$WAND/events" 2>/dev/null; }
+evn()   { if [ -f "$WAND/events" ]; then wc -l < "$WAND/events"; else echo 0; fi; }
+
+conf_diag() {
+	cat > /etc/config/wanguard <<'EOF'
+config group 'freedom'
+	option type 'direct'
+	option iface 'wan1'
+	list backup_iface 'wan2'
+config group 'proxy'
+	option type 'proxy'
+config member 'm_d8bbc1cc1771'
+	option name 'tower'
+	option mac 'd8:bb:c1:cc:17:71'
+	option group 'freedom'
+EOF
+}
+
+diag_leases() {
+	cat > /tmp/dhcp.leases <<'EOF'
+1700000001 d8:bb:c1:cc:17:71 192.168.88.10 tower
+1700000002 aa:bb:cc:dd:ee:99 192.168.88.99 freeloader
+1700000003 02:03:04:05:06:07 192.168.88.50 cast-tv
+EOF
+}
+
+# --- EV1: apply_ok heartbeat — the FIRST of a quiet run only ---
+lb_reset
+conf_diag
+out=$(rapply)
+assert_eq "EV1 fresh apply -> applied row" "$(evrow apply_ok applied)" "1"
+n1=$(evn)
+out=$(rapply)
+assert_eq "EV1 quiet apply -> in-sync row" "$(evrow apply_ok in-sync)" "1"
+assert_eq "EV1 first heartbeat appended once" "$(evn)" "$((n1 + 1))"
+out=$(rapply)
+assert_eq "EV1 quiet rerun still one in-sync row" "$(evrow apply_ok in-sync)" "1"
+assert_eq "EV1 heartbeat deduped (ring did not grow)" "$(evn)" "$((n1 + 1))"
+assert_contains "EV1 apply stdout still exactly in-sync (frozen)" "$out" "in-sync"
+
+# --- EV2: tick failover/failback land in the ring (T9 fixture) ---
+reset_router
+setup_two_wans
+uci_set globals.wan_anchors 'http://a1.example/ping'
+tick >/dev/null
+echo fail > "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null
+assert_eq "EV2 failover row" "$(evrow failover 'a>wan2')" "1"
+echo 0 > "$WAND/a.lastswitch" # bypass dwell deterministically
+rm -f "$WAND/vpn.force"
+tick >/dev/null; tick >/dev/null; tick >/dev/null
+tick >/dev/null; tick >/dev/null; tick >/dev/null
+assert_eq "EV2 failback row" "$(evrow failback 'a>vpn')" "1"
+
+# --- EV3: ring clamps at 200 (FIFO head drop), newest survives ---
+reset_router
+i=0
+while [ $i -lt 250 ]; do
+	printf '%s\tinjected\trow%s\n' "$i" "$i" >> "$WAND/events"
+	i=$((i + 1))
+done
+rapply >/dev/null
+assert_eq "EV3 ring clamped to 200" "$(evn)" "200"
+assert_eq "EV3 head dropped (51 oldest gone)" "$(head -n1 "$WAND/events")" "51	injected	row51"
+case "$(tail -n1 "$WAND/events")" in
+	*"$(printf 'apply_ok\t')"*) ok "EV3 newest row survived the clamp" ;;
+	*) bad "EV3 newest row survived the clamp" "$(tail -n1 "$WAND/events")" "*apply_ok*" ;;
+esac
+
+# --- EV4: events tail — default 20, explicit N, silence, usage ---
+reset_router
+out=$(cli events)
+assert_eq "EV4 empty ring is silent" "$out" ""
+printf '1000\talpha\tone\n1001\tbeta\ttwo\n1002\tgamma\tthree\n' > "$WAND/events"
+out=$(cli events)
+assert_eq "EV4 default tail prints the whole (short) ring" "$out" "$(cat "$WAND/events")"
+out=$(cli events 2)
+assert_eq "EV4 N=2 tail" "$out" "$(printf '1001\tbeta\ttwo\n1002\tgamma\tthree')"
+out=$(cli events abc); rc=$?
+assert_contains "EV4 non-numeric N rejected" "$out" "usage: wanguard events [N]"
+assert_rc "EV4 non-numeric N rc=1" "$rc" "1"
+
+# --- EV5: drift/restored — live edit under an unchanged UCI ---
+lb_reset
+conf_diag
+rapply >/dev/null
+printf 'delete element inet wanguard mac_freedom { d8:bb:c1:cc:17:71 }\n' > "$TMP/drift.nft"
+rnft -f "$TMP/drift.nft" >/dev/null
+out=$(rapply)
+assert_eq "EV5 drift detected" "$(evcode drift)" "1"
+assert_eq "EV5 drift repaired in the same run" "$(evcode restored)" "1"
+assert_contains "EV5 drift detail counts the diff" "$(awk -F '\t' '$2 == "drift"' "$WAND/events")" "nft:1"
+assert_contains "EV5 apply stdout still applied (frozen)" "$out" "applied"
+
+# --- EV6: wan-flush -> flush row (detail = the byte-exact event) ---
+reset_router
+setup_two_wans
+echo vpn > "$WAND/a.flush"
+echo 198.51.100.10 > "$WAND/vpn.addr"
+out=$(flush)
+assert_eq "EV6 flush stdout byte-frozen" "$out" "wand:flush:a>vpn(10.99.0.1)"
+assert_eq "EV6 flush row" "$(evrow flush 'flush:a>vpn(10.99.0.1)')" "1"
+
+# --- EV7: apply failure -> apply_err row ---
+lb_reset
+cat > /etc/config/wanguard <<'EOF'
+config group 'freedom'
+	option type 'direct'
+	option iface 'wan1'
+config member 'm_bad'
+	option mac 'zz:bb:cc:dd:ee:ff'
+	option group 'freedom'
+EOF
+out=$(rapply); rc=$?
+assert_contains "EV7 nft -c gate rejects" "$out" "nft check failed"
+assert_rc "EV7 rc=1" "$rc" "1"
+assert_eq "EV7 apply_err row" "$(evrow apply_err 'nft check failed, nothing applied')" "1"
+
+# --- SS: syncstatus — live probe, exit 0 always ---
+lb_reset
+conf_diag
+out=$(rcli syncstatus); rc=$?
+assert_rc "SS1 rc=0 even on drift" "$rc" "0"
+assert_eq "SS1 bare system: drift" "$(echo "$out" | sed -n 1p)" "status=drift"
+assert_eq "SS1 bare system: no stamp" "$(echo "$out" | sed -n 2p)" "last_apply=-"
+assert_eq "SS1 bare system: no age" "$(echo "$out" | sed -n 3p)" "age=-"
+rapply >/dev/null
+out=$(rcli syncstatus)
+assert_eq "SS2 synced: in-sync" "$(echo "$out" | sed -n 1p)" "status=in-sync"
+case "$out" in
+	*"last_apply=1"[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) ok "SS2 last_apply stamped (unix ts)" ;;
+	*) bad "SS2 last_apply stamped (unix ts)" "$out" "last_apply=<10 digits>" ;;
+esac
+case "$out" in
+	*"age="[0-9]*) ok "SS2 age in seconds" ;;
+	*) bad "SS2 age in seconds" "$out" "age=<digits>" ;;
+esac
+uci set wanguard.m_new=member
+uci set wanguard.m_new.mac='aa:bb:cc:dd:ee:77'
+uci set wanguard.m_new.group='freedom'
+uci commit wanguard
+out=$(rcli syncstatus); rc=$?
+assert_eq "SS3 UCI edit -> drift" "$(echo "$out" | sed -n 1p)" "status=drift"
+assert_rc "SS3 drift keeps rc=0 (probe, not verdict)" "$rc" "0"
+rapply >/dev/null
+assert_eq "SS3 apply heals" "$(rcli syncstatus | sed -n 1p)" "status=in-sync"
+
+# --- DG: diag sections (read-only, TAB rows under section headers) ---
+lb_reset
+conf_diag
+rapply >/dev/null
+diag_leases
+printf 'wanguard=running\nmihomo=running\n' > "$UBUS_SERVICES"
+printf '1.5.0-r1\n' > /usr/share/wanguard/version
+out=$(rcli diag rules)
+assert_contains "DG1 rules header" "$out" "$(printf 'section\trules')"
+assert_contains "DG1 our rule visible" "$out" "$(printf '8100:\tfrom all fwmark 0x64 lookup 400')"
+assert_contains "DG1 base rules visible (full dump)" "$out" "0:	from all lookup local"
+out=$(rcli diag tables)
+assert_contains "DG2 slot row" "$out" "$(printf 'slot\tfreedom\tdirect\teth0\tmark=100\ttable=400\tprio=8100')"
+assert_contains "DG2 route row" "$out" "$(printf 'route\tfreedom\tdefault dev eth0 ')"
+out=$(rcli diag nft)
+assert_contains "DG3 table dump" "$out" "table inet wanguard {"
+assert_contains "DG3 applied set visible" "$out" "set mac_freedom"
+out=$(rcli diag health)
+assert_contains "DG4 wanguard service" "$out" "$(printf 'service\twanguard\trunning')"
+assert_contains "DG4 mihomo service" "$out" "$(printf 'service\tmihomo\trunning')"
+assert_contains "DG4 config valid" "$out" "$(printf 'config\tvalid')"
+assert_contains "DG4 version stamp" "$out" "$(printf 'version\t1.5.0-r1')"
+uci set wanguard.broken=group
+uci set wanguard.broken.type='magic'
+uci commit wanguard
+assert_contains "DG5 invalid config reported" "$(rcli diag health)" "$(printf 'config\tinvalid')"
+assert_contains "DG5 warning row names the group" "$(rcli diag health)" "warning	group 'broken' has no valid type"
+out=$(rcli diag bogus); rc=$?
+assert_contains "DG6 unknown section rejected" "$out" "unknown diag section: 'bogus'"
+assert_rc "DG6 rc=1" "$rc" "1"
+uci delete wanguard.broken
+uci commit wanguard
+before_nft=$(rnft list table inet wanguard)
+before_ip="$(rip rule show)
+$(rip route show table all)"
+rcli diag all >/dev/null
+assert_eq "DG7 diag is read-only: nft db untouched" "$(rnft list table inet wanguard)" "$before_nft"
+assert_eq "DG7 diag is read-only: ip state untouched" "$(rip rule show)
+$(rip route show table all)" "$before_ip"
+
+# --- IN: inspect — configured vs live ---
+lb_reset
+conf_diag
+rapply >/dev/null
+diag_leases
+out=$(rcli inspect d8:bb:c1:cc:17:71)
+assert_contains "IN1 device row" "$out" "$(printf 'device\td8:bb:c1:cc:17:71')"
+assert_contains "IN1 lease name" "$out" "$(printf 'name\ttower')"
+assert_contains "IN1 lease ip" "$out" "$(printf 'ip\t192.168.88.10')"
+assert_contains "IN1 group" "$out" "$(printf 'group\tfreedom')"
+assert_contains "IN1 slot: configured vs live" "$out" "$(printf 'slot\tdirect\tmark=100\ttable=400\tprio=8100\tconfigured=wan1\tlive=eth0')"
+assert_contains "IN1 set membership (applied)" "$out" "$(printf 'set\tmac_freedom\tmember')"
+assert_contains "IN1 live rule of the group" "$out" "$(printf 'rule\tmarking\twg:freedom:m100\thandle=')"
+out=$(rcli inspect 192.168.88.50)
+assert_contains "IN2 ip resolves to mac" "$out" "$(printf 'mac\t02:03:04:05:06:07')"
+assert_contains "IN2 lease hostname" "$out" "$(printf 'name\tcast-tv')"
+assert_contains "IN2 ungrouped answer is valid" "$out" "$(printf 'group\t-')"
+out=$(rcli inspect cast-tv)
+assert_contains "IN2 hostname resolves" "$out" "$(printf 'mac\t02:03:04:05:06:07')"
+out=$(rcli inspect nosuchdevice); rc=$?
+assert_contains "IN3 unresolvable rejected" "$out" "cannot resolve: 'nosuchdevice'"
+assert_rc "IN3 rc=1" "$rc" "1"
+# proxy member: Meta link is the live device
+uci set wanguard.m_pxy=member
+uci set wanguard.m_pxy.mac='aa:bb:cc:dd:ee:99'
+uci set wanguard.m_pxy.group='proxy'
+uci commit wanguard
+rapply >/dev/null
+out=$(rcli inspect aa:bb:cc:dd:ee:99)
+assert_contains "IN4 proxy slot" "$out" "$(printf 'slot\tproxy\tmark=300\ttable=500\tprio=8000\tconfigured=proxy\tlive=Meta')"
+assert_contains "IN4 proxy redir rule live" "$out" "$(printf 'rule\tredir\twg:proxy:r7892\thandle=')"
+# direct-lb member: slot lines carry member= + live=
+lb_reset
+conf_lb2
+rapply >/dev/null
+out=$(rcli inspect aa:bb:cc:dd:ee:55)
+assert_contains "IN5 lb slot: member + live" "$out" "$(printf 'slot\tdirect-lb\tmark=200\ttable=401\tprio=8101\tconfigured=wan1\tmember=wan1\tlive=eth0')"
+assert_contains "IN5 lb second slot" "$out" "$(printf 'slot\tdirect-lb\tmark=400\ttable=402\tprio=8102\tconfigured=wan2\tmember=wan2\tlive=eth1')"
+
+# --- DR: diag-report — the secrets-free one-liner for LuCI ---
+lb_reset
+conf_diag
+rapply >/dev/null
+diag_leases
+printf 'wanguard=running\n' > "$UBUS_SERVICES"
+out=$(rcli diag-report)
+assert_contains "DR1 report header" "$out" "# wanguard diag-report"
+assert_contains "DR1 generated stamp" "$out" "$(printf 'generated\t')"
+assert_contains "DR1 sync row" "$out" "sync	in-sync	last_apply="
+for s in rules tables nft health devices events; do
+	assert_contains "DR1 section $s" "$out" "$(printf "section\t$s")"
+done
+assert_contains "DR1 members configured-vs-live row" "$out" "$(printf 'member\td8:bb:c1:cc:17:71\ttower\tfreedom\teth0')"
+cat > /etc/config/network <<'EOF'
+config interface 'wan'
+	option proto 'pppoe'
+	option password 'SUPERSECRET-PPPOE-PASS'
+	list servers 'SUPERSECRET-WG-KEY'
+EOF
+n_net=$(grep -c 'SUPERSECRET' /etc/config/network || true)
+n_rep=$(printf '%s' "$out" | grep -c 'SUPERSECRET' || true)
+assert_eq "DR2 sanity: markers ARE planted in /etc/config/network" "$n_net" "2"
+assert_eq "DR2 report carries NO secrets" "$n_rep" "0"
+rm -f /etc/config/network
+
 rm -f /tmp/dhcp.leases
 
 echo

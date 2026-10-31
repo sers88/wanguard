@@ -1,0 +1,9 @@
+device	d8:bb:c1:cc:17:71
+mac	d8:bb:c1:cc:17:71
+name	-
+ip	-
+online	0
+group	freedom
+slot	direct	mark=100	table=400	prio=8100	configured=vpn	live=eth1
+set	mac_freedom	member
+rule	marking	wg:freedom:m100	handle=5

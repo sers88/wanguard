@@ -46,9 +46,10 @@ NFT_STATE=$T/nft.db
 IP_STATE=$T/ip
 UBUS_IFACES=$T/ubus.ifaces
 UBUS_ADDRS=$T/ubus.addrs
+UBUS_SERVICES=$T/ubus.svc
 DATE_COUNT=$T/date.count
 CONNTRACKLOG=$T/conntrack.log
-export NFT_STATE IP_STATE UBUS_IFACES UBUS_ADDRS DATE_COUNT CONNTRACKLOG
+export NFT_STATE IP_STATE UBUS_IFACES UBUS_ADDRS UBUS_SERVICES DATE_COUNT CONNTRACKLOG
 
 PASS=0
 FAIL=0
@@ -96,6 +97,7 @@ reset_state() {
 	: > "$CONF"
 	: > "$UBUS_IFACES"
 	: > "$UBUS_ADDRS"
+	: > "$UBUS_SERVICES"
 	: > "$CONNTRACKLOG"
 	echo 1000000000 > "$DATE_COUNT"
 	printf 'default via 192.0.2.1 dev mockwan metric 10\n' > "$IP_STATE/route.main"
@@ -132,6 +134,20 @@ run_native() { # $1=case-id, rest = CLI args; fixture prepared by caller
 		diff_ok  "$id: stderr" "$T/$id.err" "$GOLDEN/$id.err"
 		assert_rc "$id: rc"    "$(cat "$T/$id.rc")" "$(cat "$GOLDEN/$id.rc")"
 	fi
+}
+
+run_raw() { # $1=case-id, rest = CLI args -> $T/<id>.{out,err,rc}; NO golden
+	local id=$1; shift          # (for the time-bearing #44/#45 surfaces:
+	ucode -L "$UCDIR" "$UC" "$@" > "$T/$id.out" 2> "$T/$id.err"  # ring ts,
+	echo $? > "$T/$id.rc"                                        # sync age)
+}
+
+has_line() { # $1=label $2=fixed needle $3=file (TAB-safe via printf)
+	if grep -qF -- "$2" "$3"; then ok "$1"; else bad "$1" "$(head -n 3 "$3" | tr '\n' '|')" "$2"; fi
+}
+
+grep_ok() { # $1=label $2=ERE $3=file
+	if grep -Eq -- "$2" "$3"; then ok "$1"; else bad "$1" "$(head -n 3 "$3" | tr '\n' '|')" "$2"; fi
 }
 
 # ---------- fixtures ----------
@@ -247,6 +263,144 @@ run_native FLI wan-flush
 # H help: the usage text (default/help/-h/--help, exit 0)
 reset_state
 run_native H help
+
+# ---- #44/#45 diagnostics data plane ----
+# Time-bearing surfaces (ring rows, syncstatus age, the report header
+# stamp real time()) are assert-gated below; the time-free ones get
+# goldens like every other contract surface.
+
+# DGR diag rules: FULL `ip rule show` — base rules AND every applied
+# slot (a foreign prio-1000 rule is exactly what debugging needs to see)
+reset_state; conf_std; sync_apply
+run_native DGR diag rules
+
+# DGT diag tables: per-slot device row + verbatim table routes
+reset_state; conf_std; sync_apply
+run_native DGT diag tables
+
+# DGN diag nft: the applied table, verbatim
+reset_state; conf_std; sync_apply
+run_native DGN diag nft
+
+# DGH diag health: procd fixture + valid config + the build stamp
+# (/usr/share/wanguard/version is written by apk/build.sh on release)
+reset_state; conf_std; sync_apply
+printf 'wanguard=running\n' > "$UBUS_SERVICES"
+printf '1.5.0-r1\n' > /usr/share/wanguard/version
+run_native DGH diag health
+
+# DGE diag unknown section: usage error, rc 1
+reset_state; conf_std
+run_native DGE diag bogus
+
+# INM inspect by MAC: registered member, live iface up
+reset_state; conf_std; sync_apply
+run_native INM inspect d8:bb:c1:cc:17:71
+
+# INH/ING inspect by hostname; ING is the configured-vs-live divergence
+# case (rostelecom member, wan2 down: slot row shows live=down)
+reset_state; conf_std; sync_apply
+cat > /tmp/dhcp.leases <<'EOF'
+1792900000 d8:bb:c1:cc:17:71 192.168.88.10 tower
+1792900001 aa:bb:cc:dd:ee:99 192.168.88.99 freeloader
+EOF
+run_native INH inspect tower
+run_native ING inspect 11:aa:22:bb:33:cc
+
+# INU inspect ungrouped: leased but not registered — a VALID answer
+run_native INU inspect 192.168.88.99
+
+# INX inspect unresolvable: the contract error path (stderr, rc 1)
+run_native INX inspect nosuchdevice
+
+# INP inspect proxy member: the Meta link is the live device
+reset_state; conf_std
+cat >> "$CONF" <<'EOF'
+config member 'm_pxy'
+	option mac 'aa:bb:cc:dd:ee:42'
+	option group 'proxy'
+EOF
+sync_apply
+run_native INP inspect aa:bb:cc:dd:ee:42
+
+# INL inspect direct-lb member: per-slot rows carry member= + live=
+reset_state
+cat > "$CONF" <<'EOF'
+config globals 'globals'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'vpn'
+	list member_iface 'wan2'
+	option weight_vpn '70'
+	option weight_wan2 '30'
+
+config member 'm_lb'
+	option mac 'aa:bb:cc:dd:ee:55'
+	option group 'lb'
+EOF
+iface vpn eth1
+addr  vpn 10.99.0.1
+iface wan2 ''
+add_link eth1
+add_link Meta
+sync_apply
+run_native INL inspect aa:bb:cc:dd:ee:55
+
+# SY syncstatus: the key=value probe, exit 0 on BOTH sides (DRIFT
+# verdict semantics stay exclusive to `list`)
+reset_state; conf_std
+run_raw SY1 syncstatus
+assert_rc "SY1: rc=0 on drift" "$(cat "$T/SY1.rc")" "0"
+grep_ok "SY1: status=drift"  '^status=drift$'    "$T/SY1.out"
+grep_ok "SY1: no stamp yet"  '^last_apply=-$'    "$T/SY1.out"
+grep_ok "SY1: no age yet"    '^age=-$'           "$T/SY1.out"
+sync_apply
+run_raw SY2 syncstatus
+assert_rc "SY2: rc=0 in-sync" "$(cat "$T/SY2.rc")" "0"
+grep_ok "SY2: status=in-sync"    '^status=in-sync$'        "$T/SY2.out"
+grep_ok "SY2: last_apply unix ts" '^last_apply=[0-9]+$'    "$T/SY2.out"
+grep_ok "SY2: age seconds"        '^age=[0-9]+$'           "$T/SY2.out"
+
+# EVS events ring: rows land in ts<TAB>code<TAB>detail shape; the
+# in-sync heartbeat records the FIRST of a quiet run only
+reset_state; conf_std
+run_raw EV1 apply
+run_raw EV2 apply
+run_raw EV3 apply
+assert_rc "EV: apply rc=0" "$(cat "$T/EV1.rc")" "0"
+has_line "EV: applied row recorded"   "$(printf 'apply_ok\tapplied')" "$WAND_DIR/events"
+has_line "EV: in-sync heartbeat"      "$(printf 'apply_ok\tin-sync')" "$WAND_DIR/events"
+assert_eq "EV: heartbeat deduped (2 rows total)" "$(wc -l < "$WAND_DIR/events")" "2"
+run_raw EV4 events 1
+assert_rc "EV: tail rc=0" "$(cat "$T/EV4.rc")" "0"
+grep_ok "EV: tail row shape" '^[0-9]{10}	apply_ok	in-sync$' "$T/EV4.out"
+assert_eq "EV: tail N=1 is one row" "$(wc -l < "$T/EV4.out")" "1"
+
+# DRP diag-report: the secrets-free aggregate (assert-gated: header
+# stamp carries real time). The gate PROVES the never-reads-network
+# property by planting markers in /etc/config/network and grepping.
+reset_state; conf_std; sync_apply
+cat > /etc/config/network <<'EOF'
+config interface 'wan'
+	option proto 'pppoe'
+	option password 'SUPERSECRET-PPPOE-PASS'
+	list servers 'SUPERSECRET-WG-KEY'
+EOF
+run_raw DRP diag-report
+assert_rc "DRP: rc=0" "$(cat "$T/DRP.rc")" "0"
+has_line "DRP: report header" "# wanguard diag-report" "$T/DRP.out"
+for s in rules tables nft health devices events; do
+	has_line "DRP: section $s" "$(printf "section\t$s")" "$T/DRP.out"
+done
+has_line "DRP: sync row" "$(printf 'sync\tin-sync\tlast_apply=')" "$T/DRP.out"
+has_line "DRP: member row" "$(printf 'member\td8:bb:c1:cc:17:71\ttower\tfreedom\t')" "$T/DRP.out"
+if grep -q SUPERSECRET /etc/config/network && ! grep -q SUPERSECRET "$T/DRP.out"; then
+	ok "DRP: secrets gate (markers planted, none leaked)"
+else
+	bad "DRP: secrets gate" "leaked or not planted" "0 leaks with markers present"
+fi
+rm -f /etc/config/network
 
 echo "----------------------------------------"
 if [ "$CAPTURE" = 1 ]; then

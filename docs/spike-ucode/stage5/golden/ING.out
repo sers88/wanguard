@@ -1,0 +1,9 @@
+device	11:aa:22:bb:33:cc
+mac	11:aa:22:bb:33:cc
+name	-
+ip	-
+online	0
+group	rostelecom
+slot	direct	mark=200	table=401	prio=8101	configured=wan2	live=down
+set	mac_rostelecom	member
+rule	marking	wg:rostelecom:m200	handle=6

@@ -1,0 +1,12 @@
+device	aa:bb:cc:dd:ee:55
+mac	aa:bb:cc:dd:ee:55
+name	-
+ip	-
+online	0
+group	lb
+slot	direct-lb	mark=100	table=400	prio=8100	configured=vpn	member=vpn	live=eth1
+slot	direct-lb	mark=200	table=401	prio=8101	configured=wan2	member=wan2	live=down
+set	mac_lb	member
+rule	marking	wg:lb:stick	handle=3
+rule	marking	wg:lb:s70@100	handle=4
+rule	marking	wg:lb:s100@200	handle=5

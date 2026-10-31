@@ -25,3 +25,12 @@ automatically: proxy = 300/500 fixed; direct (sorted by name) =
       [-color V] ...            '' clears; color: blue green purple orange gray
   devset <mac> <type|->         device type override (board icons):
                                 watch|tv|pc|printer|phone|tablet|generic; '-' clears
+
+#44/#45 diagnostics (read-only, ucode-only; data plane for the LuCI
+Diagnostics page and the header status badge):
+  events [N]                    event ring tail (default 20): ts, code, detail
+  syncstatus                    status=|last_apply=|age= (live drift probe)
+  diag [all|rules|tables|nft|health]
+                                read-only diagnostics sections
+  inspect <mac|ip|hostname>     one device: configured vs live
+  diag-report                   full secrets-free report (LuCI download)

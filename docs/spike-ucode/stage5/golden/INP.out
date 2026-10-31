@@ -1,0 +1,10 @@
+device	aa:bb:cc:dd:ee:42
+mac	aa:bb:cc:dd:ee:42
+name	-
+ip	-
+online	0
+group	proxy
+slot	proxy	mark=300	table=500	prio=8000	configured=proxy	live=Meta
+set	mac_proxy	member
+rule	marking	wg:proxy:m300	handle=3
+rule	redir	wg:proxy:r7892	handle=4

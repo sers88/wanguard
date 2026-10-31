@@ -1,0 +1,9 @@
+section	tables
+slot	proxy	proxy	Meta	mark=300	table=500	prio=8000
+route	proxy	default dev Meta 
+route	proxy	default via 192.0.2.1 dev mockwan metric 10 metric 200
+slot	freedom	direct	eth1	mark=100	table=400	prio=8100
+route	freedom	default dev eth1 
+route	freedom	default via 192.0.2.1 dev mockwan metric 10 metric 200
+slot	rostelecom	direct	down	mark=200	table=401	prio=8101
+route	rostelecom	default via 192.0.2.1 dev mockwan metric 10 metric 200

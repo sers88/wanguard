@@ -1,0 +1,7 @@
+device	192.168.88.99
+mac	aa:bb:cc:dd:ee:99
+name	freeloader
+ip	192.168.88.99
+online	0
+group	-
+note	not registered (use: wanguard add <mac> <group>)

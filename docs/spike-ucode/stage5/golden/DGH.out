@@ -1,0 +1,5 @@
+section	health
+service	wanguard	running
+service	mihomo	absent
+config	valid
+version	1.5.0-r1
