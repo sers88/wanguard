@@ -349,7 +349,19 @@ const ui = {
 	createHandlerFn(scope, fn) { return function() { return fn.apply(scope, arguments); }; },
 	changes: { init() { return Promise.resolve(); } }
 };
+/* minimal stand-in for LuCI's Class: core.js ends with
+ * L.Class.extend({...}) because the real loader (Class.isSubclass)
+ * rejects plain-object modules and instantiates the class itself */
+const Class = function() {};
+Class.prototype = {};
+Class.extend = function(properties) {
+	const F = function() {};
+	F.prototype = Object.assign(Object.create(this.prototype), properties);
+	F.extend = Class.extend;
+	return F;
+};
 const L = {
+	Class: Class,
 	bind(fn, scope) {
 		const pre = Array.prototype.slice.call(arguments, 2);
 		return function() { return fn.apply(scope, pre.concat(Array.prototype.slice.call(arguments))); };
@@ -368,12 +380,16 @@ const localStorageStub = { getItem() { return null; }, setItem() {} };
 /* load the REAL code: top-level return is legal in a Function body.
  * core.js declares 'require rpc/uci/ui/form' -> those are the wrapper's
  * params; the views declare 'require view/poll[/ui][/uci]' plus
- * 'require wanguard.core as wg' -> wg is passed explicitly. */
+ * 'require wanguard.core as wg' -> wg is passed explicitly. Like the
+ * real loader, core.js must yield a LuCI class -> return the INSTANCE. */
 function loadCore() {
 	const fn = new Function(
 		'rpc', 'uci', 'ui', 'form', 'poll', 'E', 'L', '_', 'document', 'window', 'localStorage',
 		CORE_SRC);
-	return fn(RPC, UCI, ui, form, poll, E, L, _, documentStub, windowStub, localStorageStub);
+	const C = fn(RPC, UCI, ui, form, poll, E, L, _, documentStub, windowStub, localStorageStub);
+	if (typeof C !== 'function')
+		throw new Error('core.js must yield a LuCI class (L.Class.extend)');
+	return new C();
 }
 
 function loadView(name, wg) {

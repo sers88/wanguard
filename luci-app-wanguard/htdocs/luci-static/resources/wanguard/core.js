@@ -998,7 +998,15 @@ function handleSaveApply(self, ev, mode) {
 	});
 }
 
-return {
+/* The LuCI module loader requires every module factory to yield a CLASS
+ * (Class.isSubclass check) and instantiates it: `require wanguard.core as
+ * wg` binds the INSTANCE — all logic lives in closures above, so the
+ * instance is a stateless facade over `state`. */
+return L.Class.extend({
+	__name__: 'LuCI.wanguard.core',
+
+	__init__() {},
+
 	state: state,
 	BOARD_CSS: BOARD_CSS,
 	callWanguard: callWanguard,
@@ -1045,4 +1053,4 @@ return {
 	buildGroupsGrid: buildGroupsGrid,
 	buildDevicesGrid: buildDevicesGrid,
 	handleSaveApply: handleSaveApply
-};
+});
