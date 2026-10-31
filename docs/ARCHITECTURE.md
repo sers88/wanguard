@@ -258,9 +258,15 @@ Properties and constraints:
   restarts, nft table wipes and full reboots.
 - `wanguard list` shows DRIFT when UCI and nft diverge (exit 1).
 - CLI↔keepalive races are safe: both sides do an idempotent diff.
-- **luci-app-wanguard** — a third client of the same UCI: a JS view
-  (Network → WAN Guard), two modes behind a "Board / Table" switch.
-  **Board**: columns = direct groups alphabetically, proxy, Unclassified;
+- **luci-app-wanguard** — a third client of the same UCI: four file views
+  under Network → WAN Guard (#46), each URL-addressable
+  (`…/admin/network/wanguard/{overview,devices,groups,diagnostics}`) and
+  sharing one core module (`wanguard.core`: RPC declarations, MAC helpers,
+  the alloc/LB mirror, parsers, board, grid factories). Every page shows
+  the header pill — in-sync/DRIFT state plus device/group counters — on a
+  15 s poll.
+  **Overview** keeps the "Board / Table" switch. **Board**: columns =
+  direct groups alphabetically, proxy, Unclassified;
   cards = clients (name/MAC/IP/online). Dropping a card applies the move
   silently (uci.save → uci.apply; this LuCI version auto-confirms the
   rollback window ~1 s in — no modal needed); on error — a toast and a
@@ -268,14 +274,18 @@ Properties and constraints:
   opens a "Move to" menu (touch/keyboard fallback; HTML5 DnD does not work
   on iOS, period). DRIFT makes the board read-only. A 15 s poll re-reads UCI
   + `wanguard devices` — CLI edits show up by themselves.
-  **Table**: groups grid, devices grid, adding from `/tmp/dhcp.leases`,
-  in-sync/DRIFT indicator; Save & Apply commits UCI and runs `wanguard
-  apply` via rpcd file-exec (ACL in acl.d). The browser never touches nft
+  **Table**: groups grid, devices grid (both, as before), adding from
+  `/tmp/dhcp.leases`; Save & Apply commits UCI and runs `wanguard apply`
+  via rpcd file-exec (ACL in acl.d). The **Devices** and **Groups &
+  Routes** pages expose the same grids standalone; **Diagnostics** is a
+  read-only summary (sync state, registered/group/unclassified counts)
+  built from already-loaded data. The browser never touches nft
   directly — only UCI + CLI apply. Online status and Unclassified come from
   `wanguard devices` (leases + ARP: static IPs are visible; the ACL was not
-  extended — no router-side data). Files: `luci-app-wanguard/` (view +
-  menu.d + acl.d), install via `scripts/deploy-luci.ps1` (clears LuCI
-  caches, restarts rpcd).
+  extended — no router-side data). Files: `luci-app-wanguard/` (4 views +
+  `resources/wanguard/core.js` + menu.d + acl.d), install via
+  `scripts/deploy-luci.ps1` (also removes the retired monolith
+  `view/wanguard.js`, clears LuCI caches, restarts rpcd).
 - #13 rollback: the pre-deploy snapshot made by `deploy-wanguard.ps1` lands
   in `/root/rollback/<date>/` (files + ruleset + ip rule + routes);
   procedure — see the private repo's plan, stage 8.

@@ -31,13 +31,16 @@ per-group routing tables: default dev <iface> + backup default metric 200
 Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (allocation, tags,
 incident post-mortems, boot order).
 
-## LuCI: kanban board
+## LuCI: WAN Guard (four pages)
 
-**Network → WAN Guard** — columns = groups + Unclassified, cards = clients
+**Network → WAN Guard** — four pages, each URL-addressable
+(`…/admin/network/wanguard/overview|devices|groups|diagnostics`).
+**Overview** — columns = groups + Unclassified, cards = clients
 (name/MAC/IP/online). Drag & drop moves a device, applied instantly; tapping a
 card opens a "Move to" menu (touch fallback). DRIFT switches the board to
 read-only until keepalive re-syncs the state. A table view remains for bulk
-edits.
+edits. **Devices** / **Groups & Routes** — the same grids standalone;
+**Diagnostics** — a read-only sync summary.
 
 ## Installation
 
@@ -103,7 +106,7 @@ the router must be followed by a tag so the feed matches the box again
 | `router/wanguard.nft` | nft table skeleton |
 | `router/etc.config.wanguard.example` | UCI template |
 | `router/wanguard-testmark` | debug: temporary MAC marking |
-| `luci-app-wanguard/` | view + menu.d + acl.d |
+| `luci-app-wanguard/` | 4 views + core module + menu.d + acl.d |
 | `apk/build.sh` | apk package build (wanguard + luci-app-wanguard) |
 | `keys/wanguard.pem` | feed signing public key |
 | `scripts/deploy-*.ps1` | scp/ssh deploy to the router (development) |
