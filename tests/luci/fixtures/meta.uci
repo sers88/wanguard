@@ -1,0 +1,27 @@
+config globals 'globals'
+
+# lab-shaped config (witness + lb members 70/30) + #42 group metadata:
+# label/color/description are UI-only options, the allocator ignores them.
+config group 'a'
+	option type 'direct'
+	option iface 'wan3'
+	option label 'Дом'
+	option color 'blue'
+	option description 'Main home LAN'
+
+config group 'lb'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	option weight_wan1 '70'
+	option weight_wan2 '30'
+	option color 'purple'
+
+config group 'p'
+	option type 'proxy'
+	option description 'mihomo egress'
+
+config member
+	option mac 'aa:bb:cc:dd:ee:55'
+	option group 'lb'
+	option name 'client'

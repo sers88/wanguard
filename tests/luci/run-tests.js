@@ -662,6 +662,172 @@ scenario('J14 config template', null, async (wg, tag) => {
 	assertEq(tag + ' c', wg.allocPreview('c'), 'fwmark 300 → table 500 (fixed)');
 });
 
+/* ======== #42/#43 metadata + TYPE checks (additive M1–M7; everything
+ * above must stay byte-identical — the meta options are UI-only) ======== */
+
+const META = fixture('meta.uci');
+
+/* 5-column devices output (the #43 CLI): client is a phone (override),
+ * the ARP-only row is generic */
+const DEV5 = [
+	'aa:bb:cc:dd:ee:55\t192.168.1.55\tclient\t1\tphone',
+	'aa:bb:cc:dd:ee:99\t192.168.1.99\t-\t1\tgeneric'
+].join('\n');
+
+function cannedMeta() {
+	RPC.canned = {
+		'read:/tmp/dhcp.leases': '',
+		'exec:/usr/bin/wanguard:list': { stdout: 'nft: in-sync' },
+		'exec:/usr/bin/wanguard:devices': { stdout: DEV5 },
+		'exec:/usr/bin/wanguard:grouplist': { stdout: '' },
+		'dump': { interface: [ { interface: 'lan', up: true } ] }
+	};
+}
+
+/* --- M1: parseDevices reads the 5th column; 4-column legacy degrades --- */
+scenario('M1 parseDevices TYPE (#43)', 'lb2.uci', async (wg, tag) => {
+	const five = wg.parseDevices(DEV5);
+	assertEq(tag + ' 5-col: type parsed', five[0].type, 'phone');
+	assertEq(tag + ' 5-col: generic row', five[1].type, 'generic');
+	const four = wg.parseDevices('aa:bb:cc:dd:ee:55\t192.168.1.55\tclient\t1');
+	assertEq(tag + ' 4-col legacy: type empty (no exception)', four[0].type, '');
+	assertEq(tag + ' 4-col legacy: fields intact',
+		[ four[0].mac, four[0].ip, four[0].name, four[0].online ? '1' : '0' ].join('|'),
+		'aa:bb:cc:dd:ee:55|192.168.1.55|client|1');
+	ok(tag + ' garbage lines skipped', wg.parseDevices('x\ty\n').length === 0);
+});
+
+/* --- M2: groupColor reads the UCI palette key --- */
+scenario('M2 groupColor (#42)', 'meta.uci', async (wg, tag) => {
+	assertEq(tag + ' blue hex', wg.groupColor('a'), '#2563EB');
+	assertEq(tag + ' purple hex', wg.groupColor('lb'), '#7C3AED');
+	assertEq(tag + ' no color option -> ""', wg.groupColor('p'), '');
+	ok(tag + ' unknown key falls back to ""', !wg.groupColor('nope'));
+});
+
+/* --- M2b: legacy fixture (no metadata) keeps the pre-#42 look --- */
+scenario('M2b groupColor legacy unchanged', 'legacy.uci', async (wg, tag) => {
+	assertEq(tag + ' no metadata anywhere -> all ""',
+		wg.boardGroups().map((g) => wg.groupColor(g.name)).join(','), ',,,');
+	assertEq(tag + ' titles fall back to technical labels',
+		wg.boardGroups().map((g) => g.title).join('|'),
+		'a — wan3|b — wan1|c — wan2|p — mihomo');
+});
+
+/* --- M3: board column — UCI label as title, color dot, descr tooltip --- */
+scenario('M3 board label/color/descr (#42)', 'meta.uci', async (wg, tag) => {
+	cannedMeta();
+	const ov = loadView('overview', wg);
+	await ov.load();
+	const root = await ov.render();
+
+	const col = findCol(root, 'a');
+	assertEq(tag + ' title uses UCI label', colParts(col).title, 'Дом');
+	const head = col.children[0];
+	const titleEl = head.children[0];
+	const dot = titleEl.children[0];
+	ok(tag + ' color dot present', !!dot && (dot.attrs.class || '').indexOf('wg-dot') !== -1, dot.attrs);
+	assertEq(tag + ' dot painted with the palette hex', dot.styleStr, 'background:#2563EB');
+	assertEq(tag + ' description is the header tooltip', head.attrs.title, 'Main home LAN');
+
+	const lb = colParts(findCol(root, 'lb'));
+	assertEq(tag + ' no label -> technical title', lb.title, 'lb — LB');
+	const lbdot = findCol(root, 'lb').children[0].children[0].children[0];
+	ok(tag + ' lb dot present (color without label)', (lbdot.attrs.class || '').indexOf('wg-dot') !== -1);
+	assertEq(tag + ' lb dot hex', lbdot.styleStr, 'background:#7C3AED');
+
+	const phead = findCol(root, 'p').children[0];
+	assertEq(tag + ' descr-only group still gets the tooltip', phead.attrs.title, 'mihomo egress');
+	ok(tag + ' no dot without color', !(phead.children[0].children[0].attrs || {}).class);
+
+	const uhead = findCol(root, '').children[0];
+	ok(tag + ' Unclassified stays undecorated',
+		uhead.attrs.title === undefined &&
+		!(uhead.children[0].children[0].attrs || {}).class);
+});
+
+/* --- M4: card TYPE icon from the 5th devices column --- */
+scenario('M4 board card TYPE icon (#43)', 'meta.uci', async (wg, tag) => {
+	cannedMeta();
+	const ov = loadView('overview', wg);
+	await ov.load();
+	const root = await ov.render();
+
+	const meta = findCol(root, 'lb').children[1].children[0].children[2];
+	const icon = meta.children[1];
+	ok(tag + ' icon span present', !!icon && (icon.attrs.class || '') === 'wg-type wg-type-phone', icon.attrs);
+	ok(tag + ' icon carries the svg markup', (icon.innerHTML || '').indexOf('<svg') === 0, icon.innerHTML);
+	assertEq(tag + ' icon tooltip names the type', icon.attrs.title, 'type: phone');
+
+	const umeta = findCol(root, '').children[1].children[0].children[2];
+	const uicon = umeta.children[1];
+	ok(tag + ' generic icon for the unclassified device',
+		(uicon.attrs.class || '').indexOf('wg-type-generic') !== -1, uicon.attrs);
+});
+
+/* --- M4b: old 4-column CLI -> no icon nodes (the pre-#43 card) --- */
+scenario('M4b no TYPE column -> no icons', 'lb2.uci', async (wg, tag) => {
+	cannedLb2();
+	const ov = loadView('overview', wg);
+	await ov.load();
+	const root = await ov.render();
+	const card = findCol(root, 'lb').children[1].children[0];
+	const metaRow = card.children[2];
+	ok(tag + ' no .wg-type node anywhere in the card',
+		!metaRow.children.some((c) => c.attrs && (c.attrs.class || '').indexOf('wg-type') !== -1),
+		metaRow.children.map((c) => c.attrs.class));
+});
+
+/* --- M5: groups grid gains label/color/description (#42) --- */
+scenario('M5 groups grid metadata options', 'meta.uci', async (wg, tag) => {
+	wg.state.ifaces = [ 'lan', 'wan1', 'wan2' ];
+	const gv = loadView('groups', wg);
+	await gv.render();
+	const groups = gv._map.children[0];
+
+	const label = groups.children.find((c) => c.option === 'label');
+	ok(tag + ' label option (Value)', !!label && label.__cls === form.Value);
+	assertEq(tag + ' label rmempty', label.rmempty, true);
+
+	const color = groups.children.find((c) => c.option === 'color');
+	ok(tag + ' color option (ListValue)', !!color && color.__cls === form.ListValue);
+	assertEq(tag + ' color: none + 5 palette keys',
+		JSON.stringify(color.values.map((v) => v[0])),
+		JSON.stringify([ '', 'blue', 'green', 'purple', 'orange', 'gray' ]));
+	assertEq(tag + ' color rmempty', color.rmempty, true);
+
+	const descr = groups.children.find((c) => c.option === 'description');
+	ok(tag + ' description option (Value)', !!descr && descr.__cls === form.Value);
+	assertEq(tag + ' description rmempty', descr.rmempty, true);
+});
+
+/* --- M6: devices grid gains the devtype override (#43) --- */
+scenario('M6 devices grid devtype', 'legacy.uci', async (wg, tag) => {
+	const dv = loadView('devices', wg);
+	await dv.render();
+	const grid = dv._map.children[0];
+	const dt = grid.children.find((c) => c.option === 'devtype');
+	ok(tag + ' devtype option (ListValue)', !!dt && dt.__cls === form.ListValue);
+	assertEq(tag + ' auto + the 7 whitelisted types',
+		JSON.stringify(dt.values.map((v) => v[0])),
+		JSON.stringify([ '', 'watch', 'tv', 'pc', 'printer', 'phone', 'tablet', 'generic' ]));
+	assertEq(tag + ' devtype rmempty', dt.rmempty, true);
+});
+
+/* --- M7: staged metadata edits show up through the same display path --- */
+scenario('M7 metadata edit persistence', 'meta.uci', async (wg, tag) => {
+	UCI.set('wanguard', 'a', 'color', 'green');
+	UCI.commit();
+	assertEq(tag + ' color survives Save&Apply', wg.groupColor('a'), '#22C55E');
+	UCI.set('wanguard', 'a', 'color', null); /* rmempty semantics */
+	UCI.commit();
+	assertEq(tag + ' cleared color -> "" (no dot)', wg.groupColor('a'), '');
+	UCI.set('wanguard', 'a', 'label', 'Work');
+	UCI.commit();
+	assertEq(tag + ' label edit reaches the board title',
+		wg.boardGroups().filter((g) => g.name == 'a')[0].title, 'Work');
+});
+
 /* ======== #46 layout checks (additive; behavior above is untouched) ======== */
 
 /* --- L1: menu.d — category + four deep-linkable children --- */

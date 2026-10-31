@@ -22,8 +22,16 @@
  * became `state`, grid construction became factories. Page session state
  * lives in `state` (one browser page = one module instance); tests/luci
  * re-evaluates this file per scenario, providing the same fresh closure
- * the monolith had. groupColor() is a palette placeholder for the group
- * metadata follow-up (#42) — #46 deliberately paints nothing.
+ * the monolith had.
+ *
+ * Group/device metadata (#42/#43): groupColor() now reads the UCI
+ * `option color` (prototype palette) instead of stubbing; board columns
+ * show `option label` + a color dot and carry `option description` as
+ * the header tooltip; `wanguard devices` TYPE (5th column since the
+ * #43 CLI) feeds outline SVG icons on the cards — a 4-column (old CLI)
+ * output degrades to the pre-#43 card, no exceptions. The Groups grid
+ * edits label/color/description, the Devices grid edits the member
+ * `option devtype` override — all plain UCI, Save&Apply as everywhere.
  */
 'use strict';
 'require rpc';
@@ -247,11 +255,47 @@ function groupChoices() {
 	return out;
 }
 
-/* groupColor(name) — palette placeholder (#42): stable per-group colors
- * belong to the prototype pages built on top of #46. Pure-refactor rule:
- * this paints nothing until that issue lands. */
+/* group color palette (#42): keys are the CLI-validated UCI values
+ * (`wanguard groupset <name> -color <key>` / the ListValue below), hexes
+ * from the UI prototypes (designe/). Missing option = no marker (the
+ * pre-#42 look). */
+var GROUP_COLORS = {
+	blue: '#2563EB',
+	green: '#22C55E',
+	purple: '#7C3AED',
+	orange: '#EA580C',
+	gray: '#6B7280'
+};
+
 function groupColor(name) {
-	return '';
+	var g = (uci.sections('wanguard', 'group') || []).filter(function(s) {
+		return s['.name'] == name;
+	})[0];
+	return (g && GROUP_COLORS[g.color]) || '';
+}
+
+/* TYPE icons (#43): outline SVG matching the prototype style, one per
+ * `wanguard devices` column-5 value. Rendered via innerHTML — static
+ * strings from THIS table only, never user data. An unknown/empty type
+ * (old 4-column CLI) paints nothing. */
+var TYPE_SVG = {
+	watch: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="6.5" width="10" height="11" rx="3"/><path d="M9.5 6.5 10 3h4l.5 3.5M9.5 17.5 10 21h4l.5-3.5"/><path d="M12 10.5V13l1.5 1"/></svg>',
+	tv: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="12" rx="2"/><path d="M8.5 21h7M12 17v4"/></svg>',
+	pc: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="10" rx="1.5"/><path d="M2.5 18.5h19l-1.5-3h-16z"/></svg>',
+	printer: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 8V4h10v4"/><rect x="4" y="8" width="16" height="8" rx="1.5"/><path d="M7 14h10v6H7z"/></svg>',
+	phone: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3.5" width="8" height="17" rx="2"/><path d="M11 18h2"/></svg>',
+	tablet: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="3.5" width="13" height="17" rx="2"/><path d="M10.5 18h3"/></svg>',
+	generic: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M8.5 12h7M12 8.5v7"/></svg>'
+};
+
+function typeIcon(type) {
+	var t = (type && TYPE_SVG[type]) ? type : '';
+	var el = E('span', {
+		'class': 'wg-type' + (t ? ' wg-type-' + t : ''),
+		'title': t ? _('type: %s').format(t) : ''
+	});
+	el.innerHTML = TYPE_SVG[t || 'generic'];
+	return el;
 }
 
 var BOARD_CSS = [
@@ -270,6 +314,9 @@ var BOARD_CSS = [
 	'.wg-card .wg-meta { font-size:.78em; display:flex; justify-content:space-between; gap:1em; }',
 	'.wg-on { color:#5cb85c; }',
 	'.wg-off { color:#999; }',
+	'.wg-dot { display:inline-block; width:.65em; height:.65em; border-radius:50%; margin-right:.4em; vertical-align:.05em; }',
+	'.wg-type { opacity:.75; line-height:1; }',
+	'.wg-type svg { display:inline; vertical-align:-.12em; }',
 	'.wg-col.wg-drop { outline:2px dashed #4a90d9; outline-offset:-3px; background:rgba(74,144,217,.10); }',
 	'.wg-menu button { display:block; width:100%; margin:.25em 0; }'
 ].join('\n');
@@ -287,13 +334,15 @@ function parseLeases(out) {
 }
 
 function parseDevices(out) {
-	/* `wanguard devices` (issue #14): mac<TAB>ip<TAB>name<TAB>online,
-	 * merged leases+ARP — includes static-IP clients */
+	/* `wanguard devices` (issue #14): mac<TAB>ip<TAB>name<TAB>online
+	 * [<TAB>type since the #43 CLI], merged leases+ARP — includes
+	 * static-IP clients. type stays '' on the old 4-column CLI
+	 * (degradation: no icon, current behavior otherwise). */
 	return (out || '').split('\n').map(function(line) {
 		var f = line.split('\t');
 		if (f.length < 4)
 			return null;
-		return { mac: f[0], ip: (f[1] == '-' ? '' : f[1]), name: (f[2] == '-' ? '' : f[2]), online: (f[3] == '1') };
+		return { mac: f[0], ip: (f[1] == '-' ? '' : f[1]), name: (f[2] == '-' ? '' : f[2]), online: (f[3] == '1'), type: (f.length >= 5) ? f[4] : '' };
 	}).filter(function(d) { return d && normalizeMac(d.mac); });
 }
 
@@ -451,9 +500,13 @@ function macLabel(mac) {
 }
 
 function boardGroups() {
-	/* columns: direct groups alphabetically, then proxy, then Unclassified */
+	/* columns: direct groups alphabetically, then proxy, then Unclassified.
+	 * #42: `label` keeps the technical "name — target" form (golden),
+	 * `title` prefers the UCI display label; color/descr decorate the
+	 * column header (dot + tooltip). */
 	var gs = (uci.sections('wanguard', 'group') || []).map(function(g) {
-		return { name: g['.name'], type: g.type || 'direct', iface: g.iface || '' };
+		return { name: g['.name'], type: g.type || 'direct', iface: g.iface || '',
+			metaLabel: g.label || '', color: GROUP_COLORS[g.color] || '', descr: g.description || '' };
 	});
 	var dirs = gs.filter(function(g) { return g.type != 'proxy'; })
 		.sort(function(a, b) { return a.name.localeCompare(b.name); });
@@ -468,7 +521,8 @@ function boardGroups() {
 			lbl += ' — LB';
 		else if (g.iface != g.name)
 			lbl += ' — ' + (g.iface || '?');
-		return { name: g.name, label: lbl };
+		return { name: g.name, label: lbl, title: g.metaLabel || lbl,
+			color: g.color, descr: g.descr };
 	});
 }
 
@@ -487,6 +541,7 @@ function buildCard(it, inGroup) {
 		E('div', { 'class': 'wg-mac' }, [ it.mac ]),
 		E('div', { 'class': 'wg-meta' }, [
 			E('span', {}, [ it.ip || '—' ]),
+			it.type ? typeIcon(it.type) : E([]), /* #43: board icon */
 			E('span', { 'class': it.online ? 'wg-on' : 'wg-off' },
 				[ it.online ? '● ' + _('online') : '○ ' + _('offline') ])
 		])
@@ -543,10 +598,17 @@ function buildBoard() {
 	var members = (uci.sections('wanguard', 'member') || []);
 	var known = knownMacMap();
 
-	var mkColumn = function(key, title, sub, cards) {
+	var mkColumn = function(key, title, sub, cards, color, descr) {
+		var headAttrs = { 'class': 'wg-col-h' };
+		if (descr) /* #42: the description is the column tooltip */
+			headAttrs['title'] = descr;
+		var titleContent = [];
+		if (color) /* #42: palette marker dot */
+			titleContent.push(E('span', { 'class': 'wg-dot', 'style': 'background:%s'.format(color) }, []));
+		titleContent.push(title);
 		var col = E('div', { 'class': 'wg-col', 'data-group': key }, [
-			E('div', { 'class': 'wg-col-h' }, [
-				E('div', { 'class': 'wg-col-title' }, [ title ]),
+			E('div', headAttrs, [
+				E('div', { 'class': 'wg-col-title' }, titleContent),
 				sub ? E('div', { 'class': 'wg-col-sub' }, [ sub ]) : E([])
 			]),
 			E('div', { 'class': 'wg-cards' }, cards)
@@ -583,7 +645,8 @@ function buildBoard() {
 					mac: mac,
 					name: mm.name || d.name || '',
 					ip: d.ip || '',
-					online: !!d.online
+					online: !!d.online,
+					type: d.type || ''
 				};
 			})
 			.sort(function(a, b) {
@@ -596,9 +659,10 @@ function buildBoard() {
 		if (hideOfflineMode())
 			items = items.filter(function(it) { return it.online; });
 
-		board.appendChild(mkColumn(g.name, g.label,
+		board.appendChild(mkColumn(g.name, g.title,
 			'%s · %s'.format(allocPreview(g.name), colCount(items.length, total)),
-			items.map(function(it) { return buildCard(it, true); })));
+			items.map(function(it) { return buildCard(it, true); }),
+			g.color, g.descr));
 	});
 
 	/* Unclassified: seen devices that are not members of any group */
@@ -616,7 +680,7 @@ function buildBoard() {
 	board.appendChild(mkColumn('', _('Unclassified'),
 		'%s · %s'.format(_('DHCP/ARP devices outside all groups'),
 			colCount(uitems.length, utotal)),
-		uitems.map(function(d) { return buildCard(d, false); })));
+		uitems.map(function(d) { return buildCard(d, false); }), '', ''));
 
 	root.appendChild(board);
 	return root;
@@ -738,7 +802,7 @@ function showCardMenu(mac, inGroup) {
 				ui.hideModal();
 				applyMove(mac, g.name);
 			})
-		}, [ _('Move to %s').format(g.label) ]));
+		}, [ _('Move to %s').format(g.title || g.label) ]));
 	});
 
 	if (curGroup)
@@ -805,6 +869,23 @@ function addGroupsSection(m) {
 		if (!Object.keys(seen).length)
 			o.value('', _('(interface list unavailable — check ACL/ubus)'));
 	}
+
+	/* metadata (#42): UI-only options — the allocator, nft and the CLI
+	 * commands never read them; label/color/description decorate the
+	 * board and this grid (rmempty: absent option = the pre-#42 look) */
+	o = groups.option(form.Value, 'label', _('Label'));
+	o.rmempty = true;
+	o.description = _('Display name for the board and grids (empty = the section name). UI-only: allocation, nft tags and the CLI keep using the section name.');
+
+	o = groups.option(form.ListValue, 'color', _('Color'));
+	o.value('', _('(none)'));
+	Object.keys(GROUP_COLORS).forEach(function(k) { o.value(k, k); });
+	o.rmempty = true;
+	o.description = _('Marker color on the board (prototype palette). CLI equivalent: wanguard groupset %s -color <key>.');
+
+	o = groups.option(form.Value, 'description', _('Description'));
+	o.rmempty = true;
+	o.description = _('Free-form note (shown as the board column tooltip).');
 
 	/* direct-lb members/weights live in the modal only (#40): the grid
 	 * rows keep the direct/proxy layout unchanged, and GridSection.save
@@ -895,6 +976,17 @@ function addDevicesSection(m) {
 		gch = [ [ '', _('(no groups defined)') ] ];
 	gch.forEach(function(g) { o.value(g[0], g[1]); });
 	o.rmempty = false;
+
+	/* device type (#43): the manual override that beats the CLI hostname
+	 * heuristic; the value shows up as the board icon via `wanguard
+	 * devices` column 5. Empty = auto (heuristic decides). */
+	o = grid.option(form.ListValue, 'devtype', _('Device type'));
+	o.value('', _('(auto — hostname heuristic)'));
+	[ 'watch', 'tv', 'pc', 'printer', 'phone', 'tablet', 'generic' ].forEach(function(t) {
+		o.value(t, t);
+	});
+	o.rmempty = true;
+	o.description = _('Overrides the type guessed from the hostname (board icon). Reset: empty, or wanguard devset <mac> -.');
 
 	return grid;
 }
@@ -1026,6 +1118,9 @@ return L.Class.extend({
 	allocPreview: allocPreview,
 	groupChoices: groupChoices,
 	groupColor: groupColor,
+	GROUP_COLORS: GROUP_COLORS,
+	TYPE_SVG: TYPE_SVG,
+	typeIcon: typeIcon,
 	boardGroups: boardGroups,
 	parseLeases: parseLeases,
 	parseDevices: parseDevices,
