@@ -212,6 +212,9 @@ config group 'lb'                     # direct-lb → balance across members
         list member_iface 'wan1'      # (weight edits never re-key slots)
         list member_iface 'wan3'
         option weight_wan1 '70'       # weight_<iface>; absent/garbage/0 → 50
+        option label 'Load balance'   # #42 metadata: UI-only display name
+        option color 'purple'         # #42: board marker (blue/green/purple/orange/gray)
+        option description '...'      # #42: free-form note (column tooltip)
 
 config group 'c'
         option type 'proxy'           # proxy → mihomo (max 1 group)
@@ -220,6 +223,8 @@ config member 'm_001122334455'        # section = m_<mac-without-colons>
         option name 'desktop-eth'
         option mac '00:11:22:33:44:55'
         option group 'c'
+        option devtype 'pc'           # #43: manual type override (board icon);
+                                      # empty = the hostname heuristic decides
 ```
 
 CLI (`/usr/bin/wanguard`, template: `router/etc.config.wanguard.example`):
@@ -227,13 +232,20 @@ CLI (`/usr/bin/wanguard`, template: `router/etc.config.wanguard.example`):
 ```
 wanguard list                       members + UCI↔nft drift status
 wanguard grouplist                  groups: type/iface/mark/table/device/members
-wanguard devices                    LAN clients: mac/ip/name/online (board data)
+wanguard groupmeta [name]           group metadata: name/label/color/description (TAB, #42)
+wanguard devices                    LAN clients: mac/ip/name/online/type (board data;
+                                    type = #43 hostname heuristic, devtype overrides)
 wanguard add <mac> <group> [name]   register + apply
 wanguard move <mac> <group>         change group + apply
 wanguard remove <mac>               delete + apply
 wanguard apply                      full UCI -> nft + ip rules + tables sync
 wanguard groupadd <name> <iface|proxy>   create group + apply
 wanguard groupset <name> <iface|proxy>   change group target + apply
+wanguard groupset <name> -label V [-color V] [-description V]   #42 metadata
+                                    (empty value = clear; color = blue/green/purple/
+                                    orange/gray; no apply — UI-only data)
+wanguard devset <mac> <type|->      #43 device type override for the board icons
+                                    (watch/tv/pc/printer/phone/tablet/generic)
 wanguard groupdel <name>                 delete empty group + apply
 ```
 
@@ -266,8 +278,11 @@ Properties and constraints:
   the header pill — in-sync/DRIFT state plus device/group counters — on a
   15 s poll.
   **Overview** keeps the "Board / Table" switch. **Board**: columns =
-  direct groups alphabetically, proxy, Unclassified;
-  cards = clients (name/MAC/IP/online). Dropping a card applies the move
+  direct groups alphabetically, proxy, Unclassified; column headers show
+  the UCI `label` (fallback: name — target), a palette color dot and the
+  `description` tooltip (#42); cards = clients (name/MAC/IP/online) with
+  a TYPE icon from the `wanguard devices` 5th column (#43; old 4-column
+  CLIs degrade to the icon-less card). Dropping a card applies the move
   silently (uci.save → uci.apply; this LuCI version auto-confirms the
   rollback window ~1 s in — no modal needed); on error — a toast and a
   board rebuild from re-read UCI (the card "bounces back"). Tapping a card
@@ -275,7 +290,10 @@ Properties and constraints:
   on iOS, period). DRIFT makes the board read-only. A 15 s poll re-reads UCI
   + `wanguard devices` — CLI edits show up by themselves.
   **Table**: groups grid, devices grid (both, as before), adding from
-  `/tmp/dhcp.leases`; Save & Apply commits UCI and runs `wanguard apply`
+  `/tmp/dhcp.leases`; the groups grid edits label/color/description (#42,
+  UI-only — allocation never reads them) and the devices grid edits the
+  member `devtype` override (#43). Save & Apply commits UCI and runs
+  `wanguard apply`
   via rpcd file-exec (ACL in acl.d). The **Devices** and **Groups &
   Routes** pages expose the same grids standalone; **Diagnostics** is a
   read-only summary (sync state, registered/group/unclassified counts)
@@ -331,8 +349,11 @@ Properties and constraints:
   same UCI/state; since v1.1.0 there is no in-package sh companion to
   fall back to). Contract surfaces are frozen:
   `docs/spike-ucode/00-CLI-CONTRACT.md` + golden byte fixtures
-  (`stage5/contract-gate.sh`); evidence: `docs/spike-ucode/VERDICT.md`
-  and the stage1–stage5 notes.
+  (`stage5/contract-gate.sh`); additive post-freeze deltas (#42/#43
+  metadata/TYPE — new subcommands, an extra `devices` column, no change
+  to any frozen byte of the old surfaces) are recorded in the contract's
+  §1.1; evidence: `docs/spike-ucode/VERDICT.md` and the stage1–stage5
+  notes.
 
 ### 7.1 direct-lb: WAN load balancing for direct groups (#27–#41)
 
