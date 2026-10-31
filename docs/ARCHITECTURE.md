@@ -247,6 +247,39 @@ wanguard groupset <name> -label V [-color V] [-description V]   #42 metadata
 wanguard devset <mac> <type|->      #43 device type override for the board icons
                                     (watch/tv/pc/printer/phone/tablet/generic)
 wanguard groupdel <name>                 delete empty group + apply
+wanguard events [N]                 #44 event ring tail (default 20): unix-ts,
+                                    code, detail (TAB; ucode-only). Codes:
+                                    apply_ok/apply_err (the in-sync heartbeat
+                                    records the first of a quiet run only),
+                                    drift/restored (live edit under unchanged
+                                    UCI), flush, failover/failback, lbover,
+                                    config_validated (anomalies only). The ring
+                                    is tmpfs (WAND_DIR/events, 200 rows) — a
+                                    UI feed, not a syslog replacement (#21)
+wanguard syncstatus                 #44 machine probe, exit 0 always:
+                                    status=in-sync|drift (live sets-diff, the
+                                    `list` logic — NOT ring-fed), last_apply
+                                    (unix ts of the last successful apply),
+                                    age (s). DRIFT verdict semantics stay
+                                    exclusive to `list`
+wanguard diag [all|rules|tables|nft|health]   #45 read-only TAB sections:
+                                    full `ip rule show` (foreign rules are the
+                                    point), per-slot tables+routes, the nft
+                                    table verbatim, health (procd wanguard/
+                                    mihomo via `ubus call service list`,
+                                    config validity, package version from the
+                                    apk build stamp /usr/share/wanguard/version)
+wanguard inspect <mac|ip|hostname>  #45 one device: configured vs live (group,
+                                    mark/table, configured iface vs live device,
+                                    nft set membership, matching wg: rules);
+                                    unresolvable = rc 1, ungrouped = valid answer
+wanguard diag-report                #45 full text report (LuCI "Download
+                                    report"): sync + all diag sections + the
+                                    registered members + the event ring.
+                                    Secrets-free by construction: reads ONLY
+                                    read-command output and UCI wanguard —
+                                    never /etc/config/network (PPPoE/WG
+                                    secrets); test-gated in both suites
 ```
 
 Properties and constraints:

@@ -27,6 +27,11 @@ per-group routing tables: default dev <iface> + backup default metric 200
   group's dead interface → fallback route; nothing can take the whole
   internet down.
 - **The browser never touches nft**: LuCI edits UCI and calls `wanguard apply`.
+- **Diagnostics data plane** (#44/#45): read-only CLI surfaces for the LuCI
+  Diagnostics page — `wanguard events [N]` (tmpfs event ring: apply/drift/
+  failover/flush), `wanguard syncstatus`, `wanguard diag`, `wanguard
+  inspect <device>`, and a secrets-free `wanguard diag-report`. See
+  ARCHITECTURE.md §5.
 
 Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (allocation, tags,
 incident post-mortems, boot order).
