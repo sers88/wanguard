@@ -72,11 +72,19 @@ pkg wanguard \
 	"ip-full nftables conntrack ucode ucode-mod-fs ucode-mod-uci ucode-mod-ubus" "$W"
 
 # ---- luci-app-wanguard ----
+# Four file views + shared core module (issue #46): the monolith
+# view/wanguard.js is RETIRED — like /usr/bin/wanguard-sh above, it must
+# never come back (CI feed-test asserts its absence).
 L="$work/luci-app-wanguard"
-mkdir -p "$L/www/luci-static/resources/view" "$L/usr/share/luci/menu.d" "$L/usr/share/rpcd/acl.d"
-inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard.js" "$L/www/luci-static/resources/view/wanguard.js" 644
+mkdir -p "$L/www/luci-static/resources/view/wanguard" "$L/www/luci-static/resources/wanguard" \
+	"$L/usr/share/luci/menu.d" "$L/usr/share/rpcd/acl.d"
+inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/overview.js"     "$L/www/luci-static/resources/view/wanguard/overview.js" 644
+inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/devices.js"      "$L/www/luci-static/resources/view/wanguard/devices.js" 644
+inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/groups.js"       "$L/www/luci-static/resources/view/wanguard/groups.js" 644
+inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/diagnostics.js"  "$L/www/luci-static/resources/view/wanguard/diagnostics.js" 644
+inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/wanguard/core.js"              "$L/www/luci-static/resources/wanguard/core.js" 644
 inst "$ROOT/luci-app-wanguard/usr/share/luci/menu.d/luci-app-wanguard.json"  "$L/usr/share/luci/menu.d/luci-app-wanguard.json" 644
 inst "$ROOT/luci-app-wanguard/usr/share/rpcd/acl.d/luci-app-wanguard.json"   "$L/usr/share/rpcd/acl.d/luci-app-wanguard.json" 644
 pkg luci-app-wanguard \
-	"LuCI kanban board for wanguard client groups" \
+	"LuCI app for wanguard client groups (overview board, devices, groups, diagnostics)" \
 	"wanguard luci-base" "$L"

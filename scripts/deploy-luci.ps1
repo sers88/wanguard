@@ -1,8 +1,11 @@
 <#
-deploy-luci.ps1 — install/update luci-app-wanguard on the router (issue #8).
+deploy-luci.ps1 — install/update luci-app-wanguard on the router (issue #8,
+four-page layout per issue #46).
 
-Installs the JS view, menu.d and acl.d, clears LuCI caches and restarts rpcd
-so the new menu/ACL take effect. Live /etc/config/wanguard is NOT touched.
+Installs the five JS files (four views + shared core module), menu.d and
+acl.d, removes the retired monolith view, clears LuCI caches and restarts
+rpcd so the new menu/ACL take effect. Live /etc/config/wanguard is NOT
+touched.
 
 Usage:
   .\scripts\deploy-luci.ps1                 # 192.168.1.1
@@ -20,7 +23,11 @@ $Root = Join-Path $PSScriptRoot ".."
 $SshOpts = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new")
 
 $Files = @(
-    @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard.js"; Dst = "/www/luci-static/resources/view/wanguard.js" },
+    @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard\overview.js"; Dst = "/www/luci-static/resources/view/wanguard/overview.js" },
+    @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard\devices.js"; Dst = "/www/luci-static/resources/view/wanguard/devices.js" },
+    @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard\groups.js"; Dst = "/www/luci-static/resources/view/wanguard/groups.js" },
+    @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard\diagnostics.js"; Dst = "/www/luci-static/resources/view/wanguard/diagnostics.js" },
+    @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\wanguard\core.js"; Dst = "/www/luci-static/resources/wanguard/core.js" },
     @{ Src = "$Root\luci-app-wanguard\usr\share\luci\menu.d\luci-app-wanguard.json"; Dst = "/usr/share/luci/menu.d/luci-app-wanguard.json" },
     @{ Src = "$Root\luci-app-wanguard\usr\share\rpcd\acl.d\luci-app-wanguard.json"; Dst = "/usr/share/rpcd/acl.d/luci-app-wanguard.json" }
 )
@@ -37,8 +44,12 @@ foreach ($f in $Files) {
     Write-Host ("==> upload {0}" -f (Split-Path $f.Src -Leaf))
     & scp @SshOpts -O $f.Src "${User}@${Router}:/tmp/wanguard-luci.tmp" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "scp failed for $($f.Src)" }
-    Invoke-Remote ("mv /tmp/wanguard-luci.tmp {0} && sed -i 's/`r`$//' {0} && chmod 644 {0}" -f $f.Dst)
+    $DstDir = $f.Dst -replace '/[^/]+$', ''
+    Invoke-Remote ("mkdir -p {0} && mv /tmp/wanguard-luci.tmp {1} && sed -i 's/`r`$//' {1} && chmod 644 {1}" -f $DstDir, $f.Dst)
 }
+
+Write-Host "==> remove the retired monolith view (issue #46: 4 pages + core)"
+Invoke-Remote "rm -f /www/luci-static/resources/view/wanguard.js"
 
 Write-Host "==> validate JSON files"
 Invoke-Remote "jsonfilter -i /usr/share/luci/menu.d/luci-app-wanguard.json >/dev/null && jsonfilter -i /usr/share/rpcd/acl.d/luci-app-wanguard.json >/dev/null && echo JSON-OK"

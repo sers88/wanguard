@@ -135,7 +135,12 @@ jobs:
             test -f /etc/init.d/wan-watch
             test -f /usr/share/wanguard/wanguard.nft
             test -f /usr/share/wanguard/etc.config.wanguard.example
-            test -f /www/luci-static/resources/view/wanguard.js
+            test -f /www/luci-static/resources/view/wanguard/overview.js
+            test -f /www/luci-static/resources/view/wanguard/devices.js
+            test -f /www/luci-static/resources/view/wanguard/groups.js
+            test -f /www/luci-static/resources/view/wanguard/diagnostics.js
+            test -f /www/luci-static/resources/wanguard/core.js
+            test ! -e /www/luci-static/resources/view/wanguard.js # retired monolith (#46) — must never come back
             test -f /usr/share/luci/menu.d/luci-app-wanguard.json
             test -f /usr/share/rpcd/acl.d/luci-app-wanguard.json
             /usr/bin/wanguard list >/dev/null 2>&1 || echo "wanguard list fails without /etc/config/wanguard (expected)"

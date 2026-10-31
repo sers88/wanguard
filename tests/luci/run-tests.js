@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * luci-app-wanguard harness (issue #40): runs the REAL view code from
- * luci-app-wanguard/htdocs/luci-static/resources/view/wanguard.js inside
- * node with stubbed LuCI globals (view/form/poll/rpc/uci/ui/E/L/_), so
- * no router, LuCI or prod backend is involved — the UCI side is loaded
- * from the handwritten fixtures/ configs (the same lab-shaped configs
- * as the ucode mock suite: witness + lb members 70/30).
+ * luci-app-wanguard harness (#40, re-laid out for #46): runs the REAL
+ * code from luci-app-wanguard/htdocs/luci-static/resources — the shared
+ * core module (wanguard/core.js) and the four file views
+ * (view/wanguard/{overview,devices,groups,diagnostics}.js) — inside node
+ * with stubbed LuCI globals (view/form/poll/rpc/uci/ui/E/L/_), so no
+ * router, LuCI or prod backend is involved — the UCI side is loaded from
+ * the handwritten fixtures/ configs (the same lab-shaped configs as the
+ * ucode mock suite: witness + lb members 70/30).
  *
  * What is pinned here:
  *   - UCI slot derivation parity with the CLI allocator (wand.uc
@@ -15,19 +17,26 @@
  *     buckets floor + remainder-to-last (33/33/34 for 50/50/50),
  *     weights 0/garbage/absent -> 50, member_live failover display,
  *     >20 members / no members degrade — numbers match the ucode mock
- *     suite (LB2/LB4) and the lab.
+ *     suite (LB2/LB4) and the lab (J1–J8/J12/J14 against wg.*).
  *   - direct/proxy behavior unchanged: golden preview strings and board
- *     labels for a legacy direct/proxy config (J9).
- *   - parseGrouplist: direct-lb rows carry the authoritative device
- *     state; old CLIs (no rows) degrade to UCI-only display (J1/J13).
+ *     labels for a legacy direct/proxy config (J9 -> wg.boardGroups).
+ *   - board structure and device enrichment via the overview view's
+ *     load()/render() (J10/J13) — the same DOM the monolith produced.
  *   - group modal (#40): addModalOptions adds member_iface (MultiValue)
  *     + one weight_<iface> field per candidate iface with
  *     depends({type:'direct-lb', member_iface:'<ifc>', '!contains':
  *     true}) — the weight field appears when the member is staged and
  *     its stray option is removed by form.js parse semantics when the
- *     membership is dropped; direct/proxy modals gain nothing (J11).
+ *     membership is dropped; direct/proxy modals gain nothing
+ *     (J11 against the groups view).
  *   - edit persistence: staged UCI member/weight changes are reflected
  *     by the same display code path (Save&Apply = staged UCI + commit).
+ *   - #46 layout (additive L1–L7): menu.d category + 4 deep-linkable
+ *     children, acl.d golden (unchanged), apk/build.sh + CI feed-test +
+ *     deploy-luci.ps1 ship the five new files (and NOT the deleted
+ *     monolith), and decision D2 — overview Table mode shows BOTH grids
+ *     (groups+devices) while the devices/groups pages get single-grid
+ *     Maps.
  *
  * Run: node tests/luci/run-tests.js
  */
@@ -36,15 +45,24 @@ const fs = require('fs');
 const path = require('path');
 
 const REPO = path.resolve(__dirname, '..', '..');
-const VIEW = path.join(REPO, 'luci-app-wanguard', 'htdocs', 'luci-static', 'resources', 'view', 'wanguard.js');
+const LUCI = path.join(REPO, 'luci-app-wanguard');
+const CORE = path.join(LUCI, 'htdocs', 'luci-static', 'resources', 'wanguard', 'core.js');
+const VIEW_DIR = path.join(LUCI, 'htdocs', 'luci-static', 'resources', 'view', 'wanguard');
+const VIEW_MONOLITH = path.join(LUCI, 'htdocs', 'luci-static', 'resources', 'view', 'wanguard.js');
 const FIX = path.join(__dirname, 'fixtures');
 
-const VIEW_SRC = fs.readFileSync(VIEW, 'utf8');
+const CORE_SRC = fs.readFileSync(CORE, 'utf8');
+const VIEW_SRC = {
+	overview: fs.readFileSync(path.join(VIEW_DIR, 'overview.js'), 'utf8'),
+	devices: fs.readFileSync(path.join(VIEW_DIR, 'devices.js'), 'utf8'),
+	groups: fs.readFileSync(path.join(VIEW_DIR, 'groups.js'), 'utf8'),
+	diagnostics: fs.readFileSync(path.join(VIEW_DIR, 'diagnostics.js'), 'utf8')
+};
 const fixture = (name) => fs.readFileSync(path.join(FIX, name), 'utf8');
 
 /* ---------- LuCI polyfills ---------- */
 
-/* String.format: only %s and %d are used by the view */
+/* String.format: only %s and %d are used by the views */
 if (!String.prototype.format) {
 	String.prototype.format = function() {
 		const args = arguments;
@@ -347,12 +365,22 @@ const documentStub = { querySelector() { return null; }, querySelectorAll() { re
 const windowStub = {};
 const localStorageStub = { getItem() { return null; }, setItem() {} };
 
-/* load the REAL view code: top-level return is legal in a Function body */
-function loadView() {
+/* load the REAL code: top-level return is legal in a Function body.
+ * core.js declares 'require rpc/uci/ui/form' -> those are the wrapper's
+ * params; the views declare 'require view/poll[/ui][/uci]' plus
+ * 'require wanguard.core as wg' -> wg is passed explicitly. */
+function loadCore() {
 	const fn = new Function(
-		'view', 'form', 'poll', 'rpc', 'uci', 'ui', 'E', 'L', '_', 'document', 'window', 'localStorage',
-		VIEW_SRC);
-	return fn(view, form, poll, RPC, UCI, ui, E, L, _, documentStub, windowStub, localStorageStub);
+		'rpc', 'uci', 'ui', 'form', 'poll', 'E', 'L', '_', 'document', 'window', 'localStorage',
+		CORE_SRC);
+	return fn(RPC, UCI, ui, form, poll, E, L, _, documentStub, windowStub, localStorageStub);
+}
+
+function loadView(name, wg) {
+	const fn = new Function(
+		'view', 'form', 'poll', 'rpc', 'uci', 'ui', 'E', 'L', '_', 'document', 'window', 'localStorage', 'wg',
+		VIEW_SRC[name]);
+	return fn(view, form, poll, RPC, UCI, ui, E, L, _, documentStub, windowStub, localStorageStub, wg);
 }
 
 /* ---------- check harness ---------- */
@@ -394,23 +422,24 @@ function cannedLb2() {
 	};
 }
 
-/* each scenario gets a fresh UCI + a fresh view closure (fresh LB_GROUPLIST) */
+/* each scenario gets a fresh UCI + a fresh core closure (fresh
+ * LB_GROUPLIST/status state), exactly like the monolith harness */
 const scenarios = [];
 
 function scenario(name, fixtureName, fn) {
 	scenarios.push({ name, run: async () => {
 		UCI.reset(fixtureName ? fixture(fixtureName) : null);
 		RPC.canned = {};
-		const v = loadView();
-		await fn(v, name);
+		const wg = loadCore();
+		await fn(wg, name);
 	} });
 }
 
 /* ============================ tests ============================ */
 
 /* --- J1: parseGrouplist --- */
-scenario('J1 parseGrouplist', 'lb2.uci', async (v, tag) => {
-	const rows = v.parseGrouplist(GLB);
+scenario('J1 parseGrouplist', 'lb2.uci', async (wg, tag) => {
+	const rows = wg.parseGrouplist(GLB);
 	ok(tag + ' direct-lb rows only, group keyed',
 		rows.a === undefined && Array.isArray(rows.lb) && rows.lb.length === 2, rows);
 	assertEq(tag + ' slot 1 iface/mark', [rows.lb[0].iface, rows.lb[0].mark].join('/'), 'wan1/200');
@@ -418,45 +447,45 @@ scenario('J1 parseGrouplist', 'lb2.uci', async (v, tag) => {
 	assertEq(tag + ' slot 2 mark/table', [rows.lb[1].mark, rows.lb[1].table].join('/'), '400/402');
 	assertEq(tag + ' slot 2 device', rows.lb[1].device, 'eth1');
 	ok(tag + ' old CLI (no output) degrades to {}',
-		Object.keys(v.parseGrouplist('')).length === 0);
+		Object.keys(wg.parseGrouplist('')).length === 0);
 	ok(tag + ' garbage header skipped',
-		Object.keys(v.parseGrouplist('garbage line here')).length === 0);
+		Object.keys(wg.parseGrouplist('garbage line here')).length === 0);
 });
 
 /* --- J2: conf_lb2 parity with the ucode mock numbers (LB2/LB4) --- */
-scenario('J2 conf_lb2 slot parity', 'lb2.uci', async (v, tag) => {
-	assertEq(tag + ' witness unchanged', v.allocPreview('a'), 'fwmark 100 → table 400');
+scenario('J2 conf_lb2 slot parity', 'lb2.uci', async (wg, tag) => {
+	assertEq(tag + ' witness unchanged', wg.allocPreview('a'), 'fwmark 100 → table 400');
 	assertEq(tag + ' lb slots (UCI only)',
-		v.allocPreview('lb'), 'wan1 70% 200/401 · wan2 30% 400/402');
+		wg.allocPreview('lb'), 'wan1 70% 200/401 · wan2 30% 400/402');
 });
 
 /* --- J3: conf_lb3 — three members, no weights -> buckets 33/33/34 --- */
-scenario('J3 conf_lb3 buckets', 'lb3.uci', async (v, tag) => {
+scenario('J3 conf_lb3 buckets', 'lb3.uci', async (wg, tag) => {
 	assertEq(tag + ' 50/50/50 -> 33/33/34, cascade continues',
-		v.allocPreview('lb'), 'wan1 33% 200/401 · wan2 33% 400/402 · wan3 34% 500/403');
+		wg.allocPreview('lb'), 'wan1 33% 200/401 · wan2 33% 400/402 · wan3 34% 500/403');
 });
 
 /* --- J4: conf_lbpx — proxy present must not shift anything --- */
-scenario('J4 conf_lbpx boundary', 'lbpx.uci', async (v, tag) => {
-	assertEq(tag + ' proxy fixed', v.allocPreview('p'), 'fwmark 300 → table 500 (fixed)');
-	assertEq(tag + ' witness not shifted by proxy', v.allocPreview('a'), 'fwmark 100 → table 400');
-	assertEq(tag + ' lb marks unchanged', v.allocPreview('lb'), 'wan1 70% 200/401 · wan2 30% 400/402');
+scenario('J4 conf_lbpx boundary', 'lbpx.uci', async (wg, tag) => {
+	assertEq(tag + ' proxy fixed', wg.allocPreview('p'), 'fwmark 300 → table 500 (fixed)');
+	assertEq(tag + ' witness not shifted by proxy', wg.allocPreview('a'), 'fwmark 100 → table 400');
+	assertEq(tag + ' lb marks unchanged', wg.allocPreview('lb'), 'wan1 70% 200/401 · wan2 30% 400/402');
 });
 
 /* --- J5: weight normalization (0 / garbage / absent -> 50) --- */
-scenario('J5 weight normalization', 'lbw.uci', async (v, tag) => {
+scenario('J5 weight normalization', 'lbw.uci', async (wg, tag) => {
 	assertEq(tag + ' 0/abc/absent -> 50 each, same buckets as defaults',
-		v.allocPreview('lb'), 'wan1 33% 200/401 · wan2 33% 400/402 · wan3 34% 500/403');
+		wg.allocPreview('lb'), 'wan1 33% 200/401 · wan2 33% 400/402 · wan3 34% 500/403');
 });
 
 /* --- J6: member_live failover display (#39 tick-owned) --- */
-scenario('J6 member_live display', 'lbz.uci', async (v, tag) => {
+scenario('J6 member_live display', 'lbz.uci', async (wg, tag) => {
 	assertEq(tag + ' slot 0 failed over to wan2',
-		v.allocPreview('lb'), 'wan1→wan2 70% 200/401 · wan2 30% 400/402');
+		wg.allocPreview('lb'), 'wan1→wan2 70% 200/401 · wan2 30% 400/402');
 });
 
 /* --- J7: member-count edges (same behavior as the CLI) --- */
-scenario('J7 member-count edges', null, async (v, tag) => {
+scenario('J7 member-count edges', null, async (wg, tag) => {
 	const mem = [];
 	for (let i = 1; i <= 21; i++)
 		mem.push('wan' + (i < 10 ? '0' + i : i));
@@ -464,38 +493,39 @@ scenario('J7 member-count edges', null, async (v, tag) => {
 		'.name': 'lbbig', '.type': 'group', '.anonymous': false,
 		type: 'direct-lb', member_iface: mem
 	};
-	assertEq(tag + ' >20 members — ignored', v.allocPreview('lbbig'), '— (>20 members — ignored)');
+	assertEq(tag + ' >20 members — ignored', wg.allocPreview('lbbig'), '— (>20 members — ignored)');
 
 	UCI.data.wanguard.lb0 = {
 		'.name': 'lb0', '.type': 'group', '.anonymous': false, type: 'direct-lb'
 	};
-	assertEq(tag + ' no members — ignored', v.allocPreview('lb0'), '— (no members — ignored)');
+	assertEq(tag + ' no members — ignored', wg.allocPreview('lb0'), '— (no members — ignored)');
 });
 
 /* --- J8: two lb groups continue one cascade --- */
-scenario('J8 two lb groups', 'lb2g.uci', async (v, tag) => {
-	assertEq(tag + ' lb', v.allocPreview('lb'), 'wan1 70% 200/401 · wan2 30% 400/402');
+scenario('J8 two lb groups', 'lb2g.uci', async (wg, tag) => {
+	assertEq(tag + ' lb', wg.allocPreview('lb'), 'wan1 70% 200/401 · wan2 30% 400/402');
 	assertEq(tag + ' lb2 continues the cascade',
-		v.allocPreview('lb2'), 'wan1 60% 500/403 · wan3 40% 600/404');
+		wg.allocPreview('lb2'), 'wan1 60% 500/403 · wan3 40% 600/404');
 });
 
 /* --- J9: legacy direct/proxy config — golden behavior unchanged --- */
-scenario('J9 legacy golden', 'legacy.uci', async (v, tag) => {
-	assertEq(tag + ' a', v.allocPreview('a'), 'fwmark 100 → table 400');
-	assertEq(tag + ' b', v.allocPreview('b'), 'fwmark 200 → table 401');
-	assertEq(tag + ' c (mark 300 skipped)', v.allocPreview('c'), 'fwmark 400 → table 402');
-	assertEq(tag + ' p', v.allocPreview('p'), 'fwmark 300 → table 500 (fixed)');
-	assertEq(tag + ' unknown group renders empty', v.allocPreview('nope'), '');
-	const bg = v.boardGroups();
+scenario('J9 legacy golden', 'legacy.uci', async (wg, tag) => {
+	assertEq(tag + ' a', wg.allocPreview('a'), 'fwmark 100 → table 400');
+	assertEq(tag + ' b', wg.allocPreview('b'), 'fwmark 200 → table 401');
+	assertEq(tag + ' c (mark 300 skipped)', wg.allocPreview('c'), 'fwmark 400 → table 402');
+	assertEq(tag + ' p', wg.allocPreview('p'), 'fwmark 300 → table 500 (fixed)');
+	assertEq(tag + ' unknown group renders empty', wg.allocPreview('nope'), '');
+	const bg = wg.boardGroups();
 	assertEq(tag + ' board order', bg.map((g) => g.name).join(','), 'a,b,c,p');
 	assertEq(tag + ' labels', bg.map((g) => g.label).join('|'), 'a — wan3|b — wan1|c — wan2|p — mihomo');
 });
 
-/* --- J10: board structure + device enrichment via load() --- */
-scenario('J10 board build', 'lb2.uci', async (v, tag) => {
+/* --- J10: board structure + device enrichment via the overview view --- */
+scenario('J10 board build', 'lb2.uci', async (wg, tag) => {
 	cannedLb2();
-	await v.load();
-	const root = await v.render();
+	const ov = loadView('overview', wg);
+	await ov.load();
+	const root = await ov.render();
 
 	const lb = colParts(findCol(root, 'lb'));
 	assertEq(tag + ' lb title', lb.title, 'lb — LB');
@@ -515,12 +545,13 @@ scenario('J10 board build', 'lb2.uci', async (v, tag) => {
 	assertEq(tag + ' all columns built', order, '111');
 });
 
-/* --- J11: group modal — member/weight options (#40) --- */
-scenario('J11 modal options', 'lb2.uci', async (v, tag) => {
-	v.ifaces = [ 'lan', 'wan1', 'wan2', 'wan3' ];
-	await v.render();
+/* --- J11: group modal — member/weight options (#40, groups view) --- */
+scenario('J11 modal options', 'lb2.uci', async (wg, tag) => {
+	wg.state.ifaces = [ 'lan', 'wan1', 'wan2', 'wan3' ];
+	const gv = loadView('groups', wg);
+	await gv.render();
 
-	const groups = v._map.children[0];
+	const groups = gv._map.children[0];
 	assertEq(tag + ' groups section found', groups.sectiontype, 'group');
 
 	const typeOpt = groups.children.find((c) => c.option === 'type');
@@ -572,46 +603,182 @@ scenario('J11 modal options', 'lb2.uci', async (v, tag) => {
 });
 
 /* --- J12: edit simulation — staged UCI survives "Save&Apply" --- */
-scenario('J12 edit persistence', 'lb2.uci', async (v, tag) => {
+scenario('J12 edit persistence', 'lb2.uci', async (wg, tag) => {
 	/* modal save stages: member wan3 added with weight 20 */
 	UCI.set('wanguard', 'lb', 'member_iface', [ 'wan1', 'wan2', 'wan3' ]);
 	UCI.set('wanguard', 'lb', 'weight_wan3', '20');
 
 	/* already visible from staged UCI — display derives from UCI only */
 	assertEq(tag + ' staged visible pre-apply (buckets 58/25/17)',
-		v.allocPreview('lb'), 'wan1 58% 200/401 · wan2 25% 400/402 · wan3 17% 500/403');
+		wg.allocPreview('lb'), 'wan1 58% 200/401 · wan2 25% 400/402 · wan3 17% 500/403');
 
 	UCI.commit(); /* simulated uci apply */
 
 	assertEq(tag + ' committed (survives Save&Apply)',
-		v.allocPreview('lb'), 'wan1 58% 200/401 · wan2 25% 400/402 · wan3 17% 500/403');
+		wg.allocPreview('lb'), 'wan1 58% 200/401 · wan2 25% 400/402 · wan3 17% 500/403');
 
 	/* member removal: down to wan1 only — single-member remainder form */
 	UCI.set('wanguard', 'lb', 'member_iface', [ 'wan1' ]);
 	UCI.commit();
-	assertEq(tag + ' shrink to one member', v.allocPreview('lb'), 'wan1 100% 200/401');
+	assertEq(tag + ' shrink to one member', wg.allocPreview('lb'), 'wan1 100% 200/401');
 	ok(tag + ' dropped member weight invisible',
-		!v.allocPreview('lb').includes('30'));
+		!wg.allocPreview('lb').includes('30'));
 });
 
-/* --- J13: degraded environments --- */
-scenario('J13 degraded', 'lb2.uci', async (v, tag) => {
+/* --- J13: degraded environments (overview view, no canned RPC) --- */
+scenario('J13 degraded', 'lb2.uci', async (wg, tag) => {
 	/* no grouplist output (old CLI / ACL lost): board still renders slots */
-	await v.load();
-	const root = await v.render();
+	const ov = loadView('overview', wg);
+	await ov.load();
+	const root = await ov.render();
 	const p = colParts(findCol(root, 'lb'));
 	assertEq(tag + ' no device suffix without grouplist',
 		p.sub, 'wan1 70% 200/401 · wan2 30% 400/402 · 1');
 });
 
 /* --- J14: the shipped config template stays allocator-consistent --- */
-scenario('J14 config template', null, async (v, tag) => {
+scenario('J14 config template', null, async (wg, tag) => {
 	UCI.reset(fs.readFileSync(path.join(REPO, 'router', 'etc.config.wanguard.example'), 'utf8'));
-	assertEq(tag + ' a', v.allocPreview('a'), 'fwmark 100 → table 400');
-	assertEq(tag + ' b', v.allocPreview('b'), 'fwmark 200 → table 401');
+	assertEq(tag + ' a', wg.allocPreview('a'), 'fwmark 100 → table 400');
+	assertEq(tag + ' b', wg.allocPreview('b'), 'fwmark 200 → table 401');
 	assertEq(tag + ' lb (slots continue the cascade, 300 skipped)',
-		v.allocPreview('lb'), 'wan1 70% 400/402 · wan3 30% 500/403');
-	assertEq(tag + ' c', v.allocPreview('c'), 'fwmark 300 → table 500 (fixed)');
+		wg.allocPreview('lb'), 'wan1 70% 400/402 · wan3 30% 500/403');
+	assertEq(tag + ' c', wg.allocPreview('c'), 'fwmark 300 → table 500 (fixed)');
+});
+
+/* ======== #46 layout checks (additive; behavior above is untouched) ======== */
+
+/* --- L1: menu.d — category + four deep-linkable children --- */
+scenario('L1 menu.d', null, async (wg, tag) => {
+	const menu = JSON.parse(fs.readFileSync(
+		path.join(LUCI, 'usr', 'share', 'luci', 'menu.d', 'luci-app-wanguard.json'), 'utf8'));
+	const parent = menu['admin/network/wanguard'];
+	ok(tag + ' parent is an ACL-gated category (no action)',
+		!!parent && !parent.action &&
+		JSON.stringify(parent.depends && parent.depends.acl) === JSON.stringify([ 'luci-app-wanguard' ]));
+	ok(tag + ' overview child (view wanguard/overview, order 10)',
+		menu['admin/network/wanguard/overview'] &&
+		menu['admin/network/wanguard/overview'].action &&
+		menu['admin/network/wanguard/overview'].action.type === 'view' &&
+		menu['admin/network/wanguard/overview'].action.path === 'wanguard/overview' &&
+		menu['admin/network/wanguard/overview'].order === 10);
+	ok(tag + ' devices child (view wanguard/devices, order 20)',
+		menu['admin/network/wanguard/devices'] &&
+		menu['admin/network/wanguard/devices'].action &&
+		menu['admin/network/wanguard/devices'].action.path === 'wanguard/devices' &&
+		menu['admin/network/wanguard/devices'].order === 20);
+	ok(tag + ' groups child (view wanguard/groups, order 30)',
+		menu['admin/network/wanguard/groups'] &&
+		menu['admin/network/wanguard/groups'].action &&
+		menu['admin/network/wanguard/groups'].action.path === 'wanguard/groups' &&
+		menu['admin/network/wanguard/groups'].order === 30);
+	ok(tag + ' diagnostics child (view wanguard/diagnostics, order 40)',
+		menu['admin/network/wanguard/diagnostics'] &&
+		menu['admin/network/wanguard/diagnostics'].action &&
+		menu['admin/network/wanguard/diagnostics'].action.path === 'wanguard/diagnostics' &&
+		menu['admin/network/wanguard/diagnostics'].order === 40);
+});
+
+/* --- L2: acl.d golden — #46 must not widen the ACL --- */
+scenario('L2 acl.d golden', null, async (wg, tag) => {
+	const acl = JSON.parse(fs.readFileSync(
+		path.join(LUCI, 'usr', 'share', 'rpcd', 'acl.d', 'luci-app-wanguard.json'), 'utf8'));
+	const golden = {
+		'luci-app-wanguard': {
+			'description': 'Grant access to WAN Guard device groups',
+			'read': {
+				'ubus': {
+					'file': [ 'read', 'exec' ],
+					'network.interface': [ 'dump' ]
+				},
+				'file': {
+					'/tmp/dhcp.leases': [ 'read' ],
+					'/usr/bin/wanguard': [ 'exec' ]
+				},
+				'uci': [ 'wanguard' ]
+			},
+			'write': {
+				'ubus': {
+					'file': [ 'exec' ]
+				},
+				'file': {
+					'/usr/bin/wanguard': [ 'exec' ]
+				},
+				'uci': [ 'wanguard' ]
+			}
+		}
+	};
+	assertEq(tag + ' ACL grants unchanged (golden)', JSON.stringify(acl), JSON.stringify(golden));
+});
+
+/* --- L3: apk/build.sh stages the five new files, not the monolith --- */
+scenario('L3 build.sh files', null, async (wg, tag) => {
+	const build = fs.readFileSync(path.join(REPO, 'apk', 'build.sh'), 'utf8');
+	const want = [
+		'resources/view/wanguard/overview.js',
+		'resources/view/wanguard/devices.js',
+		'resources/view/wanguard/groups.js',
+		'resources/view/wanguard/diagnostics.js',
+		'resources/wanguard/core.js'
+	];
+	ok(tag + ' packages the 5 new files, monolith gone',
+		want.every((p) => build.includes(p)) && !/resources\/view\/wanguard\.js/.test(build),
+		want.filter((p) => !build.includes(p)));
+});
+
+/* --- L4: CI feed-test verifies the new paths + monolith absence --- */
+scenario('L4 CI feed-test paths', null, async (wg, tag) => {
+	const ci = fs.readFileSync(path.join(REPO, '.github', 'workflows', 'feed.yml'), 'utf8');
+	const want = [
+		'test -f /www/luci-static/resources/view/wanguard/overview.js',
+		'test -f /www/luci-static/resources/view/wanguard/devices.js',
+		'test -f /www/luci-static/resources/view/wanguard/groups.js',
+		'test -f /www/luci-static/resources/view/wanguard/diagnostics.js',
+		'test -f /www/luci-static/resources/wanguard/core.js',
+		'test ! -e /www/luci-static/resources/view/wanguard.js'
+	];
+	ok(tag + ' install-test checks the 5 files + monolith absence',
+		want.every((p) => ci.includes(p)),
+		want.filter((p) => !ci.includes(p)));
+});
+
+/* --- L5: deploy-luci.ps1 ships the new files, removes the stale monolith --- */
+scenario('L5 deploy script', null, async (wg, tag) => {
+	const deploy = fs.readFileSync(path.join(REPO, 'scripts', 'deploy-luci.ps1'), 'utf8');
+	const want = [
+		'resources\\view\\wanguard\\overview.js',
+		'resources\\view\\wanguard\\devices.js',
+		'resources\\view\\wanguard\\groups.js',
+		'resources\\view\\wanguard\\diagnostics.js',
+		'resources\\wanguard\\core.js',
+		'rm -f /www/luci-static/resources/view/wanguard.js'
+	];
+	ok(tag + ' uploads the 5 files + removes the stale monolith on the router',
+		want.every((p) => deploy.includes(p)),
+		want.filter((p) => !deploy.includes(p)));
+});
+
+/* --- L6: the monolith is gone --- */
+scenario('L6 monolith deleted', null, async (wg, tag) => {
+	ok(tag + ' view/wanguard.js no longer exists', !fs.existsSync(VIEW_MONOLITH));
+});
+
+/* --- L7: D2 — overview Table = both grids; per-page Maps are single-grid --- */
+scenario('L7 page grids (D2)', 'lb2.uci', async (wg, tag) => {
+	const ov = loadView('overview', wg);
+	await ov.render();
+	assertEq(tag + ' overview map = groups+devices sections (D2)',
+		ov._map.children.map((s) => s.sectiontype).join(','), 'group,member');
+
+	const dv = loadView('devices', wg);
+	await dv.render();
+	assertEq(tag + ' devices map = member section only',
+		dv._map.children.map((s) => s.sectiontype).join(','), 'member');
+
+	const gv = loadView('groups', wg);
+	await gv.render();
+	assertEq(tag + ' groups map = group section only',
+		gv._map.children.map((s) => s.sectiontype).join(','), 'group');
 });
 
 /* ============================ demo ============================ */
@@ -620,9 +787,10 @@ async function demo() {
 	console.log('\n=== DEMO — board on handwritten UCI (fixtures/lb2.uci, no prod backend) ===');
 	UCI.reset(fixture('lb2.uci'));
 	cannedLb2();
-	const v = loadView();
-	await v.load();
-	const root = await v.render();
+	const wg = loadCore();
+	const ov = loadView('overview', wg);
+	await ov.load();
+	const root = await ov.render();
 	for (const g of [ 'a', 'lb', '' ]) {
 		const p = colParts(findCol(root, g));
 		console.log('  [' + p.title + ']  {' + p.sub + '}');
@@ -636,11 +804,11 @@ async function demo() {
 	UCI.set('wanguard', 'lb', 'member_iface', [ 'wan1', 'wan2', 'wan3' ]);
 	UCI.set('wanguard', 'lb', 'weight_wan3', '20');
 	UCI.commit();
-	console.log('  [lb — LB]  {' + v.allocPreview('lb') + '}  (board rebuilds from UCI)');
+	console.log('  [lb — LB]  {' + wg.allocPreview('lb') + '}  (board rebuilds from UCI)');
 
 	console.log('\n=== DEMO — tick failover (member_live wan2, fixture lbz.uci) ===');
 	UCI.reset(fixture('lbz.uci'));
-	console.log('  [lb — LB]  {' + v.allocPreview('lb') + '}');
+	console.log('  [lb — LB]  {' + wg.allocPreview('lb') + '}');
 }
 
 /* ============================ main ============================ */
