@@ -653,8 +653,8 @@ scenario('L1 menu.d', null, async (wg, tag) => {
 	const menu = JSON.parse(fs.readFileSync(
 		path.join(LUCI, 'usr', 'share', 'luci', 'menu.d', 'luci-app-wanguard.json'), 'utf8'));
 	const parent = menu['admin/network/wanguard'];
-	ok(tag + ' parent is an ACL-gated category (no action)',
-		!!parent && !parent.action &&
+	ok(tag + ' parent is an ACL-gated category (firstchild action)',
+		!!parent && parent.action && parent.action.type === 'firstchild' &&
 		JSON.stringify(parent.depends && parent.depends.acl) === JSON.stringify([ 'luci-app-wanguard' ]));
 	ok(tag + ' overview child (view wanguard/overview, order 10)',
 		menu['admin/network/wanguard/overview'] &&

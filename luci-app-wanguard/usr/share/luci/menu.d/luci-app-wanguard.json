@@ -2,6 +2,9 @@
 	"admin/network/wanguard": {
 		"title": "WAN Guard",
 		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
 		"depends": {
 			"acl": [ "luci-app-wanguard" ]
 		}
