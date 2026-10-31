@@ -43,9 +43,34 @@ frozen bytes of the existing surfaces never moved:
 | `groupmeta [name]` — `name<TAB>label<TAB>color<TAB>description`, `-` = unset, no header | #42 | New subcommand (appending columns to `grouplist` would have broken the freeze — hence separate) |
 | `devset <mac> <type\|->` — devtype override (whitelist watch/tv/pc/printer/phone/tablet/generic; err on unregistered MAC; **no apply**) | #43 | New subcommand |
 | `help` text extended for the above | #42/#43 | `H.out` golden re-captured |
+| wand state: `last-apply` + `events` ring (ucode-only; tmpfs — lost on reboot by design, UI feed not syslog) | #44 | New WAND_DIR files: `last-apply` = unix ts written on EVERY successful apply (both `applied` and `in-sync`); `events` = FIFO ring, max 200 lines, `ts<TAB>code<TAB>detail` (no tabs/newlines inside fields). Best-effort writes (fs.writefile tmp+rename) — a ring failure never breaks tick→apply→flush |
+| `events [N]` — ring tail, default 20, TAB rows, no header | #44 | New subcommand |
+| `syncstatus` — `status=in-sync\|drift`, `last_apply=<ts>`, `age=<s>` | #44 | New subcommand; drift computed LIVE (the `list` sets-diff, not the ring); `age` = now − last-apply |
+| `diag [all\|rules\|tables\|nft\|health]` — read-only TAB sections | #45 | New subcommand; only read verbs apply already uses. Decisions: `rules` = FULL `ip rule show` (foreign prio-1000 rules are exactly what debugging needs to see); `health` = procd state via `ubus call service list` (wanguard, mihomo) + config validation + package version from `/usr/share/wanguard/version` (stamped by apk/build.sh from `$VER`; missing file → `-`) |
+| `inspect <mac\|ip\|hostname>` — configured vs live for one device | #45 | New subcommand; MAC normalization + dhcp.leases/inventory resolve; prints group, allocation (mark/table), configured iface vs live (netifd dump), nft `mac_<g>` membership, matching `wg:<g>:` rules. Cases: direct / proxy / direct-lb / ungrouped / unknown |
+| `diag-report` — full text report (LuCI "Download report") | #45 | New subcommand; aggregate: diag sections + inspect summary + syncstatus + timestamp header. NEVER reads `/etc/config/network` (PPPoE/WG secrets) or any secret-bearing config — only read-command output; test-gated by a secrets-marker grep |
+| `help` text extended for the above | #44/#45 | `H.out` golden re-captured (append-only) |
 
 Machine readers of `devices` that stop at 4 fields (old LuCI) keep working
 unchanged.
+
+### 1.2 Diagnostics data-plane decisions (#44/#45, fixed before code)
+
+- Event codes and their single write site: `config_validated` (apply, after
+  the validation pass), `apply_ok` (apply success — `in-sync` path too),
+  `apply_err` (apply failure branch, e.g. `nft check failed`), `drift` /
+  `restored` (apply: drift is a found diff whose desired-side hash equals
+  the last successful apply's — i.e. UCI did NOT change, live did; e.g. a
+  manual `nft` edit. `restored` fires after that same run repairs it;
+  legitimate UCI-induced renders are NOT drift), `flush` (wan-flush, detail
+  = the existing `flush:<g>><old>(<ip>)`), `failover`/`failback` (tick UCI
+  flips), `lbover` (tick LB block).
+- `syncstatus` exit 0 always (a state probe, not a verdict — LuCI reads it
+  on every header render; DRIFT semantics stay exclusive to `list`).
+- `diag`/`inspect`/`diag-report` are ucode-only (the `groupmeta` precedent,
+  #42): the sh reference (`router/wanguard`) is not extended, cli-parity
+  gains no pairs, the surfaces are pinned by new stage-5 goldens instead.
+- No new rpcd/ACL grants: LuCI keeps exec'ing exactly one binary.
 
 ## 2. Client expectations (the actual consumers of the contract)
 
