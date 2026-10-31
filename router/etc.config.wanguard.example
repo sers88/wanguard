@@ -8,6 +8,12 @@
 #       + option weight_<iface> '<%>' (absent/garbage/0 -> 50; member_live
 #         is written by wand-tick failover — do not hand-edit)
 #   option type 'proxy'                                    -> egress via mihomo (max 1)
+# Optional group metadata (#42, UI-only — never read by the data plane):
+#   option label '<display name>'      # board column / grid title (empty = section name)
+#   option color '<blue|green|purple|orange|gray>'   # marker color on the board
+#   option description '<free text>'   # tooltip/subtitle
+#   (write via: wanguard groupset <name> -label V -color V -description V;
+#    read via: wanguard groupmeta; empty value clears the option)
 # Allocation is automatic and deterministic:
 #   proxy     = fwmark 300 / table 500 (fixed)
 #   direct    = fwmark 100,200,400,... / tables 400,401,...
@@ -64,6 +70,9 @@ config member 'm_001122334477'
 	option name 'laptop-lb'
 	option mac '00:11:22:33:44:77'
 	option group 'lb'
+	# optional device type override (#43, board icons only; empty = the
+	# hostname heuristic decides; write via: wanguard devset <mac> <type|->):
+	# option devtype 'laptop'   # watch|tv|pc|printer|phone|tablet|generic
 
 # Legacy (pre-#13): the `config wan 'wan'` section is no longer used by the
 # current code; remove manually after migrating:

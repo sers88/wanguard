@@ -23,6 +23,15 @@
 # the differential (sh vs uc) is asserted for every artifact of every
 # fixture.
 #
+# Post-stage-4 contract deltas (each a REVIEWED, golden-backed change):
+#   - #43: devices gained an ADDITIVE 5th TAB column TYPE (hostname
+#     heuristic, member option devtype overrides). The devices pairs
+#     compare the frozen 4-column PREFIX (do_pair_dev) and pin the new
+#     column with uc-side assertions; the retired sh reference itself is
+#     NOT touched. stage5/contract-gate.sh re-captured the D golden for
+#     the same delta; groupmeta/devset/groupset-metadata (#42/#43) have
+#     no sh counterpart and are gated by run-tests-ucode.sh (GM/DT).
+#
 # Environment: runs INSIDE openwrt/rootfs:x86_64-25.12.5 — REAL uci on
 # /etc/config (committed bytes are produced by the same libuci on both
 # sides), stateful mocks for nft/ip (stage-3 harness, NOTES.md) + ubus/
@@ -165,6 +174,63 @@ do_pair() { # $1=label $2=fixture-fn, rest = CLI args
 		snapshot "$s"
 	done
 	diff_ok    "$label: stdout"       "$T/sh.out" "$T/uc.out"
+	diff_ok    "$label: stderr"       "$T/sh.err" "$T/uc.err"
+	assert_rc  "$label: rc" "$(cat "$T/sh.rc")" "$(cat "$T/uc.rc")"
+	diff_ok    "$label: uci bytes"    "$T/sh.uci" "$T/uc.uci"
+	diff_ok    "$label: nft/ip state" "$T/sh.state" "$T/uc.state"
+}
+
+do_pair_help() { # help pairs (#42/#43): the ucode help grew an APPENDED
+	# metadata block, so whole-file stdout parity vs the retired sh
+	# reference is intentionally impossible. The frozen contract is the
+	# sh help as a BYTE PREFIX of the uc help: every old line byte-stable
+	# in its old position, additions strictly at the end (see
+	# 00-CLI-CONTRACT.md §1.1). stderr/rc/uci/nft+ip compare whole.
+	local label=$1 fx=$2; shift 2
+	local s
+	for s in sh uc; do
+		reset_state
+		"$fx"
+		run_subj "$s" "$@"
+		snapshot "$s"
+	done
+	local n
+	n=$(wc -l < "$T/sh.out")
+	head -n "$n" "$T/uc.out" > "$T/uc.prefix"
+	diff_ok    "$label: stdout (frozen prefix, #42/#43)" "$T/sh.out" "$T/uc.prefix"
+	assert_contains "$label: uc help documents groupmeta" "$(cat "$T/uc.out")" "groupmeta"
+	assert_contains "$label: uc help documents devset"    "$(cat "$T/uc.out")" "devset"
+	diff_ok    "$label: stderr"       "$T/sh.err" "$T/uc.err"
+	assert_rc  "$label: rc" "$(cat "$T/sh.rc")" "$(cat "$T/uc.rc")"
+	diff_ok    "$label: uci bytes"    "$T/sh.uci" "$T/uc.uci"
+	diff_ok    "$label: nft/ip state" "$T/sh.state" "$T/uc.state"
+}
+
+do_pair_dev() { # devices-only pair (#43): the ucode CLI gained an ADDITIVE
+	# 5th TAB column TYPE, so whole-file stdout parity vs the retired sh
+	# reference is intentionally impossible. The frozen contract is the
+	# 4-column PREFIX — stdout is compared on the first four fields;
+	# stderr/rc/uci/nft+ip still compare whole as in do_pair. The 5th
+	# column itself is pinned by the uc-side assertions in
+	# battery_devices + the stage5 golden D.out (contract change of
+	# issue #43, reviewed).
+	local label=$1 fx=$2; shift 2
+	local s
+	for s in sh uc; do
+		reset_state
+		"$fx"
+		run_subj "$s" "$@"
+		snapshot "$s"
+		# 4-column prefix (the frozen surface), then sort: the ARP fixture
+		# vehicle dumps neigh rows in kernel hash order that VARIES per
+		# table creation (live finding 2026-10-31 — two rebuilds with the
+		# same insertion order produced different dumps), so row ORDER is
+		# not a contract surface in this battery; row CONTENT is (and the
+		# leases-only first-seen order is pinned strictly by DT4 in
+		# run-tests-ucode.sh). LuCI keys rows by MAC — order-independent.
+		awk -F'\t' '{ print $1 "\t" $2 "\t" $3 "\t" $4 }' "$T/$s.out" | sort > "$T/$s.out4"
+	done
+	diff_ok    "$label: stdout (4-col prefix, order-insensitive, #43)" "$T/sh.out4" "$T/uc.out4"
 	diff_ok    "$label: stderr"       "$T/sh.err" "$T/uc.err"
 	assert_rc  "$label: rc" "$(cat "$T/sh.rc")" "$(cat "$T/uc.rc")"
 	diff_ok    "$label: uci bytes"    "$T/sh.uci" "$T/uc.uci"
@@ -417,25 +483,31 @@ EOF
 	arp_reset
 }
 battery_devices() {
-	do_pair "D1 devices, leases only" f_D1 devices
+	do_pair_dev "D1 devices, leases only" f_D1 devices
 	assert_contains "D1 ref: row"       "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:01	192.168.88.35	buddy-052	0"
 	assert_contains "D1 ref: star name" "$(cat "$T/sh.out")" "11:22:33:44:55:02	192.168.88.36	-	0"
 	assert_absent   "D1 ref: skip k<4"  "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:03"
-	do_pair "D2 devices, arp only" f_D2 devices
+	assert_contains "D1 uc: TYPE heuristic (buddy-* = phone)" "$(cat "$T/uc.out")" "aa:bb:cc:dd:ee:01	192.168.88.35	buddy-052	0	phone"
+	assert_contains "D1 uc: TYPE '*' name = generic" "$(cat "$T/uc.out")" "11:22:33:44:55:02	192.168.88.36	-	0	generic"
+	do_pair_dev "D2 devices, arp only" f_D2 devices
 	assert_contains "D2 ref: online"     "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:10	192.168.88.90	-	1"
 	assert_absent   "D2 ref: 0x0 skipped" "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:11"
 	assert_absent   "D2 ref: foreign"     "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:12"
-	do_pair "D3 devices, merge" f_D3 devices
+	assert_contains "D2 uc: TYPE arp-only (no name) = generic" "$(cat "$T/uc.out")" "aa:bb:cc:dd:ee:10	192.168.88.90	-	1	generic"
+	do_pair_dev "D3 devices, merge" f_D3 devices
 	assert_contains "D3 ref: completed" "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:01	192.168.88.35	buddy-052	1"
 	assert_contains "D3 ref: arp-only"  "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:99	192.168.88.99	-	1"
 	assert_contains "D3 ref: arp name"  "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:03	192.168.88.37	-	1"
 	assert_contains "D3 ref: order"     "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:01	192.168.88.35	buddy-052	1
 11:22:33:44:55:02	192.168.88.36	-	0"
-	do_pair "D4 devices, garbage macs filtered" f_D4 devices
+	assert_contains "D3 uc: TYPE completed lease" "$(cat "$T/uc.out")" "aa:bb:cc:dd:ee:01	192.168.88.35	buddy-052	1	phone"
+	assert_contains "D3 uc: TYPE arp-only row" "$(cat "$T/uc.out")" "aa:bb:cc:dd:ee:99	192.168.88.99	-	1	generic"
+	do_pair_dev "D4 devices, garbage macs filtered" f_D4 devices
 	assert_contains "D4 ref: valid row" "$(cat "$T/sh.out")" "aa:bb:cc:dd:ee:92	192.168.88.92	ghost-ok	0"
 	assert_absent   "D4 ref: zz gone"   "$(cat "$T/sh.out")" "ghost-zz"
 	assert_absent   "D4 ref: bare gone" "$(cat "$T/sh.out")" "ghost-bare"
-	do_pair "D5 devices, no leases no arp" f_L1 devices
+	assert_contains "D4 uc: TYPE no heuristic match = generic" "$(cat "$T/uc.out")" "aa:bb:cc:dd:ee:92	192.168.88.92	ghost-ok	0	generic"
+	do_pair_dev "D5 devices, no leases no arp" f_L1 devices
 }
 
 # ---- GA: groupadd ----
@@ -722,10 +794,10 @@ battery_backupset() {
 
 # ---- H: help / usage / unknown ----
 battery_help() {
-	do_pair "H1 no args" f_L1
-	do_pair "H2 help" f_L1 help
-	do_pair "H3 -h" f_L1 -h
-	do_pair "H4 --help" f_L1 --help
+	do_pair_help "H1 no args" f_L1
+	do_pair_help "H2 help" f_L1 help
+	do_pair_help "H3 -h" f_L1 -h
+	do_pair_help "H4 --help" f_L1 --help
 	assert_contains "H ref: usage line" "$(cat "$T/sh.out")" "usage: wanguard <command> [args]"
 	assert_contains "H ref: backupset" "$(cat "$T/sh.out")" "backupset <group> <iface>...  backup priority order (#26): first UP wins;"
 	assert_contains "H ref: arch tail" "$(cat "$T/sh.out")" "100,200,400,... / tables 400+ (see docs/ARCHITECTURE.md §2)."

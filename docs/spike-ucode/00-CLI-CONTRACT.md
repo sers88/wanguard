@@ -31,6 +31,22 @@ can never deploy.
 
 Errors: `wanguard: <message>` on **stderr**, exit 1 (`err()`).
 
+## 1.1 Post-freeze deltas (each reviewed; goldens re-captured deliberately)
+
+Since the stage-5 freeze (issue #35), the contract grew ADDITIVELY — the
+frozen bytes of the existing surfaces never moved:
+
+| Delta | Issue | Contract effect |
+|---|---|---|
+| `devices` 5th TAB column TYPE (hostname heuristic; member `option devtype` overrides) | #43 | The frozen contract is the **4-column prefix** — `stage4/cli-parity.sh` compares it byte-wise (`do_pair_dev`), the `D.out` golden was re-captured with the new column |
+| `groupset <name> -label V [-color V] [-description V]` (metadata form; empty value = clear; color = blue/green/purple/orange/gray; **no apply**) | #42 | New form; the legacy target form `<name> <iface|proxy>` stays byte-frozen |
+| `groupmeta [name]` — `name<TAB>label<TAB>color<TAB>description`, `-` = unset, no header | #42 | New subcommand (appending columns to `grouplist` would have broken the freeze — hence separate) |
+| `devset <mac> <type\|->` — devtype override (whitelist watch/tv/pc/printer/phone/tablet/generic; err on unregistered MAC; **no apply**) | #43 | New subcommand |
+| `help` text extended for the above | #42/#43 | `H.out` golden re-captured |
+
+Machine readers of `devices` that stop at 4 fields (old LuCI) keep working
+unchanged.
+
 ## 2. Client expectations (the actual consumers of the contract)
 
 1. **keepalive** (`router/wanguard-keepalive`, sh, unchanged):

@@ -18,3 +18,10 @@ usage: wanguard <command> [args]
 group names: [A-Za-z0-9_], <=15 chars. marks/tables are allocated
 automatically: proxy = 300/500 fixed; direct (sorted by name) =
 100,200,400,... / tables 400+ (see docs/ARCHITECTURE.md §2).
+
+#42/#43 metadata (UCI-only decoration; the data plane never reads it):
+  groupmeta [name]              group rows: name, label, color, description (TAB)
+  groupset <name> -label V      set/clear metadata: -label/-color/-description;
+      [-color V] ...            '' clears; color: blue green purple orange gray
+  devset <mac> <type|->         device type override (board icons):
+                                watch|tv|pc|printer|phone|tablet|generic; '-' clears

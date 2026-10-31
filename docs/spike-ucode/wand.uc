@@ -99,6 +99,24 @@
  *     mark. override/wanauto semantics do NOT extend to LB groups
  *     (weights are the owner's manual decision).
  *
+ * Group/device metadata (#42/#43, v1.4.0): pure UCI options that the
+ * data plane NEVER reads — labels/colors/descriptions decorate the LuCI
+ * pages, devtype feeds the board icons. Additive CLI on top:
+ *   - groupset <name> -label V -color V -description V (empty value =
+ *     clear; color validated against the prototype palette; NO apply —
+ *     render does not depend on metadata). The legacy target form
+ *     `groupset <name> <iface|proxy>` stays byte-frozen (stages 10-11).
+ *   - groupmeta [name]: machine-readable name/label/color/description
+ *     TAB rows ('-' = unset). Appending columns to `grouplist` would
+ *     have broken the frozen contract — that is why this is a separate
+ *     subcommand.
+ *   - devices gained an ADDITIVE 5th TAB column TYPE (hostname
+ *     heuristic, member `option devtype` overrides it; the frozen
+ *     contract is the 4-column prefix, gated byte-wise by cli-parity +
+ *     the stage5 D.out golden).
+ *   - devset <mac> <type|-> writes that override (whitelist of types,
+ *     err on unregistered MACs; no apply for the same reason).
+ *
  * Lab: docs/spike-lb/lab/ (topology of spike-ucode #30 + a lan bridge
  * with a client container; L1 render battery runs against THIS file —
  * the #38 acceptance vehicle `lab-up.sh up-prod`).
@@ -124,6 +142,15 @@ const DEF_ANCHORS = [
 	'http://www.gstatic.com/generate_204',
 	'http://detectportal.firefox.com/success.txt',
 ];
+
+// ---------- #42/#43 metadata (UCI-only; the data plane never reads it) ----------
+
+// group color palette (#42): the prototype's CSS hexes live in luci
+// core.js — the CLI validates the KEY only
+const GROUP_COLORS = { blue: 1, green: 1, purple: 1, orange: 1, gray: 1 };
+
+// device types (#43): the whitelist of `devset` / member `option devtype`
+const DEV_TYPES = { watch: 1, tv: 1, pc: 1, printer: 1, phone: 1, tablet: 1, generic: 1 };
 
 // ---------- state file helpers ----------
 
@@ -1272,11 +1299,90 @@ function cmd_grouplist() {
 	}
 }
 
+function cmd_groupmeta(name) { // #42: machine-readable metadata, one TAB
+	// row per group: name<TAB>label<TAB>color<TAB>description, '-' = unset
+	// (no header — the devices precedent; `grouplist` stays byte-frozen,
+	// that is why metadata output is a separate subcommand at all).
+	// All groups (direct/direct-lb/proxy) in sorted order, or one row.
+	let ids = (name != '') ? [ name ] : group_ids();
+	for (let g in ids) {
+		if (!group_exists(g))
+			fail(`no such group: '${g}' (see: wanguard grouplist)`);
+		let label = group_opt(g, 'label');
+		let color = group_opt(g, 'color');
+		let descr = group_opt(g, 'description');
+		printf('%s\t%s\t%s\t%s\n', g,
+			(label != '') ? label : '-',
+			(color != '') ? color : '-',
+			(descr != '') ? descr : '-');
+	}
+}
+
+// ---------- #43: device type (hostname heuristic + devtype override) ----------
+
+function devtype_heuristic(name) { // hostname -> type, FIRST match wins.
+	// Extend the table here (issue #43: rules must stay a table). Pure
+	// string matching on data we already have (leases/ARP inventory) —
+	// never a network probe. Patterns are anchored where a bare substring
+	// would misfire ("watchdog-pc" is a pc, not a watch); case-insensitive.
+	const RULES = [
+		[ /^watch([-_]|$)/, 'watch' ],
+		[ /(^|[-_])(tv|dune|bosch)/, 'tv' ], // dune-*, bosch-*, tv-livingroom
+		[ /^ac-/, 'tv' ],                    // ac-livingroom (media box)
+		[ /(^|[-_])(laptop|pc)/, 'pc' ],
+		[ /print/, 'printer' ],
+		[ /phone/, 'phone' ],                // guest-phone, iphone-*
+		[ /^buddy-/, 'phone' ],
+		[ /(ipad|tablet)/, 'tablet' ],
+	];
+	let s = lc('' + name);
+	for (let r in RULES)
+		if (match(s, r[0]) != null)
+			return r[1];
+	return 'generic';
+}
+
+function member_devtypes() { // mac -> manual `option devtype` override (#43):
+	// the owner's explicit fix always beats the hostname heuristic
+	let out = {};
+	for (let sid in member_ids()) {
+		let mac = normalize_mac(get_member_opt(sid, 'mac'));
+		let t = get_member_opt(sid, 'devtype');
+		if (mac != null && t != '')
+			out[mac] = t;
+	}
+	return out;
+}
+
+function cmd_devset(mac_raw, t) { // #43: write/clear the devtype override
+	let mac = normalize_mac(mac_raw);
+	if (mac == null)
+		fail(`invalid mac: ${mac_raw}`);
+	let sid = find_by_mac(mac);
+	if (sid == null)
+		fail(`${mac} not registered (use: wanguard add ${mac} <group> [name])`);
+	if (t == '-') { // reset: the hostname heuristic applies again
+		cursor.delete(CONF, sid, 'devtype');
+		uci_commit();
+		msg(`device ${mac} devtype cleared (hostname heuristic applies)`);
+		return;
+	}
+	if (!(t in DEV_TYPES))
+		fail(`unknown device type: '${t}' (types: ${join(' ', sort(keys(DEV_TYPES)))}; '-' clears)`);
+	cursor.set(CONF, sid, 'devtype', t);
+	uci_commit();
+	msg(`device ${mac} devtype set: ${t}`);
+	// no apply: devtype is board-decoration only, the render never reads it
+}
+
 function cmd_devices() { // LAN clients for the LuCI board (issue #14)
-	// prints: mac<TAB>ip<TAB>name<TAB>online — leases give name/ip, ARP
-	// gives online (complete entry). ARP-only devices (static IPs) show
-	// name "-". Field-index parity with the sh awk: ucode f[0] = awk f[1]
-	// (probe P6: split() reproduces awk leading/trailing empty fields).
+	// prints: mac<TAB>ip<TAB>name<TAB>online<TAB>type — leases give
+	// name/ip, ARP gives online (complete entry). ARP-only devices
+	// (static IPs) show name "-". Field-index parity with the sh awk:
+	// ucode f[0] = awk f[1] (probe P6: split() reproduces awk
+	// leading/trailing empty fields). TYPE (#43) is ADDITIVE: the frozen
+	// contract is the 4-column prefix; type = member `option devtype`
+	// override > hostname heuristic > generic (ARP-only has no name).
 	const order = [], seen = {}, ipm = {}, nm = {}, onm = {};
 	function add(rawmac, ip, name, on) {
 		let mac = lc('' + rawmac);
@@ -1308,11 +1414,13 @@ function cmd_devices() { // LAN clients for the LuCI board (issue #14)
 			if (length(f) >= 6 && f[2] == '0x2' && f[5] == BR)
 				add(f[3], f[0], '-', true);
 		}
+	let dv = member_devtypes(); // override > heuristic > generic (#43)
 	for (let mac in order)
-		printf('%s\t%s\t%s\t%d\n', mac,
+		printf('%s\t%s\t%s\t%d\t%s\n', mac,
 			(mac in ipm) ? ipm[mac] : '-',
 			(mac in nm) ? nm[mac] : '-',
-			(mac in onm) ? 1 : 0);
+			(mac in onm) ? 1 : 0,
+			dv[mac] ?? devtype_heuristic((mac in nm) ? nm[mac] : '-'));
 }
 
 function cmd_groupadd(name, val) {
@@ -1343,9 +1451,41 @@ function cmd_groupadd(name, val) {
 	apply();
 }
 
-function cmd_groupset(name, val) {
-	if (!group_exists(name))
+function cmd_groupset(name, rest) { // rest = args after <name> (issue #42:
+	if (!group_exists(name))        // the metadata form lives here too)
 		fail(`no such group: '${name}' (see: wanguard grouplist)`);
+	// #42 metadata mode: `groupset <name> -label V -color V -description V`.
+	// Empty value clears the option (cursor.delete of a missing option is
+	// silent — sh -q parity); a repeated flag means the last value wins.
+	// NO apply: the render never reads metadata, so this is pure UCI.
+	if (substr(rest[0], 0, 1) == '-') {
+		let palette = join(' ', sort(keys(GROUP_COLORS)));
+		let usage = `usage: wanguard groupset <name> [-label V] [-color V] [-description V] (palette: ${palette})`;
+		let touched = [];
+		for (let i = 0; i < length(rest); i += 2) {
+			let flag = rest[i];
+			let val = rest[i + 1] ?? null;
+			let opt = (flag == '-label') ? 'label'
+				: (flag == '-color') ? 'color'
+				: (flag == '-description') ? 'description'
+				: '';
+			if (opt == '')
+				fail(`unknown option: '${flag}' (${usage})`);
+			if (val == null)
+				fail(`missing value for '${flag}' (${usage})`);
+			if (opt == 'color' && val != '' && !(val in GROUP_COLORS))
+				fail(`unknown color: '${val}' (palette: ${palette})`);
+			if (val == '')
+				cursor.delete(CONF, name, opt);
+			else
+				cursor.set(CONF, name, opt, val);
+			push(touched, (val == '') ? `${opt} cleared` : opt);
+		}
+		uci_commit();
+		msg(`group '${name}' metadata updated (${join(', ', touched)})`);
+		return;
+	}
+	let val = rest[0];
 	let cur = group_opt(name, 'iface');
 	let old = '';
 	if (val == 'proxy') {
@@ -1589,6 +1729,13 @@ const HELP = `usage: wanguard <command> [args]
 group names: [A-Za-z0-9_], <=15 chars. marks/tables are allocated
 automatically: proxy = 300/500 fixed; direct (sorted by name) =
 100,200,400,... / tables 400+ (see docs/ARCHITECTURE.md §2).
+
+#42/#43 metadata (UCI-only decoration; the data plane never reads it):
+  groupmeta [name]              group rows: name, label, color, description (TAB)
+  groupset <name> -label V      set/clear metadata: -label/-color/-description;
+      [-color V] ...            '' clears; color: blue green purple orange gray
+  devset <mac> <type|->         device type override (board icons):
+                                watch|tv|pc|printer|phone|tablet|generic; '-' clears
 `;
 
 function cmd_help() {
@@ -1636,6 +1783,9 @@ switch (cmd) {
 	case 'grouplist':
 		cmd_grouplist();
 		break;
+	case 'groupmeta': // #42
+		cmd_groupmeta(args[0] ?? '');
+		break;
 	case 'devices':
 		cmd_devices();
 		break;
@@ -1645,11 +1795,15 @@ switch (cmd) {
 		break;
 	case 'groupset':
 		(length(args) >= 2) || fail('usage: wanguard groupset <name> <iface|proxy>');
-		cmd_groupset(args[0], args[1]);
+		cmd_groupset(args[0], slice(args, 1));
 		break;
 	case 'groupdel':
 		(length(args) >= 1) || fail('usage: wanguard groupdel <name>');
 		cmd_groupdel(args[0]);
+		break;
+	case 'devset': // #43
+		(length(args) >= 2) || fail('usage: wanguard devset <mac> <type|->');
+		cmd_devset(args[0], args[1]);
 		break;
 	case 'wanstatus':
 		cmd_wanstatus();

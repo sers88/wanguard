@@ -116,6 +116,7 @@ ok()  { PASS=$((PASS + 1)); echo "ok   $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL $1 (got: '$2', want: '$3')"; }
 assert_eq()       { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 assert_contains() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "$2" "*$3*" ;; esac; }
+assert_rc()       { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "rc=$2" "rc=$3"; fi; }
 
 echo "== ucode port: #23 probe anchors (T1-T8, T10) =="
 
@@ -978,6 +979,194 @@ out=$(rapply); assert_eq "LT6 post-failover apply: in-sync" "$out" "in-sync"
 : > "$CONNTRACKLOG"
 out=$(flush)
 assert_eq "LT6 flush consumed after apply (keepalive order)" "$out" "wand:flush:lb>wan1(198.51.100.10)"
+
+echo
+echo "== #42: group metadata (groupset -label/-color/-description, groupmeta) =="
+#
+# The metadata options are UCI-only (the render never reads them): the
+# assertions target the COMMITTED UCI BYTES (real uci in this runner) and
+# the machine-readable groupmeta rows. The legacy groupset target form is
+# byte-frozen (stages 10-11) — GM5 keeps it pinned.
+
+gm_opts() { # committed metadata bytes of group $1 (grep over /etc/config)
+	sed -n "/^config group '$1'/,/^config /p" /etc/config/wanguard
+}
+
+# --- GM1: flags write label/color/description; byte-exact confirmation;
+#         NO apply side effect (the output is exactly the one msg line) ---
+reset_router
+setup_two_wans
+out=$(cli groupset a -label 'Дом' -color blue -description 'Main home LAN')
+assert_eq "GM1 confirmation byte-exact" "$out" "group 'a' metadata updated (label, color, description)"
+assert_eq "GM1 label stored" "$(uci -q get wanguard.a.label)" "Дом"
+assert_eq "GM1 color stored" "$(uci -q get wanguard.a.color)" "blue"
+assert_eq "GM1 description stored" "$(uci -q get wanguard.a.description)" "Main home LAN"
+case "$(gm_opts a)" in
+	*"option label 'Дом'"*) ok "GM1 committed bytes: label line" ;;
+	*)	bad "GM1 committed bytes: label line" "$(gm_opts a)" "*option label 'Дом'*" ;;
+esac
+case "$(gm_opts a)" in
+	*"option color 'blue'"*) ok "GM1 committed bytes: color line" ;;
+	*)	bad "GM1 committed bytes: color line" "$(gm_opts a)" "*option color 'blue'*" ;;
+esac
+
+# --- GM2: unknown color -> err rc=1, palette named, nothing written ---
+reset_router
+setup_two_wans
+out=$(cli groupset a -color red); rc=$?
+assert_contains "GM2 unknown color rejected" "$out" "unknown color: 'red' (palette: blue gray green orange purple)"
+assert_rc "GM2 rc=1" "$rc" "1"
+assert_eq "GM2 color not written" "$(uci -q get wanguard.a.color)" ""
+
+# --- GM3: empty value clears; missing value errs; repeated flag: last wins ---
+reset_router
+setup_two_wans
+cli groupset a -label 'Temp' >/dev/null
+out=$(cli groupset a -label '')
+assert_contains "GM3 clear confirmation" "$out" "metadata updated (label cleared)"
+assert_eq "GM3 label gone" "$(uci -q get wanguard.a.label)" ""
+case "$(gm_opts a)" in
+	*option\ label*) bad "GM3 empty option not written" "$(gm_opts a)" "no label line" ;;
+	*)	ok "GM3 empty option not written" ;;
+esac
+out=$(cli groupset a -color)
+assert_contains "GM3 missing value errs" "$out" "missing value for '-color'"
+out=$(cli groupset a -color blue -color green)
+assert_contains "GM3 repeated flag accepted" "$out" "metadata updated (color, color)"
+assert_eq "GM3 last value wins" "$(uci -q get wanguard.a.color)" "green"
+
+# --- GM4: unknown flag errs with usage ---
+reset_router
+setup_two_wans
+out=$(cli groupset a -bogus x)
+assert_contains "GM4 unknown flag rejected" "$out" "unknown option: '-bogus'"
+
+# --- GM5: legacy target form byte-frozen AND metadata untouched ---
+reset_router
+setup_two_wans
+cli groupset a -label 'Home' -color blue >/dev/null
+out=$(cli groupset a wan2); rc=$?
+assert_contains "GM5 legacy form message" "$out" "group 'a' updated (direct -> wan2)"
+assert_rc "GM5 rc=0 (legacy form incl. trailing apply intact)" "$rc" "0"
+assert_eq "GM5 iface flipped" "$(uci -q get wanguard.a.iface)" "wan2"
+assert_eq "GM5 label survived the retarget" "$(uci -q get wanguard.a.label)" "Home"
+assert_eq "GM5 color survived the retarget" "$(uci -q get wanguard.a.color)" "blue"
+
+# --- GM6: groupmeta rows (all groups sorted, '-' for unset, all types) ---
+reset_router
+setup_two_wans
+add_group p
+uci_set p.type proxy
+out=$(cli groupmeta)
+assert_eq "GM6 unset groups render dashes" "$(printf '%s\n' "$out" | grep '^b')" "b	-	-	-"
+assert_eq "GM6 proxy group included" "$(printf '%s\n' "$out" | grep '^p')" "p	-	-	-"
+cli groupset a -label 'Дом' -color blue -description 'Main home LAN' >/dev/null
+assert_eq "GM6 full row" "$(cli groupmeta a)" "a	Дом	blue	Main home LAN"
+assert_eq "GM6 single-group form" "$(cli groupmeta b)" "b	-	-	-"
+
+# --- GM7: groupmeta unknown group -> err rc=1 ---
+out=$(cli groupmeta nosuch); rc=$?
+assert_contains "GM7 unknown group rejected" "$out" "no such group: 'nosuch'"
+assert_rc "GM7 rc=1" "$rc" "1"
+
+echo
+echo "== #43: devices TYPE column (hostname heuristic + devtype override) =="
+#
+# devices gained an ADDITIVE 5th TAB column TYPE. The frozen contract is
+# the 4-column prefix — DT4 diffs it byte-wise against the stock sh CLI
+# (the F9 differential precedent) on the SAME fixture. The heuristic
+# positives below are the full rules table; the override is pinned by
+# DT2/DT3 (member `option devtype` > heuristic > generic).
+
+dt_leases() { # one hostname per rule + fallbacks (all offline: no ARP)
+	cat > /tmp/dhcp.leases <<'EOF'
+1700000001 aa:bb:cc:dd:ee:01 192.168.88.35 watch-hall
+1700000002 aa:bb:cc:dd:ee:02 192.168.88.36 dune-hd
+1700000003 aa:bb:cc:dd:ee:03 192.168.88.37 ac-livingroom
+1700000004 aa:bb:cc:dd:ee:04 192.168.88.38 bosch-fridge
+1700000005 aa:bb:cc:dd:ee:05 192.168.88.39 office-pc
+1700000006 aa:bb:cc:dd:ee:06 192.168.88.40 laptop-sonia
+1700000007 aa:bb:cc:dd:ee:07 192.168.88.41 hp-printer
+1700000008 aa:bb:cc:dd:ee:08 192.168.88.42 buddy-052
+1700000009 aa:bb:cc:dd:ee:09 192.168.88.43 guest-phone
+1700000010 aa:bb:cc:dd:ee:0a 192.168.88.44 iphone-15
+1700000011 aa:bb:cc:dd:ee:0b 192.168.88.45 ipad-kids
+1700000012 aa:bb:cc:dd:ee:0c 192.168.88.46 tablet-2
+1700000013 aa:bb:cc:dd:ee:0d 192.168.88.47 mystery-box
+1700000014 aa:bb:cc:dd:ee:0e 192.168.88.48 watchdog-pc
+1700000015 11:22:33:44:55:02 192.168.88.49 *
+EOF
+}
+
+dt_row() { printf '%s\n' "$1" | grep "^$2" | cut -f5; }
+
+# --- DT1: heuristic positives, every type + generic fallbacks ---
+reset_router
+setup_two_wans
+dt_leases
+out=$(cli devices)
+assert_eq "DT1 watch"        "$(dt_row "$out" aa:bb:cc:dd:ee:01)" "watch"
+assert_eq "DT1 tv (dune)"    "$(dt_row "$out" aa:bb:cc:dd:ee:02)" "tv"
+assert_eq "DT1 tv (ac-)"     "$(dt_row "$out" aa:bb:cc:dd:ee:03)" "tv"
+assert_eq "DT1 tv (bosch)"   "$(dt_row "$out" aa:bb:cc:dd:ee:04)" "tv"
+assert_eq "DT1 pc"           "$(dt_row "$out" aa:bb:cc:dd:ee:05)" "pc"
+assert_eq "DT1 pc (laptop)"  "$(dt_row "$out" aa:bb:cc:dd:ee:06)" "pc"
+assert_eq "DT1 printer"      "$(dt_row "$out" aa:bb:cc:dd:ee:07)" "printer"
+assert_eq "DT1 phone (buddy)" "$(dt_row "$out" aa:bb:cc:dd:ee:08)" "phone"
+assert_eq "DT1 phone (guest)" "$(dt_row "$out" aa:bb:cc:dd:ee:09)" "phone"
+assert_eq "DT1 phone (iphone)" "$(dt_row "$out" aa:bb:cc:dd:ee:0a)" "phone"
+assert_eq "DT1 tablet (ipad)" "$(dt_row "$out" aa:bb:cc:dd:ee:0b)" "tablet"
+assert_eq "DT1 tablet"        "$(dt_row "$out" aa:bb:cc:dd:ee:0c)" "tablet"
+assert_eq "DT1 generic"       "$(dt_row "$out" aa:bb:cc:dd:ee:0d)" "generic"
+assert_eq "DT1 watchdog-pc is a pc (not a watch)" "$(dt_row "$out" aa:bb:cc:dd:ee:0e)" "pc"
+assert_eq "DT1 '*' name -> generic" "$(dt_row "$out" 11:22:33:44:55:02)" "generic"
+assert_contains "DT1 first 4 columns byte-frozen" "$out" "aa:bb:cc:dd:ee:01	192.168.88.35	watch-hall	0	watch"
+
+# --- DT2: member devtype override beats the heuristic; '-' clears it ---
+reset_router
+setup_two_wans
+dt_leases
+uci set wanguard.m_05=member
+uci set wanguard.m_05.mac='aa:bb:cc:dd:ee:05'
+uci set wanguard.m_05.devtype='tv'
+uci commit wanguard
+assert_eq "DT2 override wins over heuristic" "$(cli devices | cut -f1-5 | grep aa:bb:cc:dd:ee:05 | cut -f5)" "tv"
+out=$(cli devset aa:bb:cc:dd:ee:05 -)
+assert_contains "DT2 clear confirmation" "$out" "devtype cleared (hostname heuristic applies)"
+assert_eq "DT2 cleared -> heuristic again" "$(cli devices | grep aa:bb:cc:dd:ee:05 | cut -f5)" "pc"
+
+# --- DT3: devset validation + write bytes ---
+reset_router
+setup_two_wans
+dt_leases
+uci set wanguard.m_0d=member
+uci set wanguard.m_0d.mac='aa:bb:cc:dd:ee:0d'
+uci commit wanguard
+out=$(cli devset aa:bb:cc:dd:ee:0d mystery); rc=$?
+assert_contains "DT3 unknown type rejected" "$out" "unknown device type: 'mystery' (types: generic pc phone printer tablet tv watch; '-' clears)"
+assert_rc "DT3 rc=1" "$rc" "1"
+out=$(cli devset aa:bb:cc:dd:ee:99 tv)
+assert_contains "DT3 unregistered mac rejected" "$out" "aa:bb:cc:dd:ee:99 not registered"
+out=$(cli devset zz tv)
+assert_contains "DT3 invalid mac rejected" "$out" "invalid mac: zz"
+out=$(cli devset aa:bb:cc:dd:ee:0d printer)
+assert_eq "DT3 set confirmation" "$out" "device aa:bb:cc:dd:ee:0d devtype set: printer"
+assert_eq "DT3 devices shows the override" "$(cli devices | grep aa:bb:cc:dd:ee:0d | cut -f5)" "printer"
+case "$(grep -A3 "option mac 'aa:bb:cc:dd:ee:0d'" /etc/config/wanguard)" in
+	*"option devtype 'printer'"*) ok "DT3 committed bytes: devtype line" ;;
+	*)	bad "DT3 committed bytes: devtype line" "$(grep -A3 "option mac 'aa:bb:cc:dd:ee:0d'" /etc/config/wanguard)" "*option devtype 'printer'*" ;;
+esac
+
+# --- DT4: the frozen 4-column prefix is byte-identical to the sh CLI ---
+reset_router
+setup_two_wans
+dt_leases
+out_uc=$(cli devices | cut -f1-4)
+out_sh=$(sh "$SH" devices 2>&1 | cut -f1-4)
+assert_eq "DT4 4-column prefix byte-identical to the sh reference" "$out_uc" "$out_sh"
+assert_contains "DT4 sanity: sh actually printed rows" "$out_sh" "aa:bb:cc:dd:ee:01	192.168.88.35	watch-hall	0"
+
+rm -f /tmp/dhcp.leases
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
