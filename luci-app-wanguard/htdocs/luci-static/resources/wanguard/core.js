@@ -1363,13 +1363,16 @@ function routeCard(c, detail) {
 }
 
 /* "+ New route" never duplicates the netifd editor (issue #49 decision):
- * routes are netifd interfaces, created under Network → Interfaces */
+ * routes are netifd interfaces, created under Network → Interfaces.
+ * URL: on LuCI 25.12 (menu rework) the Interfaces page is registered at
+ * admin/network/network (view network/interfaces, luci-mod-network.json)
+ * — admin/network/interfaces 404s there (#55). */
 function newRouteBtn() {
 	return E('button', {
 		'class': 'btn cbi-button',
 		'data-wg': 'route-new',
 		'title': _('Routes are netifd interfaces — this page does not duplicate the netifd editor'),
-		'click': function() { location.href = L.url('admin/network/interfaces'); }
+		'click': function() { location.href = L.url('admin/network/network'); }
 	}, [ '+ ' + _('New route') ]);
 }
 
@@ -1850,8 +1853,9 @@ function openGroupPanel(sid) {
 
 	var createroute = E('div', { 'class': 'wg-createroute' }, [
 		E('button', {
+			'data-wg': 'panel-createroute', /* #55: same URL as newRouteBtn */
 			'title': _('Routes are netifd interfaces — this page does not duplicate the netifd editor'),
-			'click': function() { location.href = L.url('admin/network/interfaces'); }
+			'click': function() { location.href = L.url('admin/network/network'); }
 		}, [ '+ ' + _('Create route') ])
 	]);
 

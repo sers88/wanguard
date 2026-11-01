@@ -1499,6 +1499,10 @@ scenario('G7 groups page render (#49)', 'board47.uci', async (wg, tag) => {
 	const rt = findRouteCard(wg.state.groupsRoot, 'freedom');
 	ok(tag + ' routes tab detail lines', flat(rt).indexOf('RTT(s): 0.012') !== -1 && flat(rt).indexOf('Since: 01.10 12:00:00') !== -1, flat(rt));
 	ok(tag + ' New route button present', !!findByWg(wg.state.groupsRoot, 'route-new'));
+	findByWg(wg.state.groupsRoot, 'route-new').listeners['click'][0]();
+	assertEq(tag + ' New route -> Interfaces (LuCI 25.12 menu, #55)',
+		global.location.href, '/admin/network/network');
+	global.location.href = '';
 	wg.setGrTab('groups');
 });
 
@@ -1519,6 +1523,10 @@ scenario('G8 panel create flow (#49)', 'lb2.uci', async (wg, tag) => {
 	name.value = 'guest';
 	name.listeners['input'][0]();
 	ok(tag + ' valid name stages the section (live)', !!UCI.get('wanguard', 'guest'));
+	findByWg(body, 'panel-createroute').listeners['click'][0]();
+	assertEq(tag + ' Create route -> Interfaces (same URL as route-new, #55)',
+		global.location.href, '/admin/network/network');
+	global.location.href = '';
 	ok(tag + ' plate counts devices', flat(findByWg(body, 'panel-plate')).indexOf('0 devices will use lan.') !== -1,
 		flat(findByWg(body, 'panel-plate')));
 
