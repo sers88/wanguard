@@ -1,9 +1,14 @@
-/* WAN Guard groups & routes page (issue #46) — the groups grid with the
- * allocation preview, the direct-lb member/weight modal (#40) and the
- * non-empty-group delete guard, on its own URL-deep-linkable page.
- * load() fetches `wanguard grouplist` so _alloc shows authoritative
- * device state for direct-lb slots. All logic lives in the shared
- * wanguard.core module. */
+/* WAN Guard groups & routes page (issue #49, prototype
+ * designe/generated-image (3).png) — the custom rebuild of the former
+ * grid page: inner Groups/Routes tabs, the groups table (color dot +
+ * label, assigned-route chip / direct-lb slot lines, device counter,
+ * per-row "…" menu, search), the routes strip (egress cards from the
+ * netifd dump, liveness/RTT/anchors from `wanguard wanstatus`) and the
+ * New/Edit group panel with staged-UCI groupadd semantics, device
+ * assignment and the live allocation preview. DRIFT keeps the page
+ * read-only. All logic lives in the shared wanguard.core module; the
+ * #46 GridSection engine (addGroupsSection) stays in core for the
+ * parity tests and possible reuse. */
 'use strict';
 'require view';
 'require poll';
@@ -22,18 +27,20 @@ return view.extend({
 		wg.state.statusNode = statusNode;
 		this._statusNode = statusNode;
 
-		this._map = wg.buildGroupsGrid().map;
+		/* the panel's Save & Apply host (uci.apply + `wanguard apply`) */
+		wg.state.saveHost = this;
 
-		return this._map.render().then(function(mapNode) {
-			poll.add(function() {
-				return wg.refreshStatus(self._statusNode);
-			}, 15);
+		var page = wg.buildGroupsPage();
 
-			return E([
-				statusNode,
-				E('div', {}, [ mapNode ])
-			]);
-		});
+		poll.add(function() {
+			return wg.refreshStatus(self._statusNode);
+		}, 15);
+
+		return E('div', {}, [
+			E('style', { 'type': 'text/css' }, [ wg.BOARD_CSS ]),
+			statusNode,
+			page
+		]);
 	},
 
 	/* Save & Apply: commit UCI via the stock flow, then reconcile with

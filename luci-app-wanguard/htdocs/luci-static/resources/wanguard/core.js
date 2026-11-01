@@ -32,6 +32,19 @@
  * output degrades to the pre-#43 card, no exceptions. The Groups grid
  * edits label/color/description, the Devices grid edits the member
  * `option devtype` override — all plain UCI, Save&Apply as everywhere.
+ *
+ * Groups & Routes page (#49, designe/generated-image (3).png): inner
+ * Groups/Routes tabs, a groups table (dot + label, assigned-route chip /
+ * direct-lb slot lines, device counter, per-row "…" menu, search), a
+ * routes strip (egress cards from the netifd dump, liveness/RTT/anchors
+ * from `wanguard wanstatus`, mihomo when a proxy group exists) and the
+ * New/Edit group panel — staged plain UCI with `groupadd` semantics
+ * (named section + type/iface + member sections), live allocation
+ * preview through the SAME allocPreview/lbSlotMap math (the panel
+ * stages into client-side UCI as it edits), device multi-select with
+ * the "N devices will use <route>" plate, rename = create new + move
+ * members + delete. DRIFT keeps the page read-only; the addGroupsSection
+ * GridSection stays for parity tests and possible reuse.
  */
 'use strict';
 'require rpc';
@@ -69,7 +82,12 @@ var state = {
 	ifaces: [],
 	ifaceProto: {},      /* netifd iface -> proto (wireguard = VPN chip, #47) */
 	filter: '',          /* board search substring (#47) */
+	groupFilter: '',     /* groups-table search substring (#49) */
 	LB_GROUPLIST: {},   /* `wanguard grouplist` rows for direct-lb groups (#40) */
+	wanstatus: { wan: {} }, /* parsed `wanguard wanstatus` (#6/#49), {} on old CLIs */
+	allIfaces: [],       /* every netifd iface from the dump: { name, up, proto } (#49) */
+	groupsRoot: null,    /* groups-page tab container, set by buildGroupsPage (#49) */
+	groupPanel: null,    /* open panel session: { origName, stagedNew, stagedName, orig } (#49) */
 	busy: false,
 	statusNode: null,   /* header pill node, set by each view's render() */
 	boardWrap: null,    /* board container, set by the overview view */
@@ -364,6 +382,51 @@ var BOARD_CSS = [
 	".wg-pill-drift .wg-dot { background:#d9534f; }",
 	".wg-lease-flash { outline:2px solid #4a90d9; outline-offset:2px; }",
 	".wg-hint { opacity:.55; font-size:.85em; margin-bottom:.5em; }",
+	"/* #49: Groups & Routes page */",
+	".wg-tabs { display:flex; gap:.25em; border-bottom:1px solid rgba(128,128,128,.25); margin:.75em 0; }",
+	".wg-tab { background:none; border:none; border-bottom:2px solid transparent; padding:.45em .9em; cursor:pointer; opacity:.6; font-size:1em; }",
+	".wg-tab:hover { opacity:.85; }",
+	".wg-tab-active { opacity:1; border-bottom-color:#2563eb; font-weight:bold; }",
+	".wg-gtoolbar { display:flex; gap:.75em; align-items:center; margin:.5em 0 .75em; }",
+	".wg-gtable { width:100%; border-collapse:collapse; margin-bottom:.5em; }",
+	".wg-gtable th { text-align:left; font-weight:normal; opacity:.55; font-size:.82em; padding:.4em .75em; border-bottom:1px solid rgba(128,128,128,.25); }",
+	".wg-gtable td { padding:.55em .75em; border-bottom:1px solid rgba(128,128,128,.12); vertical-align:middle; }",
+	".wg-gname { font-weight:bold; display:inline-flex; align-items:center; gap:.45em; }",
+	".wg-chip { display:inline-flex; align-items:center; gap:.35em; padding:.12em .6em; border-radius:1em; font-size:.82em; background:rgba(37,99,235,.10); color:#1d4ed8; white-space:nowrap; cursor:default; }",
+	".wg-chip-ic { display:inline-flex; line-height:1; }",
+	".wg-chip-ic svg { width:1em; height:1em; }",
+	".wg-chip-vpn { background:rgba(124,58,237,.12); color:#6d28d9; }",
+	".wg-chip-proxy { background:rgba(234,88,12,.12); color:#c2410c; }",
+	".wg-chip-lb { background:rgba(107,114,128,.14); color:#374151; }",
+	".wg-slots { font-size:.78em; opacity:.7; margin-top:.2em; line-height:1.45; }",
+	".wg-strip { margin-top:1.25em; }",
+	".wg-strip-h { display:flex; justify-content:space-between; align-items:center; margin-bottom:.5em; }",
+	".wg-strip-h h3 { margin:0; }",
+	".wg-rstrip { display:flex; flex-wrap:wrap; gap:.6em; }",
+	".wg-rcard { border:1px solid rgba(128,128,128,.3); border-radius:6px; padding:.55em .85em; min-width:11em; background:rgba(128,128,128,.05); }",
+	".wg-rcard-title { font-weight:bold; display:flex; align-items:center; gap:.4em; }",
+	".wg-rcard-sub { font-size:.78em; opacity:.65; margin-top:.15em; }",
+	".wg-rcard-lines { font-size:.78em; opacity:.8; margin-top:.35em; line-height:1.5; }",
+	"/* #49: New/Edit group panel */",
+	".wg-panel .wg-field { margin:.8em 0; }",
+	".wg-panel .wg-field > label { display:block; font-weight:bold; margin-bottom:.3em; }",
+	".wg-colors { display:flex; gap:.6em; align-items:center; }",
+	".wg-color-opt { display:inline-flex; align-items:center; gap:.3em; cursor:pointer; }",
+	".wg-color-opt .wg-dot { width:1em; height:1em; margin:0; }",
+	".wg-createroute { margin-top:.3em; }",
+	".wg-createroute button { background:none; border:none; color:#2563eb; cursor:pointer; padding:0; }",
+	".wg-createroute button:hover { text-decoration:underline; }",
+	".wg-devpick { border:1px solid rgba(128,128,128,.25); border-radius:4px; max-height:16em; overflow-y:auto; margin-top:.4em; }",
+	".wg-devrow { display:flex; align-items:center; gap:.6em; padding:.35em .6em; cursor:pointer; border-bottom:1px solid rgba(128,128,128,.08); }",
+	".wg-devrow:last-child { border-bottom:none; }",
+	".wg-devname { flex:1; }",
+	".wg-devip { opacity:.6; font-size:.85em; }",
+	".wg-weight { width:5em; margin-left:auto; }",
+	".wg-plate { display:flex; gap:.4em; align-items:baseline; background:rgba(37,99,235,.08); border:1px solid rgba(37,99,235,.25); border-radius:4px; padding:.5em .75em; margin-top:.8em; font-size:.9em; }",
+	".wg-error { color:#c2410c; margin-top:.6em; }",
+	".wg-error p { margin:.2em 0; }",
+	".wg-empty { opacity:.55; text-align:center; padding:1.2em 0; }",
+	".wg-label { opacity:.55; font-size:.82em; margin-left:.4em; }"
 ].join('\n');
 
 /* ---------- parsers ---------- */
@@ -406,6 +469,33 @@ function parseGrouplist(out) {
 		});
 	});
 	return rows;
+}
+
+/* `wanguard wanstatus` (#6, consumed by the routes strip #49): the FIRST
+ * section lists the watched WANs as "WAN DEVICE STATE RTT(s) ANCHORS
+ * SINCE" — SINCE may contain a space (`date '+%d.%m %H:%M:%S'`), so a
+ * row is 6..7 fields; states carry the /forced suffix. The blank line
+ * ends the section — the GROUP table and trailing notes are ignored.
+ * Old CLIs without the command degrade to { wan: {} } (cards without
+ * liveness). */
+function parseWanstatus(out) {
+	var wan = {};
+	(out || '').split('\n').some(function(line) {
+		var f = line.trim().split(/\s+/);
+		if (!f[0])
+			return true; /* blank line = end of the WAN section */
+		if (f.length < 6 || (f[0] == 'WAN' && f[1] == 'DEVICE'))
+			return false; /* header row / too short — skip */
+		wan[f[0]] = {
+			device: f[1],
+			state: f[2],
+			rtt: f[3],
+			anchors: f[4],
+			since: f.slice(5).join(' ')
+		};
+		return false;
+	});
+	return { wan: wan };
 }
 
 function parseStatus(res) {
@@ -451,9 +541,11 @@ function refreshStatus(node) {
 	});
 }
 
-/* full page load: UCI + leases + status + ifaces + devices + grouplist
- * (the exact call set of the monolith's load(); every consumer page uses
- * this one loader — no new RPC surface vs. #46's "ACL unchanged" rule) */
+/* full page load: UCI + leases + status + ifaces + devices + grouplist +
+ * wanstatus (the call set of the monolith's load() + the #49 addition;
+ * every consumer page uses this one loader — no new RPC surface vs.
+ * #46's "ACL unchanged" rule: wanstatus is the same /usr/bin/wanguard
+ * exec the ACL already grants) */
 function load() {
 	return Promise.all([
 		uci.load('wanguard'),
@@ -461,7 +553,8 @@ function load() {
 		callWanguard('/usr/bin/wanguard', [ 'list' ]).catch(function() { return null; }),
 		callIfaceDump().catch(function() { return null; }),
 		callWanguard('/usr/bin/wanguard', [ 'devices' ]).catch(function() { return null; }),
-		callWanguard('/usr/bin/wanguard', [ 'grouplist' ]).catch(function() { return null; })
+		callWanguard('/usr/bin/wanguard', [ 'grouplist' ]).catch(function() { return null; }),
+		callWanguard('/usr/bin/wanguard', [ 'wanstatus' ]).catch(function() { return null; })
 	]).then(function(data) {
 		state.leases = parseLeases(data[1] || '');
 
@@ -477,25 +570,34 @@ function load() {
 			});
 		state.inventory = inv;
 
-		/* netifd interfaces for the Groups grid (up ones only); degrade
-		 * gracefully when ubus/ACL is unavailable */
+		/* netifd interfaces: `ifaces` = up-only names for the route/group
+		 * pickers (#46 behavior); `allIfaces` = every dump iface with
+		 * up/proto for the routes strip (#49). Degrade gracefully when
+		 * ubus/ACL is unavailable. */
 		var dump = data[3];
-		if (dump && dump.interface)
-			state.ifaces = dump.interface
-				.filter(function(i) { return i && i.up && i.interface; })
-				.map(function(i) { return i.interface; })
-				.sort();
-				if (dump && dump.interface)
-					dump.interface.forEach(function(i) {
-						if (i && i.interface)
-							state.ifaceProto[i.interface] = i.proto || '';
-					});
-		else
-			state.ifaces = [];
+		state.ifaces = [];
+		state.allIfaces = [];
+		state.ifaceProto = {};
+		if (dump && dump.interface) {
+			dump.interface.forEach(function(i) {
+				if (!i || !i.interface)
+					return;
+				state.ifaceProto[i.interface] = i.proto || '';
+				state.allIfaces.push({ name: i.interface, up: !!i.up, proto: i.proto || '' });
+				if (i.up)
+					state.ifaces.push(i.interface);
+			});
+			state.ifaces.sort();
+			state.allIfaces.sort(function(a, b) { return a.name.localeCompare(b.name); });
+		}
 
 		/* `wanguard grouplist` (#40): authoritative device state for
 		 * direct-lb slots; empty on CLIs without direct-lb support */
 		state.LB_GROUPLIST = parseGrouplist((data[5] && data[5].stdout) || '');
+
+		/* `wanguard wanstatus` (#6/#49): watched-WAN liveness for the
+		 * routes strip; { wan: {} } on old CLIs (degradation) */
+		state.wanstatus = parseWanstatus((data[6] && data[6].stdout) || '');
 	});
 }
 
@@ -657,9 +759,12 @@ function hideOfflineMode() {
 
 /* ---------- board 2.0 helpers (#47) ---------- */
 
-/* toolbar search: substring over name/IP/MAC, case-insensitive */
-function deviceMatches(it) {
-	var q = (state.filter || '').toLowerCase().replace(/^\s+|\s+$/g, '');
+/* toolbar search: substring over name/IP/MAC, case-insensitive; q
+ * defaults to the board filter (state.filter), the group panel passes
+ * its own device-search value (#49) */
+function deviceMatches(it, q) {
+	q = (q == null) ? state.filter : String(q);
+	q = q.toLowerCase().replace(/^\s+|\s+$/g, '');
 	if (!q)
 		return true;
 	return (it.name || '').toLowerCase().indexOf(q) !== -1 ||
@@ -827,7 +932,7 @@ function buildBoard() {
 	var visible = function(items) {
 		if (hideOfflineMode())
 			items = items.filter(function(it) { return it.online; });
-		return items.filter(deviceMatches);
+		return items.filter(function(it) { return deviceMatches(it); });
 	};
 
 	boardGroups().forEach(function(g) {
@@ -1026,6 +1131,932 @@ function showCardMenu(mac, inGroup) {
 	]));
 
 	ui.showModal(macLabel(mac) + (curGroup ? ' (' + curGroup + ')' : ' (' + _('unassigned') + ')'), menu);
+}
+
+/* ---------- Groups & Routes page (issue #49) ----------
+ * Prototype build (designe/generated-image (3).png): inner Groups /
+ * Routes tabs, a groups TABLE (color dot + label, assigned-route chip /
+ * direct-lb slot lines, device counter, per-row "…" menu, search), a
+ * routes strip (egress cards from the netifd dump, liveness from
+ * `wanguard wanstatus`, mihomo when a proxy group exists) and the
+ * New/Edit group panel. Group CRUD stages plain UCI with `groupadd`
+ * semantics (named section = group name, type/iface, member sections
+ * for the checked devices) and the stock Save&Apply; renaming = create
+ * new + move members + delete (never silent — labels, the slot cascade
+ * and member refs hang off the name). DRIFT keeps the page read-only.
+ * The #46/#42 GridSection engine (addGroupsSection) stays in core for
+ * the modal-parity tests (J11/M5) and possible reuse. */
+
+/* group name validator: exact mirror of the CLI valid_group_name
+ * ([A-Za-z0-9_], <=15, not globals/wan) */
+function validGroupName(name) {
+	return !!name && name != 'globals' && name != 'wan' &&
+		/^[A-Za-z0-9_]{1,15}$/.test(name);
+}
+
+/* member sections of one group (device counter + panel sync) */
+function groupMembersOf(name) {
+	return (uci.sections('wanguard', 'member') || []).filter(function(m) {
+		return (m.group || '') == name;
+	}).map(function(m) {
+		return { sid: m['.name'], mac: normalizeMac(m.mac) || m.mac || '', name: m.name || '' };
+	});
+}
+
+/* type icons for the route chips (#49 prototype): globe = WAN,
+ * shield = VPN, share = mihomo, layers = LB. Static strings from THIS
+ * table only, never user data. */
+var CHIP_SVG = {
+	wan: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.6 2.6 14.4 0 17M12 3.5c-2.6 2.6-2.6 14.4 0 17"/></svg>',
+	vpn: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 19 6v5.4c0 4.4-3 7.7-7 9.1-4-1.4-7-4.7-7-9.1V6z"/><path d="m9 11.5 2 2 4-4"/></svg>',
+	proxy: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.2"/><circle cx="17.5" cy="5.5" r="2.2"/><circle cx="17.5" cy="18.5" r="2.2"/><path d="m8 11 7.5-4.5M8 13l7.5 4.5"/></svg>',
+	lb: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m12 4 8 4.5-8 4.5-8-4.5z"/><path d="m4 13.5 8 4.5 8-4.5"/></svg>'
+};
+
+function chipIcon(type) {
+	var el = E('span', { 'class': 'wg-chip-ic' });
+	el.innerHTML = CHIP_SVG[type] || '';
+	return el;
+}
+
+function routeChipNode(type, text, title) {
+	return E('span', { 'class': 'wg-chip wg-chip-' + type, 'title': title || '' }, [
+		chipIcon(type), text
+	]);
+}
+
+/* one slot line of a direct-lb cell/preview: "wan1 70% 200/401"
+ * (failed-over slot: "wan1→wan2 70% …", member_live #39) */
+function slotText(s) {
+	var ifc = (s.iface != s.member) ? '%s→%s'.format(s.member, s.iface) : s.iface;
+	return '%s %d%% %d/%d'.format(ifc, s.b, s.mark, s.table);
+}
+
+/* Assigned-route cell of the groups table (#49): chips like the board
+ * (routeChip), except proxy names the concrete target "mihomo · Proxy"
+ * (prototype) and direct-lb shows the SLOT LINES instead of one chip
+ * (issue #49: slots as in #40). */
+function groupRouteCell(g) {
+	if (g.type == 'proxy')
+		return { type: 'proxy', text: 'mihomo · ' + _('Proxy'),
+			title: allocPreview(g.name), slots: null };
+	if (g.type == 'direct-lb') {
+		var plan = lbSlotMap()[g.name] || {};
+		return { type: 'lb',
+			text: (lbMembers(g.name).length ? lbMembers(g.name).join('+') : (g.iface || 'lb')) + ' · ' + _('LB'),
+			title: allocPreview(g.name) + (plan.note ? ' (' + plan.note + ')' : ''),
+			slots: (plan.slots || []).map(slotText) };
+	}
+	var c = routeChip(g);
+	return { type: (state.ifaceProto[g.iface] == 'wireguard') ? 'vpn' : 'wan',
+		text: c.text, title: c.title, slots: null };
+}
+
+/* groups-table search (same pattern as the board's setFilter/deviceMatches) */
+function setGroupFilter(q) {
+	state.groupFilter = (q == null) ? '' : String(q);
+}
+
+function groupMatches(g) {
+	var q = (state.groupFilter || '').toLowerCase().replace(/^\s+|\s+$/g, '');
+	if (!q)
+		return true;
+	return g.name.toLowerCase().indexOf(q) !== -1 ||
+		(g.title || '').toLowerCase().indexOf(q) !== -1;
+}
+
+/* routes strip cards (#49): egress targets = netifd ifaces (dump, all
+ * states) + watched WANs (wanstatus) + mihomo when a proxy group exists.
+ * Classification (issue #49): proto wireguard -> VPN, otherwise WAN.
+ * Old CLI (no wanstatus) -> dump-only cards without liveness/RTT; no
+ * dump either (ACL/ubus degraded) -> ifaces referenced by groups, state
+ * unknown (#46 fallback pattern). */
+function routeCards() {
+	var wan = (state.wanstatus && state.wanstatus.wan) || {};
+	var seen = {};
+	var cards = [];
+	var push = function(name, type, up) {
+		var w = wan[name] || {};
+		cards.push({
+			name: name, type: type, up: up,
+			device: w.device || '', wstate: w.state || '',
+			rtt: w.rtt || '', anchors: w.anchors || '', since: w.since || ''
+		});
+	};
+	(state.allIfaces || []).forEach(function(i) {
+		if (i.name == 'loopback' || seen[i.name])
+			return;
+		seen[i.name] = true;
+		push(i.name, (i.proto == 'wireguard') ? 'vpn' : 'wan', !!i.up);
+	});
+	Object.keys(wan).sort().forEach(function(n) {
+		if (seen[n])
+			return;
+		seen[n] = true;
+		var st = wan[n].state || '';
+		push(n, 'wan', /^up/.test(st) ? true : (/^down/.test(st) ? false : null));
+	});
+	if (!cards.length) {
+		var names = {};
+		(uci.sections('wanguard', 'group') || []).forEach(function(g) {
+			if (g.iface)
+				names[g.iface] = 1;
+			listOpt(g['.name'], 'member_iface').forEach(function(m) { names[m] = 1; });
+		});
+		Object.keys(names).sort().forEach(function(n) { push(n, 'wan', null); });
+	}
+	cards.sort(function(a, b) { return a.name.localeCompare(b.name); });
+	var hasProxy = (uci.sections('wanguard', 'group') || []).some(function(g) {
+		return g.type == 'proxy';
+	});
+	if (hasProxy)
+		push('mihomo', 'proxy', null);
+	return cards;
+}
+
+/* ---------- page builders (#49) ---------- */
+
+function grTab() {
+	if (state.groupsTab)
+		return state.groupsTab;
+	try {
+		return (localStorage.getItem('wanguard-gr-tab') == 'routes') ? 'routes' : 'groups';
+	}
+	catch (e) {
+		return 'groups';
+	}
+}
+
+function setGrTab(t) {
+	state.groupsTab = t;
+	try {
+		localStorage.setItem('wanguard-gr-tab', t);
+	}
+	catch (e) { /* storage unavailable */ }
+}
+
+function buildGrTabs() {
+	var bar = E('div', { 'class': 'wg-tabs', 'role': 'tablist' });
+	[ [ 'groups', _('Groups') ], [ 'routes', _('Routes') ] ].forEach(function(t) {
+		bar.appendChild(E('button', {
+			'class': 'wg-tab' + (grTab() == t[0] ? ' wg-tab-active' : ''),
+			'role': 'tab',
+			'data-wg': 'tab-' + t[0],
+			'click': ui.createHandlerFn(null, function() {
+				if (grTab() != t[0]) {
+					setGrTab(t[0]);
+					rebuildGroupsPage();
+				}
+			})
+		}, [ t[1] ]));
+	});
+	return bar;
+}
+
+/* one route card; detail = the Routes tab variant (state/device/RTT/
+ * anchors/since lines), the groups-tab strip shows the compact form */
+function routeCard(c, detail) {
+	var mark, markCls;
+	if (c.up === true) {
+		mark = '●'; markCls = 'wg-on';
+	}
+	else if (c.up === false) {
+		mark = '○'; markCls = 'wg-off';
+	}
+	else {
+		mark = '·'; markCls = 'wg-off';
+	}
+	var markTitle = c.wstate ? _('watchdog: %s').format(c.wstate)
+		: (c.up === true ? _('iface up') : (c.up === false ? _('iface down') : _('state unknown')));
+	var typeLbl = (c.type == 'proxy') ? _('Proxy') : ((c.type == 'vpn') ? 'VPN' : 'WAN');
+	var card = E('div', { 'class': 'wg-rcard', 'data-wg': 'route-card', 'data-route': c.name }, [
+		E('div', { 'class': 'wg-rcard-title' }, [
+			E('span', { 'class': markCls, 'title': markTitle }, [ mark + ' ' ]),
+			E('span', { 'class': 'wg-rcard-name' }, [ c.name ]),
+			routeChipNode(c.type, typeLbl, '')
+		])
+	]);
+	var subs = [];
+	if (c.device && c.device != '-')
+		subs.push(c.device);
+	if (c.rtt && c.rtt != '-')
+		subs.push('RTT ' + c.rtt);
+	if (c.anchors && c.anchors != '-')
+		subs.push(_('anchors') + ' ' + c.anchors);
+	if (!subs.length)
+		subs.push(c.up === true ? _('up') : (c.up === false ? _('down') : ''));
+	card.appendChild(E('div', { 'class': 'wg-rcard-sub' }, [ subs.join(' · ') ]));
+	if (detail) {
+		var lines = E('div', { 'class': 'wg-rcard-lines' });
+		[
+			[ _('Device'), c.device ],
+			[ _('State'), c.wstate || (c.up === true ? 'up' : (c.up === false ? 'down' : '?')) ],
+			[ _('RTT(s)'), c.rtt ],
+			[ _('Anchors'), c.anchors ],
+			[ _('Since'), c.since ]
+		].forEach(function(p) {
+			lines.appendChild(E('div', {}, [ p[0] + ': ' + ((p[1] && p[1] != '-') ? p[1] : '-') ]));
+		});
+		card.appendChild(lines);
+	}
+	return card;
+}
+
+/* "+ New route" never duplicates the netifd editor (issue #49 decision):
+ * routes are netifd interfaces, created under Network → Interfaces */
+function newRouteBtn() {
+	return E('button', {
+		'class': 'btn cbi-button',
+		'data-wg': 'route-new',
+		'title': _('Routes are netifd interfaces — this page does not duplicate the netifd editor'),
+		'click': function() { location.href = L.url('admin/network/interfaces'); }
+	}, [ '+ ' + _('New route') ]);
+}
+
+function buildRoutesStrip(detail) {
+	var wrap = E('div', { 'class': 'wg-strip' });
+	wrap.appendChild(E('div', { 'class': 'wg-strip-h' }, [
+		E('h3', {}, [ _('Routes') ]), newRouteBtn()
+	]));
+	var strip = E('div', { 'class': 'wg-rstrip' });
+	var cards = routeCards();
+	if (!cards.length)
+		strip.appendChild(E('div', { 'class': 'wg-hint' }, [
+			_('No egress interfaces found (no netifd dump and no groups yet).')
+		]));
+	cards.forEach(function(c) { strip.appendChild(routeCard(c, detail)); });
+	wrap.appendChild(strip);
+	return wrap;
+}
+
+function groupRow(g) {
+	var cell = groupRouteCell(g);
+	var members = groupMembersOf(g.name);
+	var titleContent = [];
+	if (g.color)
+		titleContent.push(E('span', { 'class': 'wg-dot', 'style': 'background:%s'.format(g.color) }, []));
+	titleContent.push(g.title);
+	var routeTd = [ routeChipNode(cell.type, cell.text, cell.title) ];
+	if (cell.slots && cell.slots.length) {
+		var sl = E('div', { 'class': 'wg-slots' });
+		cell.slots.forEach(function(t) { sl.appendChild(E('div', {}, [ t ])); });
+		routeTd.push(sl);
+	}
+	return E('tr', { 'data-group': g.name }, [
+		E('td', {}, [ E('span', { 'class': 'wg-gname' }, titleContent) ]),
+		E('td', {}, routeTd),
+		E('td', {}, [ '%d %s'.format(members.length, members.length == 1 ? _('device') : _('devices')) ]),
+		E('td', { 'style': 'text-align:right' }, [
+			E('button', {
+				'class': 'wg-card-menu',
+				'data-wg': 'group-menu',
+				'title': _('Group menu'),
+				'aria-label': _('Group menu'),
+				'click': function() { showGroupMenu(g.name); }
+			}, [ '⋯' ])
+		])
+	]);
+}
+
+function buildGroupsTab() {
+	var search = E('input', {
+		'type': 'search',
+		'class': 'wg-search',
+		'data-wg': 'group-search',
+		'placeholder': _('Search groups'),
+		'aria-label': _('Search groups'),
+		'value': state.groupFilter
+	});
+	var timer = null;
+	search.addEventListener('input', function() {
+		if (typeof clearTimeout == 'function')
+			clearTimeout(timer);
+		timer = (typeof setTimeout == 'function') ? setTimeout(function() {
+			setGroupFilter(search.value);
+			rebuildGroupsPage();
+		}, 200) : null;
+	});
+	var newBtn = E('button', {
+		'class': 'btn cbi-button cbi-button-action',
+		'data-wg': 'group-new',
+		'click': function() { openGroupPanel(null); }
+	}, [ '+ ' + _('New group') ]);
+
+	var table = E('table', { 'class': 'wg-gtable' });
+	table.appendChild(E('tr', {}, [
+		E('th', {}, [ _('Group') ]),
+		E('th', {}, [ _('Assigned route') ]),
+		E('th', {}, [ _('Devices') ]),
+		E('th', {}, [ '' ])
+	]));
+	var rows = boardGroups().filter(groupMatches);
+	if (!rows.length)
+		table.appendChild(E('tr', {}, [ E('td', { 'colspan': '4', 'class': 'wg-empty' }, [
+			(uci.sections('wanguard', 'group') || []).length
+				? _('No groups match the search')
+				: _('No groups yet — create one with "+ New group"')
+		]) ]));
+	else
+		rows.forEach(function(g) { table.appendChild(groupRow(g)); });
+
+	return E('div', {}, [
+		E('div', { 'class': 'wg-gtoolbar' }, [ search, newBtn ]),
+		table,
+		buildRoutesStrip(false)
+	]);
+}
+
+function buildRoutesTab() {
+	return E('div', {}, [
+		E('div', { 'class': 'wg-hint' }, [
+			_('Liveness, RTT and probe anchors come from wanguard wanstatus (the watchdog); up/down comes from the netifd dump.')
+		]),
+		buildRoutesStrip(true)
+	]);
+}
+
+function buildGroupsPage() {
+	var root = E('div', {});
+	if (state.statusOk === false)
+		root.appendChild(E('div', { 'class': 'alert-message warning', 'style': 'margin-bottom:1em' }, [
+			_('State is DRIFT — the page is read-only until the router re-syncs (keepalive repairs this automatically within ~10 s).')
+		]));
+	state.groupsRoot = E('div', {});
+	root.appendChild(state.groupsRoot);
+	root.appendChild(buildBoardFooter());
+	rebuildGroupsPage();
+	return root;
+}
+
+function rebuildGroupsPage() {
+	if (!state.groupsRoot)
+		return;
+	state.groupsRoot.innerHTML = '';
+	state.groupsRoot.appendChild(buildGrTabs());
+	state.groupsRoot.appendChild(grTab() == 'routes' ? buildRoutesTab() : buildGroupsTab());
+	updateBoardFooter();
+}
+
+function reloadGroupsPage() {
+	return load().then(function() {
+		rebuildGroupsPage();
+	});
+}
+
+/* ---------- group menu / delete (#49) ---------- */
+
+function showGroupMenu(name) {
+	var menu = E('div', { 'class': 'wg-menu' });
+	menu.appendChild(E('button', {
+		'class': 'btn cbi-button',
+		'click': ui.createHandlerFn(null, function() {
+			ui.hideModal();
+			openGroupPanel(name);
+		})
+	}, [ _('Edit') ]));
+	menu.appendChild(E('button', {
+		'class': 'btn cbi-button cbi-button-negative',
+		'click': ui.createHandlerFn(null, function() {
+			ui.hideModal();
+			deleteGroup(name);
+		})
+	}, [ _('Delete') ]));
+	menu.appendChild(E('div', { 'style': 'margin-top:.75em; text-align:right' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() { ui.hideModal(); })
+		}, [ _('Close') ])
+	]));
+	ui.showModal(_('Group') + ' ' + name, menu);
+}
+
+function deleteGroup(name) {
+	if (state.statusOk === false) {
+		ui.addNotification(null, E('p', {},
+			_('State is DRIFT — group editing is disabled until the router re-syncs.')), 'error');
+		return;
+	}
+	var used = groupMembersOf(name).map(function(m) { return m.name || m.mac; });
+	if (used.length) {
+		ui.addNotification(null, E('p', {},
+			_('Group "%s" still has members (%s) — move them to another group first')
+				.format(name, used.join(', '))), 'error');
+		return;
+	}
+	ui.showModal(_('Remove group'), E('div', { 'style': 'max-width:32em' }, [
+		E('p', {}, _('Delete group "%s"? Devices fall back to the main routing table.').format(name)),
+		E('div', { 'style': 'display:flex; gap:.5em; justify-content:flex-end; margin-top:1em' }, [
+			E('button', {
+				'class': 'btn cbi-button',
+				'click': ui.createHandlerFn(null, function() { ui.hideModal(); })
+			}, [ _('Cancel') ]),
+			E('button', {
+				'class': 'btn cbi-button cbi-button-negative important',
+				'click': function() {
+					ui.hideModal();
+					uci.remove('wanguard', name);
+					var host = state.saveHost;
+					Promise.resolve(host && host.handleSaveApply ? host.handleSaveApply(null, 'apply') : null)
+						.then(function() { reloadGroupsPage(); });
+				}
+			}, [ _('Delete') ])
+		])
+	]));
+}
+
+/* ---------- New/Edit group panel (#49) ---------- */
+
+/* route/device picker candidates: up ifaces (dump), degraded to the
+ * ifaces referenced by groups when the dump is unavailable (#46
+ * fallback pattern) */
+function panelIfaces() {
+	if ((state.ifaces || []).length)
+		return state.ifaces.slice();
+	var seen = {};
+	(uci.sections('wanguard', 'group') || []).forEach(function(g) {
+		if (g.iface)
+			seen[g.iface] = 1;
+		listOpt(g['.name'], 'member_iface').forEach(function(m) { seen[m] = 1; });
+	});
+	return Object.keys(seen).sort();
+}
+
+/* devices offered in the panel: the inventory + member sections the
+ * inventory does not know about (static/old-CLI entries) */
+function panelDevices() {
+	var out = (state.inventory || []).slice();
+	var have = {};
+	out.forEach(function(d) { have[d.mac] = 1; });
+	(uci.sections('wanguard', 'member') || []).forEach(function(m) {
+		var mac = normalizeMac(m.mac);
+		if (mac && !have[mac])
+			out.push({ mac: mac, ip: '', name: m.name || '', online: false, type: '' });
+	});
+	return out;
+}
+
+/* route label for the live plate: the egress the checked devices will use */
+function panelRouteLabel(sel) {
+	if (sel.type == 'proxy')
+		return 'mihomo';
+	if (sel.type == 'direct-lb')
+		return (sel.members || []).slice().sort().join('+') || 'LB';
+	return sel.iface || '?';
+}
+
+/* Stage the panel spec into (client-side) UCI — the staged config is
+ * the single source of truth for the live allocation preview (the SAME
+ * allocPreview/lbSlotMap math the board uses; no duplicated cascade).
+ * Create: named uci.add with `groupadd` semantics. Edit: in place with
+ * the groupset stale-option rules (proxy drops iface, direct-lb drops
+ * iface, stray weight_<iface> options follow their member). Devices are
+ * synced to member sections; a device that was this group's member
+ * before the panel opened and is now unchecked is unregistered, a
+ * device moved in from another group and unchecked returns to its
+ * original group (state.groupPanel.orig snapshot). Returns the staged
+ * section id or null (create with a not-yet-valid name). Cancel
+ * discards by reloading the config; Save&Apply commits it. */
+function stageGroupPanel(sel) {
+	var target;
+	if (sel.origName) {
+		target = sel.origName;
+	}
+	else {
+		if (!validGroupName(sel.name))
+			return null;
+		target = sel.name;
+		var cur = uci.get('wanguard', target);
+		if (!cur)
+			uci.add('wanguard', 'group', target);
+		else if (cur['.type'] != 'group')
+			return null;
+	}
+
+	var prev = uci.get('wanguard', target) || {};
+	var members = (sel.members || []).slice().sort();
+
+	uci.set('wanguard', target, 'type', sel.type);
+	if (sel.type == 'direct-lb') {
+		uci.set('wanguard', target, 'iface', null);
+		uci.set('wanguard', target, 'member_iface', members);
+	}
+	else if (sel.type == 'proxy') {
+		uci.set('wanguard', target, 'iface', null);
+		uci.set('wanguard', target, 'member_iface', null);
+	}
+	else {
+		uci.set('wanguard', target, 'iface', sel.iface || '');
+		uci.set('wanguard', target, 'member_iface', null);
+	}
+
+	/* metadata (#42) — absent option = the pre-#42 look (rmempty) */
+	uci.set('wanguard', target, 'label', sel.label || null);
+	uci.set('wanguard', target, 'color', sel.color || null);
+	uci.set('wanguard', target, 'description', sel.description || null);
+
+	/* stray weights (#40 semantics): a dropped member loses its
+	 * weight_<iface>, a switch away from direct-lb removes them all */
+	Object.keys(prev).forEach(function(k) {
+		if (k.indexOf('weight_') !== 0)
+			return;
+		var keep = (sel.type == 'direct-lb') &&
+			members.indexOf(k.slice('weight_'.length)) != -1;
+		if (!keep)
+			uci.set('wanguard', target, k, null);
+	});
+	if (sel.type == 'direct-lb') {
+		members.forEach(function(m) {
+			var v = (sel.weights && sel.weights[m] != null) ? String(sel.weights[m]) : '';
+			v = v.replace(/^\s+|\s+$/g, '');
+			uci.set('wanguard', target, 'weight_' + m,
+				(/^[0-9]+$/.test(v) && parseInt(v, 10) > 0) ? v : null);
+		});
+	}
+
+	/* devices: sync member sections to the selection */
+	var orig = (state.groupPanel && state.groupPanel.orig) || {};
+	var want = {};
+	(sel.devices || []).forEach(function(mac) { want[mac] = 1; });
+	groupMembersOf(target).forEach(function(m) {
+		if (!want[m.mac]) {
+			if ((orig[m.mac] || '') == target || !orig[m.mac])
+				uci.remove('wanguard', m.sid);
+			else
+				uci.set('wanguard', m.sid, 'group', orig[m.mac]);
+		}
+	});
+	(sel.devices || []).forEach(function(mac) {
+		var mm = findMember(mac);
+		if (!mm) {
+			var nm = macLabel(mac);
+			if (nm == mac)
+				nm = 'dev-' + mac.replace(/:/g, '').slice(-6);
+			var sid = uci.add('wanguard', 'member');
+			uci.set('wanguard', sid, 'name', nm);
+			uci.set('wanguard', sid, 'mac', mac);
+			uci.set('wanguard', sid, 'group', target);
+		}
+		else if ((mm.group || '') != target)
+			uci.set('wanguard', mm.sid, 'group', target);
+	});
+
+	return target;
+}
+
+/* rename = create new + copy everything + re-point the members + delete
+ * the old section (the name is load-bearing: slot cascade, labels,
+ * member refs) — mirrors the grid/form.js rename, never silent (#49) */
+function stageRename(oldName, newName) {
+	var old = uci.get('wanguard', oldName);
+	if (!old || oldName == newName || !validGroupName(newName) ||
+		uci.get('wanguard', newName))
+		return false;
+	uci.add('wanguard', 'group', newName);
+	[ 'type', 'iface', 'label', 'color', 'description' ].forEach(function(k) {
+		var v = uci.get('wanguard', oldName, k);
+		if (v != null)
+			uci.set('wanguard', newName, k, v);
+	});
+	var mi = listOpt(oldName, 'member_iface');
+	if (mi.length)
+		uci.set('wanguard', newName, 'member_iface', mi);
+	Object.keys(old).forEach(function(k) {
+		if (k.indexOf('weight_') === 0)
+			uci.set('wanguard', newName, k, uci.get('wanguard', oldName, k));
+	});
+	(uci.sections('wanguard', 'member') || []).forEach(function(m) {
+		if ((m.group || '') == oldName)
+			uci.set('wanguard', m['.name'], 'group', newName);
+	});
+	uci.remove('wanguard', oldName);
+	return true;
+}
+
+/* the panel itself: a ui modal (the established #40/#47 pattern) with
+ * the prototype's field set — name (section, a-z0-9_), label (display,
+ * #42), description, color dots, route dropdown (+ Create route link →
+ * Network → Interfaces), the direct-lb member/weight editor (#40
+ * semantics: the weight field of an unchecked member disappears and its
+ * stray option is dropped at staging), device multi-select with search
+ * and the live "N devices will use <route>" plate. DRIFT refuses to
+ * open. */
+function openGroupPanel(sid) {
+	if (state.statusOk === false) {
+		ui.addNotification(null, E('p', {},
+			_('State is DRIFT — group editing is disabled until the router re-syncs.')), 'error');
+		return;
+	}
+
+	var edit = !!sid;
+	var sec = edit ? uci.get('wanguard', sid) : null;
+	if (edit && !sec)
+		return;
+
+	var panel = { origName: edit ? sid : '', stagedNew: false, stagedName: '', orig: {} };
+	(uci.sections('wanguard', 'member') || []).forEach(function(m) {
+		var mac = normalizeMac(m.mac);
+		if (mac)
+			panel.orig[mac] = m.group || '';
+	});
+	state.groupPanel = panel;
+
+	var ifList = panelIfaces();
+	var sel = {
+		origName: panel.origName,
+		name: panel.origName,
+		type: edit ? ((sec.type == 'proxy' || sec.type == 'direct-lb') ? sec.type : 'direct') : 'direct',
+		iface: edit ? (sec.iface || '') : (ifList[0] || ''),
+		members: edit ? lbMembers(sid) : [],
+		weights: {},
+		label: edit ? (sec.label || '') : '',
+		color: edit ? (sec.color || '') : 'blue',
+		description: edit ? (sec.description || '') : '',
+		devices: edit ? groupMembersOf(sid).map(function(m) { return m.mac; }) : []
+	};
+
+	var field = function(label, node) {
+		return E('div', { 'class': 'wg-field' }, [ E('label', {}, [ label ]), node ]);
+	};
+
+	var nameNode = E('input', {
+		'type': 'text', 'class': 'cbi-input-text', 'data-wg': 'panel-name',
+		'placeholder': _('letters/digits/underscore, max 15')
+	});
+	nameNode.value = sel.name;
+	nameNode.addEventListener('input', function() {
+		sel.name = (nameNode.value || '').replace(/^\s+|\s+$/g, '');
+		stageRefresh();
+	});
+
+	/* display label (#42) — the prototype's single "Group name" maps to
+	 * the section name (issue #49 pins the a-z0-9_ validation), so the
+	 * display name gets its own optional field */
+	var labelNode = E('input', {
+		'type': 'text', 'class': 'cbi-input-text', 'data-wg': 'panel-label'
+	});
+	labelNode.value = sel.label;
+	labelNode.addEventListener('input', function() {
+		sel.label = labelNode.value || '';
+		stageRefresh();
+	});
+
+	var descrNode = E('textarea', {
+		'class': 'cbi-input-textarea', 'rows': '2', 'data-wg': 'panel-descr'
+	});
+	descrNode.value = sel.description;
+	descrNode.addEventListener('input', function() {
+		sel.description = descrNode.value || '';
+		stageRefresh();
+	});
+
+	var colorBox = E('div', { 'class': 'wg-colors', 'data-wg': 'panel-colors' });
+	Object.keys(GROUP_COLORS).forEach(function(k) {
+		var rb = E('input', { 'type': 'radio', 'name': 'wanguard-color', 'value': k });
+		rb.checked = (sel.color == k);
+		rb.addEventListener('change', function() {
+			sel.color = k;
+			stageRefresh();
+		});
+		colorBox.appendChild(E('label', { 'class': 'wg-color-opt', 'title': k }, [
+			rb,
+			E('span', { 'class': 'wg-dot', 'style': 'background:%s'.format(GROUP_COLORS[k]) }, [])
+		]));
+	});
+
+	var routeSel = E('select', { 'class': 'cbi-input-select', 'data-wg': 'panel-route' });
+	if (sel.type == 'direct' && sel.iface && ifList.indexOf(sel.iface) == -1)
+		ifList.push(sel.iface);
+	ifList.forEach(function(ifn) {
+		routeSel.appendChild(E('option', { 'value': 'direct:' + ifn }, [
+			ifn + ' · ' + ((state.ifaceProto[ifn] == 'wireguard') ? 'VPN' : 'WAN')
+		]));
+	});
+	routeSel.appendChild(E('option', { 'value': 'proxy' }, [ 'mihomo · ' + _('Proxy') ]));
+	routeSel.appendChild(E('option', { 'value': 'lb' }, [ _('Several interfaces (load balance)') ]));
+	routeSel.value = (sel.type == 'proxy') ? 'proxy'
+		: (sel.type == 'direct-lb') ? 'lb' : 'direct:' + (sel.iface || '');
+	routeSel.addEventListener('change', function() {
+		var v = routeSel.value || '';
+		if (v == 'proxy')
+			sel.type = 'proxy';
+		else if (v == 'lb')
+			sel.type = 'direct-lb';
+		else if (v.indexOf('direct:') === 0) {
+			sel.type = 'direct';
+			sel.iface = v.slice('direct:'.length);
+		}
+		stageRefresh();
+	});
+
+	var createroute = E('div', { 'class': 'wg-createroute' }, [
+		E('button', {
+			'title': _('Routes are netifd interfaces — this page does not duplicate the netifd editor'),
+			'click': function() { location.href = L.url('admin/network/interfaces'); }
+		}, [ '+ ' + _('Create route') ])
+	]);
+
+	/* direct-lb editor (#40 semantics, panel edition) */
+	var lbBox = E('div', { 'data-wg': 'panel-lb', 'style': 'display:none' });
+	var lbWrap = E('div', { 'class': 'wg-devpick' });
+	lbBox.appendChild(E('div', { 'class': 'wg-field' }, [
+		E('label', {}, [ _('Member interfaces') ]),
+		lbWrap
+	]));
+	var weightRows = {};
+	(function() {
+		var cands = ifList.slice();
+		sel.members.forEach(function(m) {
+			if (cands.indexOf(m) == -1)
+				cands.push(m);
+		});
+		cands.sort();
+		cands.forEach(function(ifn) {
+			var cb = E('input', { 'type': 'checkbox' });
+			cb.checked = sel.members.indexOf(ifn) != -1;
+			var w = E('input', { 'type': 'text', 'class': 'wg-weight', 'placeholder': '50' });
+			var cur = edit ? uci.get('wanguard', sid, 'weight_' + ifn) : null;
+			w.value = (cur != null) ? String(cur) : '';
+			sel.weights[ifn] = w.value;
+			var wr = E('label', { 'class': 'wg-devrow' }, [
+				cb,
+				E('span', { 'class': 'wg-devname' }, [ ifn ]),
+				w
+			]);
+			weightRows[ifn] = wr;
+			wr.style.display = cb.checked ? '' : 'none';
+			cb.addEventListener('change', function() {
+				if (cb.checked) {
+					if (sel.members.indexOf(ifn) == -1)
+						sel.members.push(ifn);
+				}
+				else {
+					sel.members = sel.members.filter(function(m) { return m != ifn; });
+					w.value = ''; /* stray weight dropped with the member (#40) */
+				}
+				sel.weights[ifn] = w.value;
+				wr.style.display = cb.checked ? '' : 'none';
+				stageRefresh();
+			});
+			w.addEventListener('input', function() {
+				sel.weights[ifn] = w.value;
+				stageRefresh();
+			});
+			lbWrap.appendChild(wr);
+		});
+	})();
+
+	/* devices multi-select with search (#43 icons) */
+	var devSearch = E('input', {
+		'type': 'search', 'class': 'wg-search',
+		'data-wg': 'panel-devsearch',
+		'placeholder': _('Search devices'),
+		'aria-label': _('Search devices')
+	});
+	var devBox = E('div', { 'class': 'wg-devpick', 'data-wg': 'panel-devices' });
+	var devRow = function(d) {
+		var mac = normalizeMac(d.mac) || d.mac;
+		var cb = E('input', { 'type': 'checkbox' });
+		cb.checked = sel.devices.indexOf(mac) != -1;
+		cb.addEventListener('change', function() {
+			sel.devices = sel.devices.filter(function(x) { return x != mac; });
+			if (cb.checked)
+				sel.devices.push(mac);
+			stageRefresh();
+		});
+		return E('label', { 'class': 'wg-devrow' }, [
+			cb,
+			d.type ? typeIcon(d.type) : E([]),
+			E('span', { 'class': 'wg-devname' }, [ d.name || mac ]),
+			E('span', { 'class': 'wg-devip' }, [ d.ip || '' ])
+		]);
+	};
+	var rebuildDevList = function() {
+		devBox.innerHTML = '';
+		var list = panelDevices().filter(function(d) { return deviceMatches(d, devSearch.value); });
+		list.sort(function(a, b) {
+			return (a.name || a.mac).localeCompare(b.name || b.mac);
+		});
+		if (!list.length)
+			devBox.appendChild(E('div', { 'class': 'wg-hint', 'style': 'padding:.4em .6em' }, [
+				_('No devices match the search')
+			]));
+		list.forEach(function(d) { devBox.appendChild(devRow(d)); });
+	};
+	devSearch.addEventListener('input', rebuildDevList);
+	rebuildDevList();
+
+	var plate = E('div', { 'class': 'wg-plate', 'data-wg': 'panel-plate' });
+	var prevBox = E('div', { 'class': 'wg-slots', 'data-wg': 'panel-preview', 'style': 'margin-top:.5em' });
+	var errBox = E('div', { 'class': 'wg-error', 'data-wg': 'panel-error' });
+
+	var stageRefresh = function() {
+		/* create-mode name churn: drop the previously staged new section */
+		if (!sel.origName && panel.stagedNew && panel.stagedName &&
+			panel.stagedName != sel.name) {
+			uci.remove('wanguard', panel.stagedName);
+			panel.stagedNew = false;
+			panel.stagedName = '';
+		}
+		var t = stageGroupPanel(sel);
+		if (t) {
+			panel.stagedName = t;
+			panel.stagedNew = !sel.origName;
+		}
+
+		plate.innerHTML = '';
+		plate.appendChild(E('span', {}, [
+			'%d %s will use %s.'.format(sel.devices.length,
+				sel.devices.length == 1 ? _('device') : _('devices'), panelRouteLabel(sel))
+		]));
+
+		var target = sel.origName || (validGroupName(sel.name) ? sel.name : '');
+		prevBox.innerHTML = '';
+		prevBox.appendChild(E('div', {}, [
+			_('Allocation') + ': ' + (target ? allocPreview(target) : '—')
+		]));
+		if (sel.type == 'direct-lb' && target) {
+			var plan = lbSlotMap()[target] || {};
+			(plan.slots || []).forEach(function(s) {
+				prevBox.appendChild(E('div', {}, [ slotText(s) ]));
+			});
+			if (plan.note)
+				prevBox.appendChild(E('div', {}, [ plan.note ]));
+		}
+
+		lbBox.style.display = (sel.type == 'direct-lb') ? '' : 'none';
+	};
+
+	var errShow = function(errs) {
+		errBox.innerHTML = '';
+		errs.forEach(function(e) { errBox.appendChild(E('p', {}, [ e ])); });
+	};
+
+	var panelCancel = function() {
+		ui.hideModal();
+		/* discard the staged client-side config (never applied) */
+		try { uci.unload('wanguard'); } catch (e) { /* old LuCI */ }
+		uci.load('wanguard').then(function() { rebuildGroupsPage(); });
+	};
+
+	var panelSave = function() {
+		var errs = [];
+		if (!validGroupName(sel.name))
+			errs.push(_('Invalid group name — use letters/digits/underscore, max 15 chars, not globals/wan'));
+		else if (sel.name != sel.origName && !panel.stagedNew && uci.get('wanguard', sel.name))
+			errs.push(_('A config section named "%s" already exists — pick another name').format(sel.name));
+		if (sel.type == 'proxy') {
+			var others = (uci.sections('wanguard', 'group') || []).filter(function(g) {
+				return g.type == 'proxy' && g['.name'] != (sel.origName || sel.name);
+			});
+			if (others.length)
+				errs.push(_('mihomo is a singleton — only one proxy group is allowed (already: %s)').format(others[0]['.name']));
+		}
+		if (sel.type == 'direct' && !sel.iface)
+			errs.push(_('Pick an interface for the group'));
+		if (sel.type == 'direct-lb' && !sel.members.length)
+			errs.push(_('Pick at least one member interface for load balancing'));
+		if (errs.length) {
+			errShow(errs);
+			return;
+		}
+		stageGroupPanel(sel);
+		if (sel.origName && sel.name != sel.origName)
+			stageRename(sel.origName, sel.name);
+		ui.hideModal();
+		var host = state.saveHost;
+		Promise.resolve(host && host.handleSaveApply ? host.handleSaveApply(null, 'apply') : null)
+			.then(function() { reloadGroupsPage(); });
+	};
+
+	ui.showModal(edit ? _('Edit group') : _('New group'), E('div', {
+		'class': 'wg-panel', 'style': 'max-width:34em; text-align:left'
+	}, [
+		E('div', { 'class': 'cbi-map-descr' }, [ edit
+			? _('Renaming creates a new section, moves the members and deletes the old group (the name is load-bearing).')
+			: _('Creates the group as staged UCI — Save & Apply runs "wanguard apply" instantly.')
+		]),
+		field(_('Group name'), nameNode),
+		field(_('Label (optional)'), labelNode),
+		field(_('Description (optional)'), descrNode),
+		field(_('Color'), colorBox),
+		field(_('Route'), E('div', {}, [ routeSel, createroute ])),
+		lbBox,
+		field(_('Devices'), E('div', {}, [ devSearch, devBox ])),
+		plate,
+		prevBox,
+		errBox,
+		E('div', { 'style': 'display:flex; justify-content:flex-end; gap:.5em; margin-top:1em' }, [
+			E('button', {
+				'class': 'btn cbi-button', 'data-wg': 'panel-cancel',
+				'click': ui.createHandlerFn(null, panelCancel)
+			}, [ _('Cancel') ]),
+			E('button', {
+				'class': 'btn cbi-button cbi-button-action important', 'data-wg': 'panel-save',
+				'click': ui.createHandlerFn(null, panelSave)
+			}, [ edit ? _('Save') : _('Create group') ])
+		])
+	]));
+	stageRefresh();
 }
 
 /* ---------- grid factories (issue #46) ---------- */
@@ -1329,6 +2360,7 @@ return L.Class.extend({
 	parseLeases: parseLeases,
 	parseDevices: parseDevices,
 	parseGrouplist: parseGrouplist,
+	parseWanstatus: parseWanstatus,
 	parseStatus: parseStatus,
 	updateStatusNode: updateStatusNode,
 	refreshStatus: refreshStatus,
@@ -1343,6 +2375,25 @@ return L.Class.extend({
 	deviceMatches: deviceMatches,
 	setFilter: setFilter,
 	routeChip: routeChip,
+	routeCards: routeCards,
+	groupRouteCell: groupRouteCell,
+	slotText: slotText,
+	validGroupName: validGroupName,
+	groupMembersOf: groupMembersOf,
+	setGroupFilter: setGroupFilter,
+	groupMatches: groupMatches,
+	grTab: grTab,
+	setGrTab: setGrTab,
+	buildGroupsPage: buildGroupsPage,
+	rebuildGroupsPage: rebuildGroupsPage,
+	reloadGroupsPage: reloadGroupsPage,
+	openGroupPanel: openGroupPanel,
+	stageGroupPanel: stageGroupPanel,
+	stageRename: stageRename,
+	showGroupMenu: showGroupMenu,
+	deleteGroup: deleteGroup,
+	panelIfaces: panelIfaces,
+	panelDevices: panelDevices,
 	pendingCount: pendingCount,
 	buildBoardFooter: buildBoardFooter,
 	updateBoardFooter: updateBoardFooter,

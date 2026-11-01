@@ -1,0 +1,8 @@
+WAN      DEVICE         STATE        RTT(s)    ANCHORS   SINCE
+freedom  eth0           up           0.012     2/2       01.10 12:00:00
+rostelecom pppoe-wan    down/forced  -         0/2       -
+
+GROUP    HOME     CURRENT  MODE      BACKUP                MEMBERS
+home     freedom  freedom  auto      *                     8
+media    -        -        auto      *                     7
+note: curl missing — watchdog probes disabled

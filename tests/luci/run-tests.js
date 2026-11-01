@@ -179,12 +179,22 @@ function colParts(col) {
 /* ---------- stubbed LuCI globals ---------- */
 
 const UCI = {
-	data: {}, staged: {}, _n: 0,
+	data: {}, staged: {}, _n: 0, _src: null, _base: null,
 	reset(text) {
+		this._src = text || null;
 		this.data = text ? parseUci(text, 'wanguard') : { wanguard: {} };
+		this._base = JSON.parse(JSON.stringify(this.data));
 		this.staged = {};
 	},
-	load() { return Promise.resolve(); },
+	load() {
+		/* re-read the "server" config after unload() (panel Cancel, #49):
+		 * _base = whatever the last commit left there, so committed
+		 * changes survive while client-side adds are discarded */
+		if (!this.data.wanguard || !Object.keys(this.data.wanguard).length)
+			this.data = this._base ? JSON.parse(JSON.stringify(this._base)) : (this._src ? parseUci(this._src, 'wanguard') : { wanguard: {} });
+		return Promise.resolve();
+	},
+	unload(conf) { delete this.data[conf]; },
 	sections(conf, type) {
 		const vals = this.data[conf] || {};
 		const out = [];
@@ -231,17 +241,30 @@ const UCI = {
 		this.staged[conf][sid] = this.staged[conf][sid] || {};
 		this.staged[conf][sid][opt] = val;
 	},
-	remove(conf, sid, opt) { this.set(conf, sid, opt, null); },
+	remove(conf, sid, opt) {
+		/* whole-section removal (doApply / #49 delete + rename): drops
+		 * the section from the in-memory config; option-level removal
+		 * stays the staged-null fold */
+		if (opt == null) {
+			delete this.data[conf][sid];
+			if (this.staged[conf])
+				delete this.staged[conf][sid];
+			return;
+		}
+		this.set(conf, sid, opt, null);
+	},
 	changes(conf) {
 		const c = this.staged[conf] || {};
 		return Object.keys(c).map(function(sid) { return [ sid, Object.keys(c[sid]).sort().join(',') ]; });
 	},
 	save() { this._saves = (this._saves || 0) + 1; return Promise.resolve(); },
 	apply() { this.commit(); return Promise.resolve(); },
-	add(conf, type) {
-		const sid = 'new_' + type + '_' + (++this._n);
+	add(conf, type, name) {
+		/* #49: the third argument names the section (uci.add named
+		 * semantics — the group name IS the section id) */
+		const sid = name || ('new_' + type + '_' + (++this._n));
 		this.data[conf] = this.data[conf] || {};
-		this.data[conf][sid] = { '.name': sid, '.type': type, '.anonymous': true };
+		this.data[conf][sid] = { '.name': sid, '.type': type, '.anonymous': !name };
 		return sid;
 	},
 	commit() { /* simulated apply: fold staged changes into the base */
@@ -259,6 +282,7 @@ const UCI = {
 			}
 		}
 		this.staged = {};
+		this._base = JSON.parse(JSON.stringify(this.data));
 	}
 };
 
@@ -595,13 +619,12 @@ scenario('J10 board build (#47 layout)', 'lb2.uci', async (wg, tag) => {
 });
 
 
-/* --- J11: group modal — member/weight options (#40, groups view) --- */
+/* --- J11: group modal — member/weight options (#40, groups view) ---
+ * #49 moved the groups page to the custom panel; the GridSection engine
+ * itself is unchanged and is pinned through the core factory now. */
 scenario('J11 modal options', 'lb2.uci', async (wg, tag) => {
 	wg.state.ifaces = [ 'lan', 'wan1', 'wan2', 'wan3' ];
-	const gv = loadView('groups', wg);
-	await gv.render();
-
-	const groups = gv._map.children[0];
+	const groups = wg.buildGroupsGrid().map.children[0];
 	assertEq(tag + ' groups section found', groups.sectiontype, 'group');
 
 	const typeOpt = groups.children.find((c) => c.option === 'type');
@@ -817,12 +840,11 @@ scenario('M4b no TYPE column -> no icons', 'lb2.uci', async (wg, tag) => {
 });
 
 
-/* --- M5: groups grid gains label/color/description (#42) --- */
+/* --- M5: groups grid gains label/color/description (#42) ---
+ * pinned through the core factory since #49 (see J11) */
 scenario('M5 groups grid metadata options', 'meta.uci', async (wg, tag) => {
 	wg.state.ifaces = [ 'lan', 'wan1', 'wan2' ];
-	const gv = loadView('groups', wg);
-	await gv.render();
-	const groups = gv._map.children[0];
+	const groups = wg.buildGroupsGrid().map.children[0];
 
 	const label = groups.children.find((c) => c.option === 'label');
 	ok(tag + ' label option (Value)', !!label && label.__cls === form.Value);
@@ -996,10 +1018,16 @@ scenario('L7 page grids (D2, amended by #47)', 'lb2.uci', async (wg, tag) => {
 	assertEq(tag + ' devices map = member section only',
 		dv._map.children.map(function(s) { return s.sectiontype; }).join(','), 'member');
 
-	const gv = loadView('groups', wg);
-	await gv.render();
-	assertEq(tag + ' groups map = group section only',
-		gv._map.children.map(function(s) { return s.sectiontype; }).join(','), 'group');
+	/* #49: the groups page mounts the custom panel page (no grid Map);
+	 * the single-grid groups Map lives on in the core factory */
+	const gm = wg.buildGroupsGrid();
+	assertEq(tag + ' groups map (core factory) = group section only',
+		gm.map.children.map(function(s) { return s.sectiontype; }).join(','), 'group');
+	const gv49 = loadView('groups', wg);
+	await gv49.load();
+	await gv49.render();
+	ok(tag + ' groups page = custom #49 build (no grid Map)', gv49._map === undefined);
+	ok(tag + ' groups page mounts the tab container', !!wg.state.groupsRoot);
 });
 
 
@@ -1224,6 +1252,372 @@ scenario('B9 List / +Add / New group navigation (#20/#47)', 'board47.uci', async
 	ok(tag + ' New group tile present', !!tile);
 	tile.children[0].listeners['click'][0]();
 	assertEq(tag + ' tile -> groups page', global.location.href, '/admin/network/wanguard/groups');
+});
+
+/* ======== #49 Groups & Routes page (G1–G10; everything above must stay
+ * byte-identical — the page is a rebuild of the groups VIEW only, the
+ * engine math is shared) ======== */
+
+/* `wanguard wanstatus` sample (#6): 7-field row (SINCE with a space),
+ * 6-field row with dashes, header, blank line, GROUP table, note */
+const WANS = fixture('wanstatus.txt');
+
+function findByWg(root, key) {
+	let out = null;
+	(function walk(n) {
+		if (out || !n || typeof n !== 'object')
+			return;
+		if (n.attrs && n.attrs['data-wg'] === key) {
+			out = n;
+			return;
+		}
+		(n.children || []).forEach(walk);
+	})(root);
+	return out;
+}
+
+function findRows(root) {
+	const out = [];
+	(function walk(n) {
+		if (!n || typeof n !== 'object')
+			return;
+		if (n.tag === 'tr' && n.attrs && n.attrs['data-group'])
+			out.push(n);
+		(n.children || []).forEach(walk);
+	})(root);
+	return out;
+}
+
+function findRouteCard(root, name) {
+	let out = null;
+	(function walk(n) {
+		if (out || !n || typeof n !== 'object')
+			return;
+		if (n.attrs && n.attrs['data-wg'] === 'route-card' && n.attrs['data-route'] === name) {
+			out = n;
+			return;
+		}
+		(n.children || []).forEach(walk);
+	})(root);
+	return out;
+}
+
+/* --- G1: parseWanstatus --- */
+scenario('G1 parseWanstatus (#49)', 'board47.uci', async (wg, tag) => {
+	const r = wg.parseWanstatus(WANS);
+	ok(tag + ' freedom row', !!r.wan.freedom && r.wan.freedom.device == 'eth0' && r.wan.freedom.state == 'up', r.wan);
+	assertEq(tag + ' rtt', r.wan.freedom.rtt, '0.012');
+	assertEq(tag + ' anchors', r.wan.freedom.anchors, '2/2');
+	assertEq(tag + ' since keeps the inner space', r.wan.freedom.since, '01.10 12:00:00');
+	ok(tag + ' forced state kept as-is', r.wan.rostelecom && r.wan.rostelecom.state == 'down/forced');
+	assertEq(tag + ' dash fields survive', [ r.wan.rostelecom.rtt, r.wan.rostelecom.since ].join('|'), '-|-');
+	ok(tag + ' GROUP section ignored', r.wan.GROUP === undefined && r.wan.home === undefined);
+	ok(tag + ' trailing note ignored', r.wan['note:'] === undefined);
+	assertEq(tag + ' old CLI (no output) degrades', Object.keys(wg.parseWanstatus('').wan).length, 0);
+	assertEq(tag + ' garbage rows skipped', Object.keys(wg.parseWanstatus('x y z\n').wan).length, 0);
+});
+
+/* --- G2: routeCards — classification, mihomo, wanstatus, degradations --- */
+scenario('G2 routeCards (#49)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	RPC.canned['exec:/usr/bin/wanguard:wanstatus'] = { stdout: WANS };
+	await wg.load();
+	const cards = wg.routeCards();
+	assertEq(tag + ' dump ifaces (sorted) + wanstatus-only + mihomo last',
+		cards.map((c) => c.name).join(','),
+		'freedom,lan,rostelecom,wan1,wan2,wg_moscow,mihomo', cards.map((c) => c.name).join(','));
+	assertEq(tag + ' wireguard -> vpn', cards.filter((c) => c.name == 'wg_moscow')[0].type, 'vpn');
+	assertEq(tag + ' plain iface -> wan', cards.filter((c) => c.name == 'wan1')[0].type, 'wan');
+	assertEq(tag + ' mihomo card (proxy group exists)', cards.filter((c) => c.name == 'mihomo')[0].type, 'proxy');
+	const fr = cards.filter((c) => c.name == 'freedom')[0];
+	ok(tag + ' wanstatus enrichment (rtt/anchors/device)',
+		fr.up === true && fr.rtt == '0.012' && fr.anchors == '2/2' && fr.device == 'eth0', fr);
+	const ro = cards.filter((c) => c.name == 'rostelecom')[0];
+	assertEq(tag + ' wanstatus-only iface (not in dump)', ro.up, false);
+
+	/* old CLI: no wanstatus output — dump-only cards, no liveness */
+	RPC.canned['exec:/usr/bin/wanguard:wanstatus'] = { stdout: '' };
+	await wg.load();
+	ok(tag + ' degradation: no rtt without wanstatus',
+		wg.routeCards().every((c) => !c.rtt));
+	ok(tag + ' degradation: dump state kept',
+		wg.routeCards().filter((c) => c.name == 'freedom')[0].up === true);
+
+	/* no dump AND no wanstatus -> ifaces referenced by groups, unknown state */
+	wg.state.allIfaces = [];
+	wg.state.ifaces = [];
+	wg.state.wanstatus = { wan: {} };
+	const deg = wg.routeCards();
+	assertEq(tag + ' degraded cards from group ifaces',
+		deg.map((c) => c.name).join(','), 'freedom,wan1,wan2,wg_moscow,mihomo');
+	ok(tag + ' degraded state unknown', deg[0].up === null);
+});
+
+/* --- G3: validGroupName — exact CLI valid_group_name mirror --- */
+scenario('G3 validGroupName (#49)', 'legacy.uci', async (wg, tag) => {
+	ok(tag + ' plain name ok', wg.validGroupName('Guest_2'));
+	ok(tag + ' 15 chars ok', wg.validGroupName(new Array(16).join('x')));
+	ok(tag + ' 16 chars refused', !wg.validGroupName(new Array(17).join('x')));
+	ok(tag + ' dash refused', !wg.validGroupName('a-b'));
+	ok(tag + ' empty refused', !wg.validGroupName(''));
+	ok(tag + ' null refused', !wg.validGroupName(null));
+	ok(tag + ' globals refused', !wg.validGroupName('globals'));
+	ok(tag + ' wan refused', !wg.validGroupName('wan'));
+});
+
+/* --- G4: stageGroupPanel — create (groupadd semantics) + device sync --- */
+scenario('G4 panel staging: create + devices (#49)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	await wg.load();
+	wg.state.groupPanel = {
+		origName: '', stagedNew: false, stagedName: '',
+		orig: { 'aa:bb:cc:dd:ee:01': 'home', 'aa:bb:cc:dd:ee:02': 'work' }
+	};
+
+	const spec = { origName: '', name: 'guest', type: 'direct', iface: 'wan1',
+		label: 'Guest', color: 'green', description: 'temp',
+		devices: [ 'aa:bb:cc:dd:ee:99' ], weights: {} };
+	assertEq(tag + ' staged section id', wg.stageGroupPanel(spec), 'guest');
+	assertEq(tag + ' named section type', UCI.get('wanguard', 'guest', 'type'), 'direct');
+	assertEq(tag + ' iface', UCI.get('wanguard', 'guest', 'iface'), 'wan1');
+	assertEq(tag + ' label (#42)', UCI.get('wanguard', 'guest', 'label'), 'Guest');
+	assertEq(tag + ' color (#42)', UCI.get('wanguard', 'guest', 'color'), 'green');
+	assertEq(tag + ' description (#42)', UCI.get('wanguard', 'guest', 'description'), 'temp');
+	ok(tag + ' new member section for the lease-only device',
+		!!wg.findMember('aa:bb:cc:dd:ee:99') && wg.findMember('aa:bb:cc:dd:ee:99').group == 'guest');
+
+	spec.devices.push('aa:bb:cc:dd:ee:01');
+	wg.stageGroupPanel(spec);
+	assertEq(tag + ' device moved in from home', wg.findMember('aa:bb:cc:dd:ee:01').group, 'guest');
+	assertEq(tag + ' home left with no members',
+		wg.groupMembersOf('home').length, 0);
+
+	spec.devices = [ 'aa:bb:cc:dd:ee:99' ];
+	wg.stageGroupPanel(spec);
+	assertEq(tag + ' moved-in device returned to its original group',
+		wg.findMember('aa:bb:cc:dd:ee:01').group, 'home');
+
+	assertEq(tag + ' invalid name -> nothing staged',
+		wg.stageGroupPanel({ origName: '', name: 'no-valid-name!', type: 'direct', iface: 'wan1', devices: [], weights: {} }),
+		null);
+	ok(tag + ' globals name -> nothing staged',
+		wg.stageGroupPanel({ origName: '', name: 'globals', type: 'direct', iface: 'wan1', devices: [], weights: {} }) === null);
+});
+
+/* --- G5: stageRename — create new + copy + re-point + delete --- */
+scenario('G5 panel staging: rename (#49)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	await wg.load();
+	ok(tag + ' rename staged', wg.stageRename('work', 'jobs') === true);
+	assertEq(tag + ' options copied', [ UCI.get('wanguard', 'jobs', 'type'), UCI.get('wanguard', 'jobs', 'iface') ].join('/'), 'direct/wg_moscow');
+	assertEq(tag + ' member re-pointed', wg.findMember('aa:bb:cc:dd:ee:02').group, 'jobs');
+	ok(tag + ' old section deleted', UCI.get('wanguard', 'work') === null);
+	ok(tag + ' collision refused', wg.stageRename('jobs', 'home') === false);
+	ok(tag + ' missing section refused', wg.stageRename('nope', 'x2') === false);
+	wg.stageRename('lbx', 'lbx2');
+	assertEq(tag + ' lb members copied', JSON.stringify(UCI.get('wanguard', 'lbx2', 'member_iface')), JSON.stringify([ 'wan1', 'wan2' ]));
+	assertEq(tag + ' lb weights copied', UCI.get('wanguard', 'lbx2', 'weight_wan1'), '70');
+	assertEq(tag + ' lb slots follow the new name',
+		wg.lbSlotMap().lbx2.slots.map((s) => s.mark).join(','), '400,500');
+});
+
+/* --- G6: delete guard + modal --- */
+scenario('G6 deleteGroup (#49)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	await wg.load();
+	wg.state.saveHost = { handleSaveApply: function() { UCI.commit(); return Promise.resolve(); } };
+	wg.deleteGroup('home');
+	ok(tag + ' non-empty group refused (notification, no modal)', !ui._modal);
+	ok(tag + ' group still there', !!UCI.get('wanguard', 'home'));
+	wg.deleteGroup('media');
+	ok(tag + ' empty group asks for confirmation', !!ui._modal);
+	const del = (function walk(n) {
+		if (n.tag === 'button' && flat(n) == 'Delete')
+			return n;
+		for (const c of (n.children || [])) {
+			const r = walk(c);
+			if (r)
+				return r;
+		}
+		return null;
+	})(ui._modal[1]);
+	del.listeners['click'][0]();
+	assertEq(tag + ' modal closed', ui._modal, null);
+	ok(tag + ' empty group removed', UCI.get('wanguard', 'media') === null);
+	wg.state.statusOk = false;
+	wg.deleteGroup('home');
+	ok(tag + ' DRIFT refuses deletion', !ui._modal && !!UCI.get('wanguard', 'home'));
+	wg.state.statusOk = true;
+});
+
+/* --- G7: groups page render — tabs, table rows, chips, search --- */
+scenario('G7 groups page render (#49)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	RPC.canned['exec:/usr/bin/wanguard:wanstatus'] = { stdout: WANS };
+	const gv = loadView('groups', wg);
+	await gv.load();
+	const root = await gv.render();
+	const txt = flat(root);
+	ok(tag + ' tabs present', txt.indexOf('Groups') !== -1 && txt.indexOf('Routes') !== -1);
+	assertEq(tag + ' active tab', (findByWg(root, 'tab-groups').attrs.class || ''), 'wg-tab wg-tab-active');
+	assertEq(tag + ' row order (direct sorted, proxy last)',
+		findRows(root).map((r) => r.attrs['data-group']).join(','), 'home,lbx,work,media');
+
+	const home = findRows(root).filter((r) => r.attrs['data-group'] == 'home')[0];
+	const dot = home.children[0].children[0].children[0];
+	assertEq(tag + ' color dot painted (#42)', dot.styleStr, 'background:#2563EB');
+	ok(tag + ' label as display name (#42)', flat(home.children[0]).indexOf('Home') !== -1, flat(home.children[0]));
+	assertEq(tag + ' assigned-route chip', flat(home.children[1]), 'freedom · WAN');
+	assertEq(tag + ' device counter', flat(home.children[2]), '1 device');
+
+	const lbx = findRows(root).filter((r) => r.attrs['data-group'] == 'lbx')[0];
+	ok(tag + ' lb chip', flat(lbx.children[1]).indexOf('wan1+wan2 · LB') !== -1);
+	ok(tag + ' lb shown as slots (not one chip)',
+		flat(lbx.children[1]).indexOf('wan1 70% 400/402') !== -1 &&
+		flat(lbx.children[1]).indexOf('wan2 30% 500/403') !== -1, flat(lbx.children[1]));
+	const media = findRows(root).filter((r) => r.attrs['data-group'] == 'media')[0];
+	assertEq(tag + ' proxy chip names the target', flat(media.children[1]), 'mihomo · Proxy');
+
+	/* routes strip under the table */
+	const fr = findRouteCard(root, 'freedom');
+	ok(tag + ' routes strip card', !!fr);
+	ok(tag + ' strip card carries wanstatus', flat(fr).indexOf('RTT 0.012') !== -1, flat(fr));
+
+	wg.setGroupFilter('wor');
+	wg.rebuildGroupsPage();
+	assertEq(tag + ' search narrows the table',
+		findRows(wg.state.groupsRoot).map((r) => r.attrs['data-group']).join(','), 'work');
+	wg.setGroupFilter('zzz');
+	wg.rebuildGroupsPage();
+	ok(tag + ' empty search state', flat(wg.state.groupsRoot).indexOf('No groups match') !== -1);
+	wg.setGroupFilter('');
+	wg.rebuildGroupsPage();
+
+	/* tab switch persists + routes tab shows the detail lines */
+	findByWg(wg.state.groupsRoot, 'tab-routes').listeners['click'][0]();
+	assertEq(tag + ' tab persisted', localStorageStub.getItem('wanguard-gr-tab'), 'routes');
+	const rt = findRouteCard(wg.state.groupsRoot, 'freedom');
+	ok(tag + ' routes tab detail lines', flat(rt).indexOf('RTT(s): 0.012') !== -1 && flat(rt).indexOf('Since: 01.10 12:00:00') !== -1, flat(rt));
+	ok(tag + ' New route button present', !!findByWg(wg.state.groupsRoot, 'route-new'));
+	wg.setGrTab('groups');
+});
+
+/* --- G8: openGroupPanel create flow — live staging, plate, preview --- */
+scenario('G8 panel create flow (#49)', 'lb2.uci', async (wg, tag) => {
+	cannedLb2();
+	await wg.load();
+	const host = { saved: 0, handleSaveApply: function() { this.saved++; UCI.commit(); return Promise.resolve(); } };
+	wg.state.saveHost = host;
+
+	wg.openGroupPanel(null);
+	ok(tag + ' modal open', !!ui._modal && ui._modal[0] == 'New group', ui._modal && ui._modal[0]);
+	let body = ui._modal[1];
+	const name = findByWg(body, 'panel-name');
+	ok(tag + ' route preselected (first up iface)', findByWg(body, 'panel-route').value == 'direct:lan', findByWg(body, 'panel-route').value);
+	ok(tag + ' color defaulted (blue radio)', findByWg(body, 'panel-colors').children[0].children[0].checked === true);
+
+	name.value = 'guest';
+	name.listeners['input'][0]();
+	ok(tag + ' valid name stages the section (live)', !!UCI.get('wanguard', 'guest'));
+	ok(tag + ' plate counts devices', flat(findByWg(body, 'panel-plate')).indexOf('0 devices will use lan.') !== -1,
+		flat(findByWg(body, 'panel-plate')));
+
+	/* route -> mihomo (proxy) */
+	let route = findByWg(body, 'panel-route');
+	route.value = 'proxy';
+	route.listeners['change'][0]();
+	assertEq(tag + ' staged type proxy', UCI.get('wanguard', 'guest', 'type'), 'proxy');
+	ok(tag + ' live preview through allocPreview',
+		flat(findByWg(body, 'panel-preview')).indexOf('fwmark 300 → table 500 (fixed)') !== -1,
+		flat(findByWg(body, 'panel-preview')));
+
+	/* check a device via the picker */
+	const dev = findByWg(body, 'panel-devices').children[0].children[0];
+	dev.checked = true;
+	dev.listeners['change'][0]();
+	ok(tag + ' plate tracks the selection', flat(findByWg(body, 'panel-plate')).indexOf('1 device will use mihomo.') !== -1,
+		flat(findByWg(body, 'panel-plate')));
+
+	findByWg(body, 'panel-save').listeners['click'][0]();
+	assertEq(tag + ' modal closed on save', ui._modal, null);
+	assertEq(tag + ' committed proxy group', UCI.get('wanguard', 'guest', 'type'), 'proxy');
+	assertEq(tag + ' Save&Apply ran once', host.saved, 1);
+	ok(tag + ' committed member', !!wg.findMember('aa:bb:cc:dd:ee:55') && wg.findMember('aa:bb:cc:dd:ee:55').group == 'guest');
+
+	/* second proxy -> singleton validation, modal stays open */
+	wg.openGroupPanel(null);
+	body = ui._modal[1];
+	findByWg(body, 'panel-name').value = 'guest2';
+	findByWg(body, 'panel-name').listeners['input'][0]();
+	route = findByWg(body, 'panel-route');
+	route.value = 'proxy';
+	route.listeners['change'][0]();	findByWg(body, 'panel-save').listeners['click'][0]();
+	ok(tag + ' singleton error shown', flat(findByWg(body, 'panel-error')).indexOf('singleton') !== -1, flat(findByWg(body, 'panel-error')));
+	ok(tag + ' modal stays open with the error', !!ui._modal);
+	assertEq(tag + ' failed validation never saved', host.saved, 1);
+	ok(tag + ' guest2 only staged client-side so far', UCI.get('wanguard', 'guest2') !== null);
+
+	findByWg(body, 'panel-cancel').listeners['click'][0]();
+	assertEq(tag + ' modal closed on cancel', ui._modal, null);
+	ok(tag + ' cancel discards staged client state', UCI.get('wanguard', 'guest2') === null);
+	ok(tag + ' committed group survives cancel', UCI.get('wanguard', 'guest', 'type') == 'proxy');
+});
+
+/* --- G9: openGroupPanel edit flow — prefill, label, device unassign --- */
+scenario('G9 panel edit flow (#49)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	await wg.load();
+	wg.state.saveHost = { handleSaveApply: function() { UCI.commit(); return Promise.resolve(); } };
+
+	wg.openGroupPanel('home');
+	ok(tag + ' edit modal', !!ui._modal && ui._modal[0] == 'Edit group', ui._modal && ui._modal[0]);
+	const body = ui._modal[1];
+	assertEq(tag + ' name prefilled', findByWg(body, 'panel-name').value, 'home');
+	assertEq(tag + ' label prefilled (#42)', findByWg(body, 'panel-label').value, 'Home');
+	assertEq(tag + ' route prefilled', findByWg(body, 'panel-route').value, 'direct:freedom');
+	ok(tag + ' member prechecked', findByWg(body, 'panel-devices').children[0].children[0].checked === true);
+
+	findByWg(body, 'panel-label').value = 'Home net';
+	findByWg(body, 'panel-label').listeners['input'][0]();
+	const homeCb = findByWg(body, 'panel-devices').children[0].children[0];
+	homeCb.checked = false; /* the stub does not toggle before the event */
+	homeCb.listeners['change'][0]();
+	findByWg(body, 'panel-save').listeners['click'][0]();
+	assertEq(tag + ' label staged + committed', UCI.get('wanguard', 'home', 'label'), 'Home net');
+	ok(tag + ' unchecked member unregistered', wg.findMember('aa:bb:cc:dd:ee:01') === null);
+
+	/* lb group edit: weight fields follow the member checkboxes (#40) */
+	wg.openGroupPanel('lbx');
+	const body2 = ui._modal[1];
+	ok(tag + ' lb member rows visible', findByWg(body2, 'panel-lb').style.display !== 'none');
+	const lbRows = findByWg(body2, 'panel-lb').children[0].children[1];
+	const wan1row = lbRows.children.filter(function(r) {
+		return flat(r).indexOf('wan1') !== -1;
+	})[0];
+	const wan1cb = wan1row.children[0];
+	ok(tag + ' wan1 row checked', !!wan1cb && wan1cb.checked === true);
+	wan1cb.checked = false;
+	wan1cb.listeners['change'][0]();
+	assertEq(tag + ' unchecked member weight dropped (stray-weight rule)',
+		UCI.get('wanguard', 'lbx', 'weight_wan1'), null);
+	ui.hideModal();
+	try { UCI.unload('wanguard'); UCI.load(); } catch (e) { /* fine */ }
+});
+
+/* --- G10: DRIFT gating on the page and the panel --- */
+scenario('G10 DRIFT read-only (#49)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	wg.state.statusOk = false;
+	const p = wg.buildGroupsPage();
+	ok(tag + ' drift banner', flat(p).indexOf('DRIFT') !== -1);
+	wg.openGroupPanel(null);
+	ok(tag + ' panel refused in DRIFT', !ui._modal);
+	wg.openGroupPanel('home');
+	ok(tag + ' edit refused in DRIFT', !ui._modal);
+	wg.state.statusOk = true;
+	wg.openGroupPanel(null);
+	ok(tag + ' panel opens back in sync', !!ui._modal);
+	ui.hideModal();
 });
 
 async function demo() {
