@@ -341,6 +341,21 @@ Properties and constraints:
   in `/root/rollback/<date>/` (files + ruleset + ip rule + routes);
   procedure — see the private repo's plan, stage 8.
 
+### 5.1 LuCI overview board (#47)
+
+The Overview page is board-first: a compact sync pill (counters moved to
+the footer), a toolbar — search by name/IP/MAC, an "Online only" switch,
+Board|List (List deep-links to the Devices page, #20) and a "+ Add" menu —
+per-column route chips (`iface · WAN`, `iface · VPN` for wireguard proto,
+`Proxy`, `member summary · LB`), cards with type icons (#43) whose "…"
+opens the move menu (drag stays the primary path, #14), the Unassigned
+column, a per-column "Add devices" shortcut into the DHCP lease panel,
+a "New group" tile and an honest footer: global totals plus a staged-
+changes pill fed by `uci.changes()` — the same source as the "Unsaved
+changes" badge; DRIFT keeps the board read-only. The former in-page
+table mode is retired: grids live on the Devices and Groups & Routes
+pages (#46).
+
 ## 6. MTU/MSS
 
 | Path | MTU | MSS clamp |

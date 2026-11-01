@@ -98,7 +98,8 @@ function E(spec, attrs, children) {
 		getAttribute(k) { return (k in this.attrs) ? this.attrs[k] : null; },
 		querySelector() { return null; },
 		querySelectorAll() { return []; },
-		innerHTML: ''
+		get innerHTML() { return this._h || ''; },
+		set innerHTML(v) { this._h = v; if (v === '') this.children.length = 0; },
 	};
 	if (Array.isArray(spec)) {
 		spec.forEach((c) => node.appendChild(c));
@@ -159,11 +160,18 @@ function findCol(root, group) {
 
 function colParts(col) {
 	const head = col.children[0];
-	const titleEl = head.children.find((c) => (c.attrs.class || '').includes('wg-col-title'));
-	const subEl = head.children.find((c) => (c.attrs.class || '').includes('wg-col-sub'));
+	const pick = function(cls) {
+		return head.children.find(function(c) {
+			return c.attrs && (c.attrs.class || '') === cls;
+		});
+	};
+	const t = pick('wg-col-title');
+	const s = pick('wg-col-sub');
+	const ch = pick('wg-col-chip');
 	return {
-		title: titleEl ? flat(titleEl) : '',
-		sub: subEl ? flat(subEl) : '',
+		title: t ? flat(t) : '',
+		sub: s ? flat(s) : '',
+		chip: ch ? flat(ch) : '',
 		cards: col.children[1].children
 	};
 }
@@ -211,11 +219,25 @@ const UCI = {
 		return (opt in s) ? s[opt] : null;
 	},
 	set(conf, sid, opt, val) {
+		const m = /^@(\w+)\[-1\]$/.exec(sid);
+		if (m) {
+			const ty = m[1];
+			const ks = Object.keys(this.data[conf] || {}).filter(function(k) {
+				return (this.data[conf][k] || {})['.type'] === ty;
+			}, this);
+			sid = ks.length ? ks[ks.length - 1] : sid;
+		}
 		this.staged[conf] = this.staged[conf] || {};
 		this.staged[conf][sid] = this.staged[conf][sid] || {};
 		this.staged[conf][sid][opt] = val;
 	},
 	remove(conf, sid, opt) { this.set(conf, sid, opt, null); },
+	changes(conf) {
+		const c = this.staged[conf] || {};
+		return Object.keys(c).map(function(sid) { return [ sid, Object.keys(c[sid]).sort().join(',') ]; });
+	},
+	save() { this._saves = (this._saves || 0) + 1; return Promise.resolve(); },
+	apply() { this.commit(); return Promise.resolve(); },
 	add(conf, type) {
 		const sid = 'new_' + type + '_' + (++this._n);
 		this.data[conf] = this.data[conf] || {};
@@ -345,7 +367,9 @@ form.Map.prototype.section = function(cls, type, title) {
 const view = { extend(o) { return o; } };
 const poll = { add() {} };
 const ui = {
-	addNotification() {}, showModal() {}, hideModal() {},
+	addNotification() {},
+	showModal(title, body) { ui._modal = [title, body]; },
+	hideModal() { ui._modal = null; },
 	createHandlerFn(scope, fn) { return function() { return fn.apply(scope, arguments); }; },
 	changes: { init() { return Promise.resolve(); } }
 };
@@ -372,10 +396,16 @@ const L = {
 	 * made of (L.isArray hit the router, 2026-10-30). */
 	isObject: (o) => !!o && typeof o === 'object'
 };
+L.url = function(p) { return '/' + p; };
+global.location = { href: '' };
 const _ = (s) => s;
 const documentStub = { querySelector() { return null; }, querySelectorAll() { return []; } };
 const windowStub = {};
-const localStorageStub = { getItem() { return null; }, setItem() {} };
+const localStorageStub = {
+	_s: {},
+	getItem(k) { return (k in this._s) ? this._s[k] : null; },
+	setItem(k, v) { this._s[k] = String(v); }
+};
 
 /* load the REAL code: top-level return is legal in a Function body.
  * core.js declares 'require rpc/uci/ui/form' -> those are the wrapper's
@@ -446,6 +476,8 @@ function scenario(name, fixtureName, fn) {
 	scenarios.push({ name, run: async () => {
 		UCI.reset(fixtureName ? fixture(fixtureName) : null);
 		RPC.canned = {};
+		localStorageStub._s = {};
+		global.location.href = '';
 		const wg = loadCore();
 		await fn(wg, name);
 	} });
@@ -537,7 +569,7 @@ scenario('J9 legacy golden', 'legacy.uci', async (wg, tag) => {
 });
 
 /* --- J10: board structure + device enrichment via the overview view --- */
-scenario('J10 board build', 'lb2.uci', async (wg, tag) => {
+scenario('J10 board build (#47 layout)', 'lb2.uci', async (wg, tag) => {
 	cannedLb2();
 	const ov = loadView('overview', wg);
 	await ov.load();
@@ -545,21 +577,23 @@ scenario('J10 board build', 'lb2.uci', async (wg, tag) => {
 
 	const lb = colParts(findCol(root, 'lb'));
 	assertEq(tag + ' lb title', lb.title, 'lb — LB');
-	assertEq(tag + ' lb sub (slots + devices + count)',
-		lb.sub, 'wan1 70% 200/401 (eth0) · wan2 30% 400/402 (eth1) · 1');
+	assertEq(tag + ' lb sub (device count)', lb.sub, '1 device');
+	assertEq(tag + ' lb chip (member summary)', lb.chip, 'wan1+wan2 · LB');
 	assertEq(tag + ' lb card mac', lb.cards[0] && lb.cards[0].attrs['data-mac'], 'aa:bb:cc:dd:ee:55');
 
 	const a = colParts(findCol(root, 'a'));
 	assertEq(tag + ' direct column title unchanged', a.title, 'a — wan3');
-	assertEq(tag + ' direct column sub unchanged', a.sub, 'fwmark 100 → table 400 · 0');
+	assertEq(tag + ' direct sub (device count)', a.sub, '0 devices');
+	assertEq(tag + ' direct chip (iface · WAN)', a.chip, 'wan3 · WAN');
 
 	const u = colParts(findCol(root, ''));
-	assertEq(tag + ' unclassified column present', u.title, 'Unclassified');
+	assertEq(tag + ' column renamed', u.title, 'Unassigned');
+	assertEq(tag + ' unassigned has no chip', u.chip, '');
 
-	/* board column order: direct first, lb inside the non-proxy block */
-	const order = [ 'a', 'lb', '' ].map((g) => findCol(root, g) ? 1 : 0).join('');
+	const order = [ 'a', 'lb', '' ].map(function(g) { return findCol(root, g) ? 1 : 0; }).join('');
 	assertEq(tag + ' all columns built', order, '111');
 });
+
 
 /* --- J11: group modal — member/weight options (#40, groups view) --- */
 scenario('J11 modal options', 'lb2.uci', async (wg, tag) => {
@@ -643,14 +677,15 @@ scenario('J12 edit persistence', 'lb2.uci', async (wg, tag) => {
 
 /* --- J13: degraded environments (overview view, no canned RPC) --- */
 scenario('J13 degraded', 'lb2.uci', async (wg, tag) => {
-	/* no grouplist output (old CLI / ACL lost): board still renders slots */
+	/* old CLI / lost ACL: board still renders counts + UCI-only chip */
 	const ov = loadView('overview', wg);
 	await ov.load();
 	const root = await ov.render();
 	const p = colParts(findCol(root, 'lb'));
-	assertEq(tag + ' no device suffix without grouplist',
-		p.sub, 'wan1 70% 200/401 · wan2 30% 400/402 · 1');
+	assertEq(tag + ' count survives without grouplist', p.sub, '1 device');
+	assertEq(tag + ' chip degrades to UCI-only', p.chip, 'wan1+wan2 · LB');
 });
+
 
 /* --- J14: the shipped config template stays allocator-consistent --- */
 scenario('J14 config template', null, async (wg, tag) => {
@@ -753,17 +788,19 @@ scenario('M4 board card TYPE icon (#43)', 'meta.uci', async (wg, tag) => {
 	await ov.load();
 	const root = await ov.render();
 
-	const meta = findCol(root, 'lb').children[1].children[0].children[2];
-	const icon = meta.children[1];
-	ok(tag + ' icon span present', !!icon && (icon.attrs.class || '') === 'wg-type wg-type-phone', icon.attrs);
+	const card = findCol(root, 'lb').children[1].children[0];
+	const row = card.children[0];
+	const icon = row.children[0];
+	ok(tag + ' icon span present', !!icon && (icon.attrs.class || '') === 'wg-type wg-type-phone', icon && icon.attrs);
 	ok(tag + ' icon carries the svg markup', (icon.innerHTML || '').indexOf('<svg') === 0, icon.innerHTML);
-	assertEq(tag + ' icon tooltip names the type', icon.attrs.title, 'type: phone');
+	assertEq(tag + ' icon tooltip names the type', icon.attrs.title, ('type: %s').replace('%s', 'phone'));
 
-	const umeta = findCol(root, '').children[1].children[0].children[2];
-	const uicon = umeta.children[1];
-	ok(tag + ' generic icon for the unclassified device',
+	const ucard = findCol(root, '').children[1].children[0];
+	const uicon = ucard.children[0].children[0];
+	ok(tag + ' generic icon for the unassigned device',
 		(uicon.attrs.class || '').indexOf('wg-type-generic') !== -1, uicon.attrs);
 });
+
 
 /* --- M4b: old 4-column CLI -> no icon nodes (the pre-#43 card) --- */
 scenario('M4b no TYPE column -> no icons', 'lb2.uci', async (wg, tag) => {
@@ -772,11 +809,13 @@ scenario('M4b no TYPE column -> no icons', 'lb2.uci', async (wg, tag) => {
 	await ov.load();
 	const root = await ov.render();
 	const card = findCol(root, 'lb').children[1].children[0];
-	const metaRow = card.children[2];
-	ok(tag + ' no .wg-type node anywhere in the card',
-		!metaRow.children.some((c) => c.attrs && (c.attrs.class || '').indexOf('wg-type') !== -1),
-		metaRow.children.map((c) => c.attrs.class));
+	const row = card.children[0];
+	ok(tag + ' no icon node in the card row',
+		!row.children.some(function(c) { return c.attrs && (c.attrs.class || '').indexOf('wg-type') !== -1; }));
+	ok(tag + ' MAC lives in the card tooltip (#47)',
+		(card.attrs.title || '').indexOf('aa:bb:cc:dd:ee:55') !== -1, card.attrs.title);
 });
+
 
 /* --- M5: groups grid gains label/color/description (#42) --- */
 scenario('M5 groups grid metadata options', 'meta.uci', async (wg, tag) => {
@@ -946,24 +985,246 @@ scenario('L6 monolith deleted', null, async (wg, tag) => {
 });
 
 /* --- L7: D2 — overview Table = both grids; per-page Maps are single-grid --- */
-scenario('L7 page grids (D2)', 'lb2.uci', async (wg, tag) => {
+scenario('L7 page grids (D2, amended by #47)', 'lb2.uci', async (wg, tag) => {
 	const ov = loadView('overview', wg);
 	await ov.render();
-	assertEq(tag + ' overview map = groups+devices sections (D2)',
-		ov._map.children.map((s) => s.sectiontype).join(','), 'group,member');
+	ok(tag + ' overview dropped the in-page table (#20/#47)', ov._map === undefined);
+	ok(tag + ' List button present', !!ov._btnList);
 
 	const dv = loadView('devices', wg);
 	await dv.render();
 	assertEq(tag + ' devices map = member section only',
-		dv._map.children.map((s) => s.sectiontype).join(','), 'member');
+		dv._map.children.map(function(s) { return s.sectiontype; }).join(','), 'member');
 
 	const gv = loadView('groups', wg);
 	await gv.render();
 	assertEq(tag + ' groups map = group section only',
-		gv._map.children.map((s) => s.sectiontype).join(','), 'group');
+		gv._map.children.map(function(s) { return s.sectiontype; }).join(','), 'group');
 });
 
+
 /* ============================ demo ============================ */
+
+/* ======== #47 board 2.0 — toolbar search/switch, chips, card layout,
+ * Unassigned, footer pending pill, List/add/new-group nav (B1–B9) ======== */
+
+function cannedBoard47() {
+	RPC.canned = {
+		'read:': '',
+		'exec:/usr/bin/wanguard:list': { stdout: 'members: 2\n\naa:bb:cc:dd:ee:01 home\naa:bb:cc:dd:ee:02 work\nnft: in-sync' },
+		'exec:/usr/bin/wanguard:devices': { stdout: [
+			'aa:bb:cc:dd:ee:01\t192.168.88.79\talice-phone\t1\tphone',
+			'aa:bb:cc:dd:ee:02\t192.168.88.58\twork-pc\t1\tpc',
+			'aa:bb:cc:dd:ee:99\t192.168.88.201\tguest-phone\t0\tphone'
+		].join('\n') },
+		'exec:/usr/bin/wanguard:grouplist': { stdout: '' },
+		'dump': { interface: [
+			{ interface: 'freedom', up: true },
+			{ interface: 'wg_moscow', up: true, proto: 'wireguard' },
+			{ interface: 'wan1', up: true },
+			{ interface: 'wan2', up: true },
+			{ interface: 'lan', up: true }
+		] }
+	};
+}
+
+async function renderBoard47(wg) {
+	const ov = loadView('overview', wg);
+	await ov.load();
+	const root = await ov.render();
+	return { ov: ov, root: root };
+}
+function refilter47(wg) {
+	wg.state.boardWrap.children.length = 0;
+	wg.rebuildBoard();
+}
+scenario('B1 search filter (#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderBoard47(wg);
+	ok(tag + ' matches by name substring', wg.deviceMatches({ name: 'work-pc', ip: '', mac: '' }));
+	ok(tag + ' matches by IP substring', wg.deviceMatches({ name: '', ip: '192.168.88.58', mac: '' }));
+	ok(tag + ' matches by MAC substring', wg.deviceMatches({ name: '', ip: '', mac: 'aa:bb:cc:dd:ee:02' }));
+	ok(tag + ' case-insensitive', wg.deviceMatches({ name: 'WORK-PC', ip: '', mac: '' }));
+	wg.setFilter('192.168.88.58');
+	ok(tag + ' rejects non-matching', !wg.deviceMatches({ name: 'x', ip: '10.9.9.9', mac: 'aa:bb:cc:dd:ee:02' }));
+	refilter47(wg);
+	assertEq(tag + ' target column filtered count', colParts(findCol(wg.state.boardWrap, 'work')).sub, '1 device');
+	assertEq(tag + ' other column shows filtered/total', colParts(findCol(wg.state.boardWrap, 'home')).sub, '0/1 device');
+	wg.setFilter('alice');
+	refilter47(wg);
+	assertEq(tag + ' search by name restores the card', colParts(findCol(wg.state.boardWrap, 'home')).sub, '1 device');
+	wg.setFilter('');
+});
+
+scenario('B2 Online-only switch (#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderBoard47(wg);
+	ok(tag + ' switch input present', !!r.ov._sw);
+	ok(tag + ' off by default', r.ov._sw.checked === false);
+	r.ov._sw.listeners['change'][0]({ target: { checked: true } });
+	assertEq(tag + ' checked persists', localStorageStub.getItem('wanguard-hide-offline'), '1');
+	assertEq(tag + ' offline guest hidden', colParts(findCol(wg.state.boardWrap, '')).sub, '0/1 device');
+	r.ov._sw.listeners['change'][0]({ target: { checked: false } });
+	assertEq(tag + ' unchecked persists', localStorageStub.getItem('wanguard-hide-offline'), '0');
+	assertEq(tag + ' offline guest visible again', colParts(findCol(wg.state.boardWrap, '')).sub, '1 device');
+});
+
+scenario('B3 route chips (#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderBoard47(wg);
+	assertEq(tag + ' direct -> WAN', wg.routeChip({ name: 'home', type: 'direct', iface: 'freedom' }).text, 'freedom · WAN');
+	assertEq(tag + ' wireguard -> VPN', wg.routeChip({ name: 'work', type: 'direct', iface: 'wg_moscow' }).text, 'wg_moscow · VPN');
+	assertEq(tag + ' wireguard chip keeps the allocation', wg.routeChip({ name: 'work', type: 'direct', iface: 'wg_moscow' }).title, 'fwmark 200 → table 401');
+	assertEq(tag + ' proxy chip', wg.routeChip({ name: 'media', type: 'proxy', iface: '' }).text, 'Proxy');
+	const lbc = wg.routeChip({ name: 'lbx', type: 'direct-lb', iface: '' });
+	assertEq(tag + ' direct-lb chip = member summary', lbc.text, 'wan1+wan2 · LB');
+	ok(tag + ' direct-lb chip keeps the slot plan', lbc.title.indexOf('400/402') !== -1, lbc.title);
+	assertEq(tag + ' unknown iface -> WAN (UCI-only degradation)', wg.routeChip({ name: 'zz', type: 'direct', iface: 'nosuch' }).text, 'nosuch · WAN');
+	assertEq(tag + ' rendered home chip', colParts(findCol(r.root, 'home')).chip, 'freedom · WAN');
+	assertEq(tag + ' rendered work chip', colParts(findCol(r.root, 'work')).chip, 'wg_moscow · VPN');
+});
+
+scenario('B4 card layout (#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderBoard47(wg);
+	const card = findCol(r.root, 'work').children[1].children[0];
+	const row = card.children[0];
+	ok(tag + ' row = icon | main | menu', row.children.length === 3, row.children.length);
+	const main = row.children[1];
+	assertEq(tag + ' name line', flat(main.children[0]), 'work-pc');
+	assertEq(tag + ' ip line', flat(main.children[1]), '192.168.88.58');
+	ok(tag + ' online marker', flat(main.children[2]).indexOf('Online') !== -1, flat(main.children[2]));
+	ok(tag + ' MAC only in the tooltip',
+		(card.attrs.title || '').indexOf('aa:bb:cc:dd:ee:02') !== -1 && flat(card).indexOf('aa:bb:cc:dd:ee:02') === -1, card.attrs.title);
+	const menuBtn = row.children[2];
+	ok(tag + ' menu button class', (menuBtn.attrs.class || '').indexOf('wg-card-menu') !== -1);
+	menuBtn.listeners['click'][0]({ stopPropagation: function() {} });
+	ok(tag + ' menu opens with the device', (ui._modal || [''])[0].indexOf('work-pc') !== -1, ui._modal && ui._modal[0]);
+	ui.hideModal();
+	ok(tag + ' draggable when in sync', card.attrs.draggable === 'true');
+});
+
+scenario('B5 Unassigned column (#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderBoard47(wg);
+	const u = colParts(findCol(r.root, ''));
+	assertEq(tag + ' renamed', u.title, 'Unassigned');
+	assertEq(tag + ' count', u.sub, '1 device');
+	assertEq(tag + ' no route chip', u.chip, '');
+	const board = (function walk(nod) {
+		if (nod.attrs && (nod.attrs.class || '') === 'wg-board') return nod;
+		const kids = nod.children || [];
+		for (let i = 0; i < kids.length; i++) {
+			const x = walk(kids[i]);
+			if (x) return x;
+		}
+		return null;
+	})(r.root);
+	ok(tag + ' board node found', !!board);
+	assertEq(tag + ' column order (groups, Unassigned, tile)',
+		board.children.map(function(c) {
+			return (c.attrs && c.attrs['data-group'] != null) ? c.attrs['data-group'] : '<new>';
+		}).join('|'),
+		'home|lbx|work|media||<new>');
+});
+
+scenario('B6 footer totals + pending pill (#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderBoard47(wg);
+	const foot = wg.state.footerNode;
+	ok(tag + ' footer exists', !!foot);
+	assertEq(tag + ' totals line', flat(foot.children[0]), '1 devices · 4 groups');
+	ok(tag + ' green when clean', flat(foot.children[1]).indexOf('No pending changes') !== -1, flat(foot.children[1]));
+	const hd = E('div', {});
+	wg.state.statusCompact = true;
+	wg.updateStatusNode(hd);
+	ok(tag + ' compact header pill', flat(hd).indexOf('Rules synchronized') !== -1, flat(hd));
+	wg.state.statusCompact = false;
+	wg.updateStatusNode(hd);
+	ok(tag + ' plain header keeps counters', flat(hd).indexOf('device(s)') !== -1, flat(hd));
+	UCI.set('wanguard', 'anon_member_1', 'group', 'media');
+	wg.updateBoardFooter();
+	ok(tag + ' staged edit -> pending pill', flat(foot.children[1]).indexOf('pending') !== -1, flat(foot.children[1]));
+	UCI.commit();
+	wg.updateBoardFooter();
+	ok(tag + ' applied -> clean again', flat(foot.children[1]).indexOf('No pending changes') !== -1, flat(foot.children[1]));
+	wg.state.statusOk = false;
+	wg.updateBoardFooter();
+	ok(tag + ' drift -> read-only pill', flat(foot.children[1]).indexOf('DRIFT — read-only') !== -1, flat(foot.children[1]));
+	wg.state.statusOk = true;
+	wg.updateBoardFooter();
+});
+
+scenario('B7 pending pill honesty through apply (#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderBoard47(wg);
+	const pill = function() { return flat(wg.state.footerNode.children[1]); };
+	const inCol = function(grp, mac) {
+		const col = findCol(wg.state.boardWrap, grp);
+		return !!col && col.children[1].children.some(function(c) { return c.attrs['data-mac'] === mac; });
+	};
+	ok(tag + ' clean start', pill().indexOf('No pending changes') !== -1);
+	UCI.apply = function() { return Promise.reject(new Error('apply down')); };
+	await wg.applyMove('aa:bb:cc:dd:ee:99', 'home');
+	ok(tag + ' failed apply keeps the change staged (honest pill)', pill().indexOf('pending') !== -1, pill());
+	UCI.apply = function() { UCI.commit(); return Promise.resolve(); };
+	await wg.applyMove('aa:bb:cc:dd:ee:99', 'work');
+	ok(tag + ' successful apply clears the pill', pill().indexOf('No pending changes') !== -1, pill());
+	ok(tag + ' device landed in the target group', inCol('work', 'aa:bb:cc:dd:ee:99'));
+	ok(tag + ' left the unassigned column', !inCol('', 'aa:bb:cc:dd:ee:99'));
+});
+
+scenario('B8 column add -> lease preselect (#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	RPC.canned['read:'] = '1699900000 aa:bb:cc:dd:ee:77 192.168.88.77 new-guest 01:22:33:44:55:66';
+	const r = await renderBoard47(wg);
+	ok(tag + ' lease panel present', !!wg.state.leasePanel);
+	const col = findCol(r.root, 'work');
+	const addBtn = col.children[2].children[0];
+	ok(tag + ' add button class', (addBtn.attrs.class || '') === 'wg-add-devices', addBtn.attrs.class);
+	addBtn.listeners['click'][0]();
+	const sel = (function walk(nod) {
+		if (nod.attrs && nod.attrs['data-wg'] === 'lease-group') return nod;
+		const kids = nod.children || [];
+		for (let i = 0; i < kids.length; i++) {
+			const x = walk(kids[i]);
+			if (x) return x;
+		}
+		return null;
+	})(wg.state.leasePanel);
+	ok(tag + ' group select found', !!sel);
+	assertEq(tag + ' group preselected from the column', sel && sel.value, 'work');
+	ok(tag + ' panel flashed for attention', wg.state.leasePanel.classList.contains('wg-lease-flash'));
+});
+
+scenario('B9 List / +Add / New group navigation (#20/#47)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderBoard47(wg);
+	ok(tag + ' in-page table mode removed', r.ov._map === undefined);
+	r.ov._btnList.listeners['click'][0]();
+	assertEq(tag + ' List -> devices page', global.location.href, '/admin/network/wanguard/devices');
+	r.ov.showAddMenu();
+	ok(tag + ' + Add opens the menu', !!ui._modal);
+	const items = (ui._modal[1].children || []).filter(function(c) { return c.tag === 'button'; });
+	assertEq(tag + ' menu = Add device + New group', items.length, 2);
+	items[0].listeners['click'][0]();
+	ok(tag + ' Add device focuses the lease panel', !!wg.state.leasePanel);
+	assertEq(tag + ' menu closed', ui._modal, null);
+	items[1].listeners['click'][0]();
+	assertEq(tag + ' New group -> groups page', global.location.href, '/admin/network/wanguard/groups');
+	const tile = (function walk(nod) {
+		if (nod.attrs && (nod.attrs.class || '').indexOf('wg-newgroup') !== -1) return nod;
+		const kids = nod.children || [];
+		for (let i = 0; i < kids.length; i++) {
+			const x = walk(kids[i]);
+			if (x) return x;
+		}
+		return null;
+	})(r.root);
+	ok(tag + ' New group tile present', !!tile);
+	tile.children[0].listeners['click'][0]();
+	assertEq(tag + ' tile -> groups page', global.location.href, '/admin/network/wanguard/groups');
+});
 
 async function demo() {
 	console.log('\n=== DEMO — board on handwritten UCI (fixtures/lb2.uci, no prod backend) ===');

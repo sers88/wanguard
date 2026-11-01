@@ -1,0 +1,35 @@
+config globals 'globals'
+
+# board-2.0 fixture (#47): labeled direct group, wireguard direct group,
+# direct-lb group, proxy group; two registered members and one DHCP-only
+# (unassigned) device that `wanguard devices` reports offline.
+
+config group 'home'
+	option type 'direct'
+	option iface 'freedom'
+	option label 'Home'
+	option color 'blue'
+
+config group 'work'
+	option type 'direct'
+	option iface 'wg_moscow'
+
+config group 'lbx'
+	option type 'direct-lb'
+	list member_iface 'wan1'
+	list member_iface 'wan2'
+	option weight_wan1 '70'
+	option weight_wan2 '30'
+
+config group 'media'
+	option type 'proxy'
+
+config member
+	option name 'alice-phone'
+	option mac 'aa:bb:cc:dd:ee:01'
+	option group 'home'
+
+config member
+	option name 'work-pc'
+	option mac 'aa:bb:cc:dd:ee:02'
+	option group 'work'

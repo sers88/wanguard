@@ -67,10 +67,15 @@ var state = {
 	leases: [],
 	inventory: [],
 	ifaces: [],
+	ifaceProto: {},      /* netifd iface -> proto (wireguard = VPN chip, #47) */
+	filter: '',          /* board search substring (#47) */
 	LB_GROUPLIST: {},   /* `wanguard grouplist` rows for direct-lb groups (#40) */
 	busy: false,
 	statusNode: null,   /* header pill node, set by each view's render() */
 	boardWrap: null,    /* board container, set by the overview view */
+	footerNode: null,    /* overview footer bar node (#47) */
+	leasePanel: null,    /* DHCP lease-add panel node (#47) */
+	statusCompact: false, /* overview header shows the short sync pill (#47) */
 	saveHost: null      /* view providing handleSaveApply (lease panel, #46) */
 };
 
@@ -299,26 +304,66 @@ function typeIcon(type) {
 }
 
 var BOARD_CSS = [
-	'.wg-board { display:flex; gap:12px; align-items:flex-start; overflow-x:auto; padding-bottom:8px; }',
-	'.wg-col { flex:1 0 15em; min-width:15em; max-width:24em; background:rgba(128,128,128,.07);',
-	'  border:1px solid rgba(128,128,128,.25); border-radius:6px; }',
-	'.wg-col-h { padding:8px 10px; border-bottom:1px solid rgba(128,128,128,.25); }',
-	'.wg-col-title { font-weight:bold; }',
-	'.wg-col-sub { font-size:.82em; opacity:.65; }',
-	'.wg-cards { padding:8px; display:flex; flex-direction:column; gap:6px; min-height:3.2em; }',
-	'.wg-card { background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.35);',
-	'  border-radius:4px; padding:6px 8px; cursor:pointer; user-select:none; }',
-	'.wg-card[draggable="true"] { cursor:grab; }',
-	'.wg-card.wg-busy { opacity:.5; pointer-events:none; }',
-	'.wg-card .wg-mac { font-size:.78em; opacity:.6; font-family:monospace; }',
-	'.wg-card .wg-meta { font-size:.78em; display:flex; justify-content:space-between; gap:1em; }',
-	'.wg-on { color:#5cb85c; }',
-	'.wg-off { color:#999; }',
-	'.wg-dot { display:inline-block; width:.65em; height:.65em; border-radius:50%; margin-right:.4em; vertical-align:.05em; }',
-	'.wg-type { opacity:.75; line-height:1; }',
-	'.wg-type svg { display:inline; vertical-align:-.12em; }',
-	'.wg-col.wg-drop { outline:2px dashed #4a90d9; outline-offset:-3px; background:rgba(74,144,217,.10); }',
-	'.wg-menu button { display:block; width:100%; margin:.25em 0; }'
+	".wg-board { display:flex; gap:12px; align-items:flex-start; overflow-x:auto; padding-bottom:8px; }",
+	".wg-col { flex:1 0 15em; min-width:15em; max-width:24em; background:rgba(128,128,128,.07);",
+	"\tborder:1px solid rgba(128,128,128,.25); border-radius:6px; }",
+	".wg-col-h { padding:8px 10px; border-bottom:1px solid rgba(128,128,128,.25); }",
+	".wg-col-title { font-weight:bold; display:flex; align-items:center; gap:.4em; }",
+	".wg-col-sub { font-size:.82em; opacity:.65; }",
+	".wg-col-chip { font-size:.78em; opacity:.75; margin-top:2px; cursor:default; }",
+	".wg-cards { padding:8px; display:flex; flex-direction:column; gap:6px; min-height:3.2em; }",
+	".wg-card { background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.35);",
+	"\tborder-radius:4px; padding:6px 8px; cursor:pointer; user-select:none; }",
+	".wg-card[draggable=\"true\"] { cursor:grab; }",
+	".wg-card.wg-busy { opacity:.5; pointer-events:none; }",
+	".wg-card-row { display:flex; gap:.6em; align-items:flex-start; }",
+	".wg-card-main { flex:1; min-width:0; }",
+	".wg-card .wg-ip { font-size:.78em; opacity:.65; }",
+	".wg-card .wg-status { font-size:.78em; margin-top:2px; }",
+	".wg-card-menu { background:none; border:none; cursor:pointer; opacity:.6; padding:0 .3em; font-size:1em; line-height:1.2; }",
+	".wg-card-menu:hover { opacity:1; }",
+	".wg-on { color:#5cb85c; }",
+	".wg-off { color:#999; }",
+	".wg-dot { display:inline-block; width:.65em; height:.65em; border-radius:50%; margin-right:.4em; vertical-align:.05em; }",
+	".wg-type { opacity:.75; line-height:1; margin-top:.15em; }",
+	".wg-type svg { display:inline; vertical-align:-.12em; }",
+	".wg-col.wg-drop { outline:2px dashed #4a90d9; outline-offset:-3px; background:rgba(74,144,217,.10); }",
+	".wg-menu button { display:block; width:100%; margin:.25em 0; }",
+	"/* #47: toolbar (search, Online-only switch, Board|List, + Add) */",
+	".wg-toolbar { display:flex; flex-wrap:wrap; gap:.75em; align-items:center; margin:1em 0; }",
+	".wg-search { flex:1 1 14em; min-width:10em; }",
+	".wg-switch { display:inline-flex; align-items:center; gap:.45em; cursor:pointer; white-space:nowrap; }",
+	".wg-switch input { position:absolute; opacity:0; width:0; height:0; }",
+	".wg-switch-track { display:inline-block; width:2.1em; height:1.15em; border-radius:.6em;",
+	"\tbackground:rgba(128,128,128,.4); position:relative; transition:background .15s; }",
+	".wg-switch-track::after { content:''; position:absolute; top:.12em; left:.12em; width:.9em; height:.9em;",
+	"\tborder-radius:50%; background:#fff; transition:left .15s; }",
+	".wg-switch input:checked ~ .wg-switch-track { background:#2563eb; }",
+	".wg-switch input:checked ~ .wg-switch-track::after { left:1.05em; }",
+	".wg-switch input:focus-visible ~ .wg-switch-track { outline:2px solid #4a90d9; outline-offset:1px; }",
+	".wg-viewtoggle { display:inline-flex; }",
+	".wg-viewtoggle .btn { margin:0; }",
+	".wg-viewtoggle .btn + .btn { margin-left:-1px; }",
+	".wg-viewtoggle .btn:first-child { border-radius:4px 0 0 4px; }",
+	".wg-viewtoggle .btn:last-child { border-radius:0 4px 4px 0; }",
+	"/* #47: per-column add + New group tile */",
+	".wg-col-add { border-top:1px solid rgba(128,128,128,.25); text-align:center; padding:2px; }",
+	".wg-add-devices { background:none; border:none; color:#2563eb; cursor:pointer; padding:4px; }",
+	".wg-add-devices:hover { text-decoration:underline; }",
+	".wg-newgroup { flex:0 0 9em; min-width:9em; max-width:11em; min-height:6em; display:flex;",
+	"\talign-items:center; justify-content:center; background:transparent; border-style:dashed; }",
+	".wg-newgroup-btn { background:none; border:none; color:#2563eb; cursor:pointer; }",
+	".wg-newgroup-btn:hover { text-decoration:underline; }",
+	"/* #47: header + footer */",
+	".wg-header { display:flex; align-items:baseline; gap:1em; flex-wrap:wrap; }",
+	".wg-subtitle { opacity:.6; }",
+	".wg-footer { display:flex; justify-content:space-between; align-items:center; gap:1em; flex-wrap:wrap; margin-top:1em; opacity:.85; }",
+	".wg-pill .wg-dot { margin-right:.2em; }",
+	".wg-pill-ok .wg-dot { background:#22c55e; }",
+	".wg-pill-pending .wg-dot { background:#ea580c; }",
+	".wg-pill-drift .wg-dot { background:#d9534f; }",
+	".wg-lease-flash { outline:2px solid #4a90d9; outline-offset:2px; }",
+	".wg-hint { opacity:.55; font-size:.85em; margin-bottom:.5em; }",
 ].join('\n');
 
 /* ---------- parsers ---------- */
@@ -382,11 +427,16 @@ function parseStatus(res) {
 
 function updateStatusNode(node) {
 	var dot = state.statusOk === true ? '#5cb85c' : (state.statusOk === false ? '#d9534f' : '#999');
-	var label = '%d device(s) · %d group(s) · %s%s'.format(
-		state.memberCount,
-		(uci.sections('wanguard', 'group') || []).length,
-		state.statusOk === false ? 'DRIFT: ' : 'nft: ',
-		state.statusText);
+	var label;
+	if (state.statusCompact) /* #47: overview header pill, counters moved to the footer */
+		label = (state.statusOk === true) ? _('Rules synchronized')
+			: (state.statusOk === false ? 'DRIFT: %s'.format(state.statusText) : state.statusText);
+	else
+		label = '%d device(s) · %d group(s) · %s%s'.format(
+			state.memberCount,
+			(uci.sections('wanguard', 'group') || []).length,
+			state.statusOk === false ? 'DRIFT: ' : 'nft: ',
+			state.statusText);
 	node.innerHTML = '';
 	node.appendChild(E('span', { 'style': 'font-weight:bold' }, [
 		E('span', { 'style': 'color:%s'.format(dot) }, '● '), label
@@ -435,6 +485,11 @@ function load() {
 				.filter(function(i) { return i && i.up && i.interface; })
 				.map(function(i) { return i.interface; })
 				.sort();
+				if (dump && dump.interface)
+					dump.interface.forEach(function(i) {
+						if (i && i.interface)
+							state.ifaceProto[i.interface] = i.proto || '';
+					});
 		else
 			state.ifaces = [];
 
@@ -459,6 +514,7 @@ function reloadState() {
 		refreshStatus(state.statusNode)
 	]).then(function() {
 		rebuildBoard();
+		updateBoardFooter();
 	});
 }
 
@@ -521,7 +577,7 @@ function boardGroups() {
 			lbl += ' — LB';
 		else if (g.iface != g.name)
 			lbl += ' — ' + (g.iface || '?');
-		return { name: g.name, label: lbl, title: g.metaLabel || lbl,
+		return { name: g.name, type: g.type, iface: g.iface, label: lbl, title: g.metaLabel || lbl,
 			color: g.color, descr: g.descr };
 	});
 }
@@ -535,15 +591,29 @@ function buildCard(it, inGroup) {
 		'class': 'wg-card',
 		'data-mac': it.mac,
 		'draggable': dndEnabled() ? 'true' : 'false',
-		'title': inGroup ? _('Drag to move, click for menu') : _('Drag into a group to add, click for menu')
+		'title': it.mac + ' — ' + (inGroup
+			? _('Drag to move, click for the menu')
+			: _('Drag into a group to add, click for the menu'))
 	}, [
-		E('div', { 'class': 'wg-name' }, [ it.name || it.ip || it.mac ]),
-		E('div', { 'class': 'wg-mac' }, [ it.mac ]),
-		E('div', { 'class': 'wg-meta' }, [
-			E('span', {}, [ it.ip || '—' ]),
+		E('div', { 'class': 'wg-card-row' }, [
 			it.type ? typeIcon(it.type) : E([]), /* #43: board icon */
-			E('span', { 'class': it.online ? 'wg-on' : 'wg-off' },
-				[ it.online ? '● ' + _('online') : '○ ' + _('offline') ])
+			E('div', { 'class': 'wg-card-main' }, [
+				E('div', { 'class': 'wg-name' }, [ it.name || it.ip || it.mac ]),
+				E('div', { 'class': 'wg-ip' }, [ it.ip || '—' ]),
+				E('div', { 'class': 'wg-status ' + (it.online ? 'wg-on' : 'wg-off') },
+					[ (it.online ? '● ' : '○ ') + (it.online ? _('Online') : _('Offline')) ])
+			]),
+			E('button', {
+				'class': 'wg-card-menu',
+				'title': _('Move to another group'),
+				'aria-label': _('Move to another group'),
+				'click': function(ev) {
+					if (ev && ev.stopPropagation)
+						ev.stopPropagation();
+					if (!state.busy)
+						showCardMenu(it.mac, inGroup);
+				}
+			}, [ '⋯' ])
 		])
 	]);
 
@@ -585,6 +655,116 @@ function hideOfflineMode() {
 	}
 }
 
+/* ---------- board 2.0 helpers (#47) ---------- */
+
+/* toolbar search: substring over name/IP/MAC, case-insensitive */
+function deviceMatches(it) {
+	var q = (state.filter || '').toLowerCase().replace(/^\s+|\s+$/g, '');
+	if (!q)
+		return true;
+	return (it.name || '').toLowerCase().indexOf(q) !== -1 ||
+		(it.ip || '').toLowerCase().indexOf(q) !== -1 ||
+		(it.mac || '').toLowerCase().indexOf(q) !== -1;
+}
+
+function setFilter(q) {
+	state.filter = (q == null) ? '' : String(q);
+}
+
+/* column route chip: "iface · WAN" / "iface · VPN" / "Proxy" /
+ * direct-lb: "wan1+wan2 · LB". Degrades to UCI-only (WAN) when the
+ * netifd dump is unavailable (no VPN detection). title keeps the full
+ * allocation preview so the board stays clean without losing it. */
+function routeChip(g) {
+	if (g.type == 'proxy')
+		return { text: _('Proxy'), title: allocPreview(g.name) };
+	if (g.type == 'direct-lb') {
+		var mem = lbMembers(g.name);
+		return {
+			text: (mem.length ? mem.join('+') : (g.iface || 'lb')) + ' · ' + _('LB'),
+			title: allocPreview(g.name)
+		};
+	}
+	var proto = state.ifaceProto[g.iface] || '';
+	return {
+		text: (g.iface || '?') + ' · ' + (proto == 'wireguard' ? 'VPN' : 'WAN'),
+		title: allocPreview(g.name)
+	};
+}
+
+/* pending staged-UCI changes (honest footer pill, #47): LuCI stages
+ * client-side, uci.changes() is the same source the "Unsaved Changes"
+ * badge uses; 0 when the API is unavailable (degraded/old LuCI) */
+function pendingCount() {
+	try {
+		if (typeof uci.changes == 'function') {
+			var c = uci.changes('wanguard');
+			return (c && c.length) ? c.length : 0;
+		}
+	}
+	catch (e) {}
+	return 0;
+}
+
+/* footer bar: "N devices · M groups" + pending pill (#47); global
+ * totals (the column counters are the filtered ones). DRIFT keeps
+ * the pill red and honest. */
+function buildBoardFooter() {
+	var node = E('div', { 'class': 'wg-footer' });
+	state.footerNode = node;
+	updateBoardFooter();
+	return node;
+}
+
+function updateBoardFooter() {
+	var node = state.footerNode;
+	if (!node)
+		return;
+	var pend = pendingCount();
+	var drift = (state.statusOk === false);
+	var pill = drift
+		? { cls: 'wg-pill wg-pill-drift', label: _('DRIFT — read-only') }
+		: (pend > 0
+			? { cls: 'wg-pill wg-pill-pending',
+				label: '%d pending change(s) — Save & Apply'.format(pend) }
+			: { cls: 'wg-pill wg-pill-ok', label: _('No pending changes') });
+	node.innerHTML = '';
+	node.appendChild(E('span', { 'class': 'wg-footer-counts' }, [
+		'%d %s · %d %s'.format(state.memberCount, _('devices'),
+			(uci.sections('wanguard', 'group') || []).length, _('groups'))
+	]));
+	node.appendChild(E('span', { 'class': pill.cls,
+		'title': drift ? state.statusText : '' }, [
+		E('span', { 'class': 'wg-dot' }, []), ' ', pill.label
+	]));
+}
+
+/* focus the lease-add panel with a group preselected (#47); the
+ * Unassigned column and the toolbar menu pass '' = just focus */
+function leaseFocus(group) {
+	var panel = state.leasePanel;
+	if (!panel)
+		return;
+	if (typeof panel.scrollIntoView == 'function') {
+		try { panel.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) {}
+	}
+	var sel = null;
+	(function walk(n) {
+		if (sel || !n || !n.children)
+			return;
+		n.children.forEach(function(c) {
+			if (!sel && c.attrs && c.attrs['data-wg'] == 'lease-group')
+				sel = c;
+			walk(c);
+		});
+	})(panel);
+	if (sel && group)
+		sel.value = group;
+	panel.classList.add('wg-lease-flash');
+	if (typeof setTimeout == 'function')
+		setTimeout(function() { panel.classList.remove('wg-lease-flash'); }, 1600);
+}
+
 function buildBoard() {
 	var board = E('div', { 'class': 'wg-board' });
 	var root = E('div', {});
@@ -598,7 +778,7 @@ function buildBoard() {
 	var members = (uci.sections('wanguard', 'member') || []);
 	var known = knownMacMap();
 
-	var mkColumn = function(key, title, sub, cards, color, descr) {
+	var mkColumn = function(key, title, sub, chip, cards, color, descr) {
 		var headAttrs = { 'class': 'wg-col-h' };
 		if (descr) /* #42: the description is the column tooltip */
 			headAttrs['title'] = descr;
@@ -609,9 +789,18 @@ function buildBoard() {
 		var col = E('div', { 'class': 'wg-col', 'data-group': key }, [
 			E('div', headAttrs, [
 				E('div', { 'class': 'wg-col-title' }, titleContent),
-				sub ? E('div', { 'class': 'wg-col-sub' }, [ sub ]) : E([])
+				E('div', { 'class': 'wg-col-sub' }, [ sub ]),
+				chip ? E('div', { 'class': 'wg-col-chip', 'title': chip.title || '' },
+					[ chip.text ]) : E([])
 			]),
-			E('div', { 'class': 'wg-cards' }, cards)
+			E('div', { 'class': 'wg-cards' }, cards),
+			E('div', { 'class': 'wg-col-add' }, [
+				E('button', {
+					'class': 'wg-add-devices',
+					'title': _('Pick a DHCP lease for this group'),
+					'click': function() { leaseFocus(key || ''); }
+				}, [ '+ ' + _('Add devices') ])
+			])
 		]);
 
 		col.addEventListener('dragover', function(ev) {
@@ -635,6 +824,12 @@ function buildBoard() {
 		return col;
 	};
 
+	var visible = function(items) {
+		if (hideOfflineMode())
+			items = items.filter(function(it) { return it.online; });
+		return items.filter(deviceMatches);
+	};
+
 	boardGroups().forEach(function(g) {
 		var items = members
 			.filter(function(mm) { return (mm.group || '') == g.name; })
@@ -656,16 +851,14 @@ function buildBoard() {
 			});
 
 		var total = items.length;
-		if (hideOfflineMode())
-			items = items.filter(function(it) { return it.online; });
-
+		var vis = visible(items);
 		board.appendChild(mkColumn(g.name, g.title,
-			'%s · %s'.format(allocPreview(g.name), colCount(items.length, total)),
-			items.map(function(it) { return buildCard(it, true); }),
+			'%s %s'.format(colCount(vis.length, total), total == 1 ? _('device') : _('devices')),
+			routeChip(g), vis.map(function(it) { return buildCard(it, true); }),
 			g.color, g.descr));
 	});
 
-	/* Unclassified: seen devices that are not members of any group */
+	/* Unassigned: seen devices that are not members of any group (#47 rename) */
 	var uitems = (state.inventory || [])
 		.filter(function(d) { return !known[d.mac]; })
 		.sort(function(a, b) {
@@ -674,13 +867,24 @@ function buildBoard() {
 				: (a.online ? -1 : 1);
 		});
 	var utotal = uitems.length;
-	if (hideOfflineMode())
-		uitems = uitems.filter(function(it) { return it.online; });
+	uitems = visible(uitems);
 
-	board.appendChild(mkColumn('', _('Unclassified'),
-		'%s · %s'.format(_('DHCP/ARP devices outside all groups'),
-			colCount(uitems.length, utotal)),
-		uitems.map(function(d) { return buildCard(d, false); }), '', ''));
+	board.appendChild(mkColumn('', _('Unassigned'),
+		'%s %s'.format(colCount(uitems.length, utotal), utotal == 1 ? _('device') : _('devices')),
+		null, uitems.map(function(d) { return buildCard(d, false); }), '', ''));
+
+	/* New group tile (#47): dashed shortcut to Groups & Routes */
+	board.appendChild(E('div', { 'class': 'wg-col wg-newgroup' }, [
+		E('button', {
+			'class': 'wg-newgroup-btn',
+			'title': _('Create and decorate groups on the Groups & Routes page'),
+			'click': function() {
+				var u = (typeof L != 'undefined' && L.url) ? L.url('admin/network/wanguard/groups') : '';
+				if (u && typeof location != 'undefined')
+					location.href = u;
+			}
+		}, [ '+ ' + _('New group') ])
+	]));
 
 	root.appendChild(board);
 	return root;
@@ -736,7 +940,7 @@ function applyMove(mac, target) {
 		return;
 	}
 
-	doApply(mac, target);
+	return doApply(mac, target);
 }
 
 function doApply(mac, target) {
@@ -821,7 +1025,7 @@ function showCardMenu(mac, inGroup) {
 		}, [ _('Close') ])
 	]));
 
-	ui.showModal(macLabel(mac) + (curGroup ? ' (' + curGroup + ')' : ' (' + _('unclassified') + ')'), menu);
+	ui.showModal(macLabel(mac) + (curGroup ? ' (' + curGroup + ')' : ' (' + _('unassigned') + ')'), menu);
 }
 
 /* ---------- grid factories (issue #46) ---------- */
@@ -1023,7 +1227,7 @@ function buildDevicesGrid() {
 function buildLeasePanel() {
 	var known = knownMacMap();
 
-	var leaseSel = E('select', { 'class': 'cbi-input-select', 'style': 'min-width:24em' });
+	var leaseSel = E('select', { 'class': 'cbi-input-select', 'style': 'min-width:24em', 'data-wg': 'lease' });
 	state.leases.sort(function(a, b) { return (a.name || '').localeCompare(b.name || ''); });
 	state.leases.forEach(function(l, i) {
 		var inGroup = known[l.mac];
@@ -1033,7 +1237,7 @@ function buildLeasePanel() {
 		leaseSel.appendChild(E('option', { 'value': String(i) }, [ label ]));
 	});
 
-	var groupSel = E('select', { 'class': 'cbi-input-select' });
+	var groupSel = E('select', { 'class': 'cbi-input-select', 'data-wg': 'lease-group' });
 	var choices = groupChoices();
 	if (!choices.length)
 		choices = [ [ '', _('(no groups defined — create one below)') ] ];
@@ -1136,6 +1340,13 @@ return L.Class.extend({
 	buildCard: buildCard,
 	clearDropHl: clearDropHl,
 	colCount: colCount,
+	deviceMatches: deviceMatches,
+	setFilter: setFilter,
+	routeChip: routeChip,
+	pendingCount: pendingCount,
+	buildBoardFooter: buildBoardFooter,
+	updateBoardFooter: updateBoardFooter,
+	leaseFocus: leaseFocus,
 	hideOfflineMode: hideOfflineMode,
 	buildBoard: buildBoard,
 	rebuildBoard: rebuildBoard,

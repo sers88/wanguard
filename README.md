@@ -28,6 +28,9 @@ per-group routing tables: default dev <iface> + backup default metric 200
   internet down.
 - **The browser never touches nft**: LuCI edits UCI and calls `wanguard apply`.
 - **Diagnostics data plane** (#44/#45): read-only CLI surfaces for the LuCI
+- **Board-first overview (#47)**: search by name/IP/MAC, an "Online
+  only" switch, per-column route chips, a pending-changes footer; the
+  List view deep-links to the Devices page.
   Diagnostics page — `wanguard events [N]` (tmpfs event ring: apply/drift/
   failover/flush), `wanguard syncstatus`, `wanguard diag`, `wanguard
   inspect <device>`, and a secrets-free `wanguard diag-report`. See
