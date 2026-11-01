@@ -1,7 +1,10 @@
-/* WAN Guard devices page (issue #46) — the devices grid (registered
- * member MACs) on its own URL-deep-linkable page. Read-mostly: the poll
- * refreshes the status pill only. All logic lives in the shared
- * wanguard.core module. */
+/* WAN Guard devices page (issue #48, prototype
+ * designe/generated-image (2).png) — the custom rebuild of the former
+ * grid page: toolbar (search / group dropdown / Online-only / "+ Add
+ * device"), the sortable 5-column table with bulk moves and the
+ * "Device details" drawer. All logic lives in the shared wanguard.core
+ * module; the #46 GridSection engine (buildDevicesGrid) stays in core
+ * for the M6 parity test only. */
 'use strict';
 'require view';
 'require poll';
@@ -20,18 +23,26 @@ return view.extend({
 		wg.state.statusNode = statusNode;
 		this._statusNode = statusNode;
 
-		this._map = wg.buildDevicesGrid().map;
+		/* the drawer/lease panel Save & Apply host (uci.apply +
+		 * `wanguard apply`) */
+		wg.state.saveHost = this;
 
-		return this._map.render().then(function(mapNode) {
-			poll.add(function() {
+		var page = wg.buildDevicesPage();
+
+		poll.add(function() {
+			/* a staged drawer edit must not be clobbered by a reload:
+			 * while the drawer holds staged UCI (or a bulk/drawer apply
+			 * is running) only the status pill refreshes (#48) */
+			if (wg.state.busy || wg.state.devTable.drawerDirty)
 				return wg.refreshStatus(self._statusNode);
-			}, 15);
+			return wg.reloadDevicesPage();
+		}, 15);
 
-			return E([
-				statusNode,
-				E('div', {}, [ mapNode ])
-			]);
-		});
+		return E('div', {}, [
+			E('style', { 'type': 'text/css' }, [ wg.BOARD_CSS ]),
+			statusNode,
+			page
+		]);
 	},
 
 	/* Save & Apply: commit UCI via the stock flow, then reconcile with

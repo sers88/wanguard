@@ -45,6 +45,19 @@
  * the "N devices will use <route>" plate, rename = create new + move
  * members + delete. DRIFT keeps the page read-only; the addGroupsSection
  * GridSection stays for parity tests and possible reuse.
+ *
+ * Devices table page (#48, designe/generated-image (2).png): the
+ * board's toolbar filters (search / group dropdown / Online-only,
+ * shared keys) over a sortable 5-column inventory table (Device / IP
+ * address / Group / Route / Status) with bulk checkboxes and a
+ * one-shot "Move to group" (stage all -> ONE save+apply), plus the
+ * "Device details" drawer — the assignment dropdown stages plain UCI
+ * like the #49 panel (drawerDirty blocks the poll from reloading
+ * mid-edit), copy buttons degrade through execCommand when
+ * navigator.clipboard is unavailable (the router LuCI is no secure
+ * context), DRIFT keeps everything read-only. The #46 GridSection
+ * devices grid (buildDevicesGrid) stays for the M6 parity test but is
+ * no longer mounted anywhere.
  */
 'use strict';
 'require rpc';
@@ -88,6 +101,15 @@ var state = {
 	allIfaces: [],       /* every netifd iface from the dump: { name, up, proto } (#49) */
 	groupsRoot: null,    /* groups-page tab container, set by buildGroupsPage (#49) */
 	groupPanel: null,    /* open panel session: { origName, stagedNew, stagedName, orig } (#49) */
+	devWrap: null,       /* devices-page table container, set by buildDevicesPage (#48) */
+	devLeaseHolder: null, /* devices-page lease-panel holder, outside the table rebuild (#48) */
+	devTable: {          /* devices-table session state (#48) */
+		sortKey: 'name', sortDir: 'asc',
+		groupFilter: '',   /* '' = all, '(unassigned)' sentinel, else a group name */
+		selected: {},      /* mac -> 1, the bulk-selection set */
+		drawerMac: null,   /* open "Device details" drawer */
+		drawerDirty: false /* drawer staged some UCI (the poll reloads status only) */
+	},
 	busy: false,
 	statusNode: null,   /* header pill node, set by each view's render() */
 	boardWrap: null,    /* board container, set by the overview view */
@@ -426,7 +448,33 @@ var BOARD_CSS = [
 	".wg-error { color:#c2410c; margin-top:.6em; }",
 	".wg-error p { margin:.2em 0; }",
 	".wg-empty { opacity:.55; text-align:center; padding:1.2em 0; }",
-	".wg-label { opacity:.55; font-size:.82em; margin-left:.4em; }"
+	".wg-label { opacity:.55; font-size:.82em; margin-left:.4em; }",
+	"/* #48: devices table page */",
+	".wg-dtable-wrap { overflow-x:auto; margin:.5em 0; }",
+	".wg-dtable { width:100%; border-collapse:collapse; }",
+	".wg-dtable th { text-align:left; font-weight:normal; opacity:.55; font-size:.82em; padding:.4em .75em; border-bottom:1px solid rgba(128,128,128,.25); white-space:nowrap; }",
+	".wg-dtable td { padding:.55em .75em; border-bottom:1px solid rgba(128,128,128,.12); vertical-align:middle; white-space:nowrap; }",
+	".wg-dtable .wg-dcheck { width:2em; }",
+	".wg-dtable button.wg-sort { background:none; border:none; cursor:pointer; padding:0; font:inherit; color:inherit; }",
+	".wg-dtable button.wg-sort:hover { text-decoration:underline; }",
+	".wg-dtable tr[data-mac] { cursor:pointer; }",
+	".wg-dtable tr[data-mac]:hover { background:rgba(128,128,128,.06); }",
+	".wg-dtable tr.wg-sel { background:rgba(37,99,235,.08); }",
+	".wg-devname { margin-left:.35em; }",
+	".wg-devgroup { font-weight:bold; }",
+	".wg-unassigned { opacity:.5; font-style:italic; }",
+	".wg-bulkbar { display:flex; gap:.75em; align-items:center; flex-wrap:wrap; background:rgba(37,99,235,.08); border:1px solid rgba(37,99,235,.25); border-radius:4px; padding:.5em .75em; margin-bottom:.5em; }",
+	"/* #48: device drawer (fixed right panel; full-width on phones) */",
+	".wg-drawer { position:fixed; top:0; right:0; bottom:0; width:22em; max-width:90vw; background:#f8f8f8; color:#222; border-left:1px solid rgba(128,128,128,.35); box-shadow:-4px 0 12px rgba(0,0,0,.25); padding:1em; overflow-y:auto; z-index:200; }",
+	".wg-drawer h3 { margin:0 0 .8em; display:flex; align-items:center; gap:.5em; font-size:1.1em; }",
+	".wg-drawer .wg-drawer-close { margin-left:auto; background:none; border:none; cursor:pointer; font-size:1.2em; opacity:.6; padding:0 .2em; color:inherit; }",
+	".wg-drawer .wg-drawer-close:hover { opacity:1; }",
+	".wg-drawer .wg-field { margin:.8em 0; }",
+	".wg-drawer .wg-field > label { display:block; font-weight:bold; margin-bottom:.3em; }",
+	".wg-copyrow { display:flex; align-items:center; gap:.5em; flex-wrap:wrap; }",
+	".wg-copy { background:none; border:1px solid rgba(128,128,128,.4); border-radius:3px; cursor:pointer; font-size:.78em; padding:.05em .5em; opacity:.7; color:inherit; }",
+	".wg-copy:hover { opacity:1; }",
+	"@media (max-width:640px) { .wg-drawer { width:100%; max-width:100%; } }"
 ].join('\n');
 
 /* ---------- parsers ---------- */
@@ -1048,30 +1096,41 @@ function applyMove(mac, target) {
 	return doApply(mac, target);
 }
 
-function doApply(mac, target) {
+/* Stage-only assignment (#48, mechanical extraction from doApply):
+ * add/move/remove the member section in client-side UCI — never
+ * saves/applies. Shared by the board's silent moves (doApply), the
+ * devices-table drawer and the bulk bar. Returns 'add' | 'move' |
+ * 'remove' | '' (nothing to do). */
+function stageAssign(mac, target) {
 	var mm = findMember(mac);
-	var label = macLabel(mac);
-	var verb;
 
 	if (target) {
-		verb = mm ? 'move' : 'add';
-		if (mm)
+		if (mm) {
 			uci.set('wanguard', mm.sid, 'group', target);
-		else {
-			var nm = macLabel(mac);
-			if (nm == mac)
-				nm = 'dev-' + mac.replace(/:/g, '').slice(-6);
-			uci.add('wanguard', 'member');
-			uci.set('wanguard', '@member[-1]', 'name', nm);
-			uci.set('wanguard', '@member[-1]', 'mac', mac);
-			uci.set('wanguard', '@member[-1]', 'group', target);
+			return 'move';
 		}
+		var nm = macLabel(mac);
+		if (nm == mac)
+			nm = 'dev-' + mac.replace(/:/g, '').slice(-6);
+		uci.add('wanguard', 'member');
+		uci.set('wanguard', '@member[-1]', 'name', nm);
+		uci.set('wanguard', '@member[-1]', 'mac', mac);
+		uci.set('wanguard', '@member[-1]', 'group', target);
+		return 'add';
 	}
-	else if (mm) {
-		verb = 'remove';
+
+	if (mm) {
 		uci.remove('wanguard', mm.sid);
+		return 'remove';
 	}
-	else
+	return '';
+}
+
+function doApply(mac, target) {
+	var label = macLabel(mac);
+	var verb = stageAssign(mac, target);
+
+	if (!verb)
 		return Promise.resolve();
 
 	state.busy = true;
@@ -2063,6 +2122,575 @@ function openGroupPanel(sid) {
 	stageRefresh();
 }
 
+/* ---------- Devices table page (issue #48) ----------
+ * Prototype build (designe/generated-image (2).png): toolbar (search /
+ * group dropdown / Online-only switch / "+ Add device"), a sortable
+ * 5-column table (Device / IP address / Group / Route / Status) with
+ * bulk checkboxes ("Move to group" / Unassign) and the "Device
+ * details" drawer. Search and Online-only reuse the board's filters
+ * (deviceMatches / hideOfflineMode, shared localStorage key); the
+ * footer is the honest board footer (totals + pending/DRIFT pill).
+ * DRIFT keeps the page read-only. The #46 GridSection devices grid
+ * (buildDevicesGrid) stays in core for the M6 parity test only. */
+
+/* row model (#48): the inventory enriched with the assignment ('' =
+ * Unassigned), plus member sections the inventory does not know about
+ * (static/old-CLI entries — the panelDevices pattern) */
+function deviceRows() {
+	var known = knownMacMap();
+	var rows = (state.inventory || []).map(function(d) {
+		return { mac: d.mac, name: d.name || '', ip: d.ip || '',
+			online: !!d.online, type: d.type || '', group: known[d.mac] || '' };
+	});
+	(uci.sections('wanguard', 'member') || []).forEach(function(m) {
+		var mac = normalizeMac(m.mac);
+		if (mac && !rows.some(function(r) { return r.mac == mac; }))
+			rows.push({ mac: mac, name: m.name || '', ip: '', online: false,
+				type: '', group: m.group || '' });
+	});
+	return rows;
+}
+
+/* numeric IP compare, octet-wise (192.168.88.201 sorts AFTER
+ * 192.168.88.58 — a plain string compare gets this wrong) */
+function ipCompare(a, b) {
+	var A = String(a || '').split('.'), B = String(b || '').split('.');
+	for (var i = 0; i < 4; i++) {
+		var d = (parseInt(A[i], 10) || 0) - (parseInt(B[i], 10) || 0);
+		if (d)
+			return d;
+	}
+	return 0;
+}
+
+/* filter + sort for the table: the three filters AND-combine (search
+ * substring, group dropdown, Online-only). Unassigned sorts under its
+ * own label; ties fall back to the device label. */
+function devicesView() {
+	var t = state.devTable;
+	var gmap = {};
+	boardGroups().forEach(function(g) { gmap[g.name] = g; });
+	var dir = (t.sortDir == 'desc') ? -1 : 1;
+	var rows = deviceRows().filter(function(r) {
+		if (hideOfflineMode() && !r.online)
+			return false;
+		if (!deviceMatches(r))
+			return false;
+		if (t.groupFilter == '(unassigned)')
+			return !r.group;
+		return !t.groupFilter || r.group == t.groupFilter;
+	});
+	var routeOf = function(r) {
+		return (r.group && gmap[r.group]) ? groupRouteCell(gmap[r.group]).text : '';
+	};
+	var groupOf = function(r) {
+		return (r.group && gmap[r.group]) ? gmap[r.group].title : _('Unassigned');
+	};
+	rows.sort(function(a, b) {
+		var d;
+		if (t.sortKey == 'ip')
+			d = ipCompare(a.ip, b.ip);
+		else if (t.sortKey == 'group')
+			d = groupOf(a).localeCompare(groupOf(b));
+		else if (t.sortKey == 'route')
+			d = routeOf(a).localeCompare(routeOf(b));
+		else if (t.sortKey == 'status')
+			d = (a.online ? 'Online' : 'Offline').localeCompare(b.online ? 'Online' : 'Offline');
+		else
+			d = (a.name || a.ip || a.mac).localeCompare(b.name || b.ip || b.mac);
+		if (!d)
+			d = (a.name || a.ip || a.mac).localeCompare(b.name || b.ip || b.mac);
+		return d * dir;
+	});
+	return rows;
+}
+
+function setDevSort(key) {
+	var t = state.devTable;
+	if (t.sortKey == key)
+		t.sortDir = (t.sortDir == 'asc') ? 'desc' : 'asc';
+	else {
+		t.sortKey = key;
+		t.sortDir = 'asc';
+	}
+	rebuildDevicesPage();
+}
+
+/* drop bulk selections for devices that vanished from the inventory
+ * (poll refresh); the rest survives table rebuilds */
+function pruneSelection() {
+	var live = {};
+	deviceRows().forEach(function(r) { live[r.mac] = 1; });
+	Object.keys(state.devTable.selected).forEach(function(mac) {
+		if (!live[mac])
+			delete state.devTable.selected[mac];
+	});
+}
+
+var DEV_COLS = [
+	[ 'name', 'Device' ],
+	[ 'ip', 'IP address' ],
+	[ 'group', 'Group' ],
+	[ 'route', 'Route' ],
+	[ 'status', 'Status' ]
+];
+
+function devSortHead() {
+	var t = state.devTable;
+	var tr = E('tr', {}, [ E('th', { 'class': 'wg-dcheck' }, [ '\u00a0' ]) ]);
+	DEV_COLS.forEach(function(c) {
+		var mark = (t.sortKey == c[0]) ? ((t.sortDir == 'asc') ? ' ▲' : ' ▼') : ' ↕';
+		tr.appendChild(E('th', {}, [
+			E('button', {
+				'class': 'wg-sort',
+				'data-wg': 'sort-' + c[0],
+				'title': _('Sort by %s').format(c[1]),
+				'click': function() { setDevSort(c[0]); }
+			}, [ c[1] + mark ])
+		]));
+	});
+	return tr;
+}
+
+function devRow(r, gmap) {
+	var t = state.devTable;
+	var label = r.name || r.ip || r.mac;
+	var g = r.group ? (gmap[r.group] || null) : null;
+
+	var cb = E('input', { 'type': 'checkbox', 'aria-label': _('Select %s').format(label) });
+	cb.checked = !!t.selected[r.mac];
+	cb.addEventListener('click', function(ev) {
+		if (ev && ev.stopPropagation)
+			ev.stopPropagation(); /* not a row click (the drawer) */
+	});
+	cb.addEventListener('change', function(ev) {
+		if (ev && ev.stopPropagation)
+			ev.stopPropagation();
+		if (cb.checked)
+			t.selected[r.mac] = 1;
+		else
+			delete t.selected[r.mac];
+		rebuildDevicesPage();
+	});
+
+	var routeTd;
+	if (g) {
+		var c = groupRouteCell(g);
+		routeTd = E('td', {}, [ routeChipNode(c.type, c.text, c.title) ]);
+	}
+	else
+		routeTd = E('td', {}, [ E('span', { 'class': 'wg-unassigned' }, [ '—' ]) ]);
+
+	return E('tr', {
+		'class': t.selected[r.mac] ? 'wg-sel' : '',
+		'data-mac': r.mac,
+		'title': _('Open device details'),
+		'click': function() { if (!state.busy) openDeviceDrawer(r.mac); }
+	}, [
+		E('td', { 'class': 'wg-dcheck' }, [ cb ]),
+		E('td', {}, [
+			r.type ? typeIcon(r.type) : E([]),
+			E('span', { 'class': 'wg-devname' }, [ label ])
+		]),
+		E('td', {}, [ r.ip || '—' ]),
+		E('td', {}, (g ? [
+			g.color ? E('span', { 'class': 'wg-dot', 'style': 'background:%s'.format(g.color) }, []) : E([]),
+			E('span', { 'class': 'wg-devgroup' }, [ g.title ])
+		] : [ E('span', { 'class': 'wg-unassigned' }, [ _('Unassigned') ]) ])),
+		routeTd,
+		E('td', {}, [ E('span', { 'class': r.online ? 'wg-on' : 'wg-off' },
+			[ (r.online ? '● ' : '○ ') + (r.online ? _('Online') : _('Offline')) ]) ])
+	]);
+}
+
+function buildDevicesToolbar() {
+	var search = E('input', {
+		'type': 'search',
+		'class': 'wg-search',
+		'data-wg': 'dev-search',
+		'placeholder': _('Search devices, IP or MAC'),
+		'aria-label': _('Search devices, IP or MAC'),
+		'value': state.filter
+	});
+	var timer = null;
+	search.addEventListener('input', function() {
+		if (typeof clearTimeout == 'function')
+			clearTimeout(timer);
+		timer = (typeof setTimeout == 'function') ? setTimeout(function() {
+			setFilter(search.value);
+			rebuildDevicesPage();
+		}, 200) : null;
+	});
+
+	var grpSel = E('select', { 'class': 'cbi-input-select',
+		'data-wg': 'dev-group-filter', 'aria-label': _('Filter by group') });
+	grpSel.appendChild(E('option', { 'value': '' }, [ _('All groups') ]));
+	boardGroups().forEach(function(g) {
+		grpSel.appendChild(E('option', { 'value': g.name }, [ g.title ]));
+	});
+	grpSel.appendChild(E('option', { 'value': '(unassigned)' }, [ _('Unassigned') ]));
+	grpSel.value = state.devTable.groupFilter;
+	grpSel.addEventListener('change', function() {
+		state.devTable.groupFilter = grpSel.value || '';
+		rebuildDevicesPage();
+	});
+
+	var sw = E('input', { 'type': 'checkbox' });
+	sw.checked = hideOfflineMode();
+	sw.addEventListener('change', function(ev) {
+		try {
+			localStorage.setItem('wanguard-hide-offline', ev.target.checked ? '1' : '0');
+		}
+		catch (e) { /* storage unavailable */ }
+		rebuildDevicesPage();
+	});
+
+	return E('div', { 'class': 'wg-toolbar' }, [
+		search, grpSel,
+		E('label', { 'class': 'wg-switch' }, [
+			sw, E('span', { 'class': 'wg-switch-track' }, []), _('Online only')
+		]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'data-wg': 'dev-add',
+			'title': _('Pick a DHCP lease'),
+			'click': function() { deviceLeaseToggle(); }
+		}, [ '+ ' + _('Add device') ])
+	]);
+}
+
+/* "+ Add device": mount the DHCP-lease panel above the table (once;
+ * the holder lives outside the table rebuild) and flash it (#47) */
+function deviceLeaseToggle() {
+	if (!state.leasePanel && state.devLeaseHolder) {
+		state.leasePanel = buildLeasePanel();
+		state.devLeaseHolder.appendChild(state.leasePanel);
+	}
+	leaseFocus('');
+}
+
+function buildBulkBar() {
+	var sel = E('select', { 'class': 'cbi-input-select', 'data-wg': 'bulk-target',
+		'aria-label': _('Target group') });
+	groupChoices().forEach(function(g) {
+		sel.appendChild(E('option', { 'value': g[0] }, [ g[1] ]));
+	});
+	return E('div', { 'class': 'wg-bulkbar', 'data-wg': 'bulk-bar' }, [
+		E('span', { 'style': 'font-weight:bold' }, [
+			'%d %s'.format(Object.keys(state.devTable.selected).length, _('selected'))
+		]),
+		sel,
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action', 'data-wg': 'bulk-move',
+			'click': function() { return bulkMove(sel.value || ''); }
+		}, [ _('Move to group') ]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-negative', 'data-wg': 'bulk-unassign',
+			'click': function() { return bulkMove(''); }
+		}, [ _('Unassign') ]),
+		E('button', {
+			'class': 'btn cbi-button', 'data-wg': 'bulk-clear',
+			'click': function() {
+				state.devTable.selected = {};
+				rebuildDevicesPage();
+			}
+		}, [ _('Clear selection') ])
+	]);
+}
+
+/* bulk move (#48): stage every selected device (no-op skips), ONE
+ * save+apply, full reload, selection cleared; failure -> toast +
+ * reload (the staged config stays, the pending pill stays honest —
+ * the B7 semantics). Unassign confirms first (a silent unregister
+ * would be a surprise). */
+function bulkMove(target) {
+	if (state.busy)
+		return;
+	if (state.statusOk === false) {
+		ui.addNotification(null, E('p', {}, _('State is DRIFT — bulk moves are disabled until the router re-syncs.')), 'error');
+		return;
+	}
+	var macs = Object.keys(state.devTable.selected).filter(function(mac) {
+		var mm = findMember(mac);
+		return (mm ? (mm.group || '') : '') != target;
+	});
+	if (!macs.length) {
+		state.devTable.selected = {};
+		rebuildDevicesPage();
+		return;
+	}
+
+	var go = function() {
+		macs.forEach(function(mac) { stageAssign(mac, target); });
+		state.busy = true;
+		return uci.save().then(function() {
+			return uci.apply(5);
+		}).then(function() {
+			state.busy = false;
+			state.devTable.selected = {};
+			return reloadState().then(rebuildDevicesPage);
+		}).then(function() {
+			/* uci.save() lit the "Unsaved Changes" badge; re-query it */
+			return ui.changes.init();
+		}).catch(function(e) {
+			state.busy = false;
+			ui.addNotification(null, E('p', {}, _('Bulk move failed — the change is rolled back (%s).').format((e && e.message) || 'error')), 'error');
+			return reloadState().then(rebuildDevicesPage);
+		});
+	};
+
+	if (!target) {
+		ui.showModal(_('Unassign devices'), E('div', { 'style': 'max-width:32em' }, [
+			E('p', {}, _('Unassign %d device(s)? They fall back to the main routing table.').format(macs.length)),
+			E('div', { 'style': 'display:flex; gap:.5em; justify-content:flex-end; margin-top:1em' }, [
+				E('button', {
+					'class': 'btn cbi-button',
+					'click': ui.createHandlerFn(null, function() { ui.hideModal(); })
+				}, [ _('Cancel') ]),
+				E('button', {
+					'class': 'btn cbi-button cbi-button-negative important',
+					'click': ui.createHandlerFn(null, function() { ui.hideModal(); return go(); })
+				}, [ _('Unassign') ])
+			])
+		]));
+		return;
+	}
+	return go();
+}
+
+/* ---------- Device details drawer (#48) ---------- */
+
+function openDeviceDrawer(mac) {
+	state.devTable.drawerMac = mac;
+	state.devTable.drawerDirty = false;
+	rebuildDevicesPage();
+}
+
+/* × / Cancel: close, discarding the staged client-side config when the
+ * drawer edited anything (the #49 panelCancel pattern); resolves after
+ * the discard-reload rebuild */
+function closeDeviceDrawer() {
+	var dirty = state.devTable.drawerDirty;
+	state.devTable.drawerMac = null;
+	state.devTable.drawerDirty = false;
+	if (dirty) {
+		try { uci.unload('wanguard'); } catch (e) { /* old LuCI */ }
+		return uci.load('wanguard').then(rebuildDevicesPage);
+	}
+	rebuildDevicesPage();
+	return Promise.resolve();
+}
+
+/* clipboard helper: navigator.clipboard is unavailable on the router's
+ * http:// LuCI (no secure context) — the execCommand fallback keeps
+ * the copy buttons alive; every failure path degrades to a toast,
+ * never throws */
+function copyText(text) {
+	var done = function(okflag) {
+		ui.addNotification(null, E('p', {},
+			okflag ? _('Copied: %s').format(text) : _('Copy failed')),
+			okflag ? 'info' : 'error');
+	};
+	try {
+		if (typeof navigator != 'undefined' && navigator.clipboard &&
+			typeof navigator.clipboard.writeText == 'function') {
+			navigator.clipboard.writeText(text).then(function() { done(true); },
+				function() { copyFallback(text, done); });
+			return;
+		}
+	}
+	catch (e) { /* fall through to the fallback */ }
+	copyFallback(text, done);
+}
+
+function copyFallback(text, done) {
+	var okflag = false;
+	try {
+		if (typeof document != 'undefined' && typeof document.createElement == 'function' &&
+			document.body) {
+			var ta = document.createElement('textarea');
+			ta.value = text;
+			ta.setAttribute('readonly', '');
+			ta.style.position = 'fixed';
+			ta.style.opacity = '0';
+			document.body.appendChild(ta);
+			ta.select();
+			try { okflag = (document.execCommand('copy') === true); }
+			catch (e) { okflag = false; }
+			document.body.removeChild(ta);
+		}
+	}
+	catch (e) { okflag = false; }
+	done(okflag);
+}
+
+function buildDeviceDrawer(mac) {
+	var drift = (state.statusOk === false);
+	var d = inventoryOf(mac) || {};
+
+	var field = function(lbl, node) {
+		return E('div', { 'class': 'wg-field' }, [ E('label', {}, [ lbl ]), node ]);
+	};
+	var copyRow = function(text) {
+		return E('div', { 'class': 'wg-copyrow' }, [
+			E('span', {}, [ text ]),
+			E('button', {
+				'class': 'wg-copy', 'data-wg': 'copy',
+				'title': _('Copy'), 'aria-label': _('Copy'),
+				'click': function() { copyText(text); }
+			}, [ _('Copy') ])
+		]);
+	};
+
+	var sel = E('select', { 'class': 'cbi-input-select', 'data-wg': 'drawer-group' });
+	sel.appendChild(E('option', { 'value': '' }, [ _('Unassigned') ]));
+	groupChoices().forEach(function(g) {
+		sel.appendChild(E('option', { 'value': g[0] }, [ g[1] ]));
+	});
+	sel.value = (findMember(mac) || { group: '' }).group || '';
+	sel.disabled = drift || state.busy;
+	sel.addEventListener('change', function() {
+		var target = sel.value || '';
+		var mm = findMember(mac);
+		var cur = mm ? (mm.group || '') : '';
+		if (cur == target)
+			return;
+		stageAssign(mac, target);
+		state.devTable.drawerDirty = true;
+		rebuildDevicesPage();
+	});
+
+	/* the read-only route line follows the STAGED selection: what the
+	 * device will use after Save (the panel-plate honesty, #49) */
+	var rg = boardGroups().filter(function(g) { return g.name == (sel.value || ''); })[0];
+	var routeLine;
+	if (rg) {
+		var c = groupRouteCell(rg);
+		routeLine = routeChipNode(c.type, c.text, c.title);
+	}
+	else
+		routeLine = E('span', { 'class': 'wg-unassigned' }, [ '—' ]);
+
+	var body = E('div', { 'class': 'wg-drawer', 'data-wg': 'drawer' }, [
+		E('h3', {}, [
+			E('button', {
+				'class': 'wg-drawer-close', 'data-wg': 'drawer-close',
+				'title': _('Close'), 'aria-label': _('Close'),
+				'click': function() { return closeDeviceDrawer(); }
+			}, [ '×' ]),
+			d.type ? typeIcon(d.type) : E([]),
+			E('span', {}, [ macLabel(mac) ]),
+			E('span', { 'class': d.online ? 'wg-on' : 'wg-off' },
+				[ (d.online ? '● ' : '○ ') + (d.online ? _('Online') : _('Offline')) ])
+		]),
+		field(_('Hostname'), E('span', { 'data-wg': 'drawer-host' }, [ d.name || '—' ])),
+		field(_('IP address'), d.ip ? copyRow(d.ip) : E('span', {}, [ '—' ])),
+		field(_('MAC address'), copyRow(mac)),
+		field(_('Group'), sel),
+		field(_('Configured route'), E('div', { 'data-wg': 'drawer-route' }, [ routeLine ])),
+		E('div', { 'class': 'wg-plate' }, [
+			_('Assignment reflects configuration, not a live traffic test.')
+		])
+	]);
+
+	if (drift)
+		body.appendChild(E('div', { 'class': 'wg-plate', 'data-wg': 'drawer-drift' }, [
+			_('DRIFT — read-only until the router re-syncs.')
+		]));
+
+	var saveAttrs = {
+		'class': 'btn cbi-button cbi-button-action important', 'data-wg': 'drawer-save',
+		'click': ui.createHandlerFn(null, function() { return drawerSave(mac); })
+	};
+	if (drift)
+		saveAttrs['disabled'] = 'disabled';
+	body.appendChild(E('div', { 'style': 'display:flex; justify-content:flex-end; gap:.5em; margin-top:1em' }, [
+		E('button', {
+			'class': 'btn cbi-button', 'data-wg': 'drawer-cancel',
+			'click': ui.createHandlerFn(null, function() { return closeDeviceDrawer(); })
+		}, [ _('Cancel') ]),
+		E('button', saveAttrs, [ _('Save changes') ])
+	]));
+
+	return body;
+}
+
+/* drawer Save: commit the staged assignment through the hosting view's
+ * Save & Apply (uci.apply + `wanguard apply` — the #49 panel path);
+ * the drawer STAYS OPEN with the refreshed data; failure -> toast +
+ * staged-config discard (rollback), drawer still open */
+function drawerSave(mac) {
+	state.devTable.drawerDirty = false;
+	state.busy = true;
+	var host = state.saveHost;
+	var finish = function() {
+		state.busy = false;
+		return reloadState().then(rebuildDevicesPage);
+	};
+	return Promise.resolve(host && host.handleSaveApply ? host.handleSaveApply(null, 'apply') : null)
+		.then(finish, function(e) {
+			state.busy = false;
+			ui.addNotification(null, E('p', {}, _('Saving %s failed — the change is rolled back (%s).').format(macLabel(mac), (e && e.message) || 'error')), 'error');
+			try { uci.unload('wanguard'); } catch (err) { /* old LuCI */ }
+			return uci.load('wanguard').then(function() { return reloadState(); })
+				.then(rebuildDevicesPage);
+		});
+}
+
+/* ---------- page builders (#48) ---------- */
+
+function buildDevicesPage() {
+	var root = E('div', {});
+	state.devLeaseHolder = E('div', {});
+	root.appendChild(state.devLeaseHolder);
+	state.devWrap = E('div', {});
+	root.appendChild(state.devWrap);
+	root.appendChild(buildBoardFooter());
+	rebuildDevicesPage();
+	return root;
+}
+
+function rebuildDevicesPage() {
+	if (!state.devWrap)
+		return;
+	pruneSelection();
+	var t = state.devTable;
+	var gmap = {};
+	boardGroups().forEach(function(g) { gmap[g.name] = g; });
+
+	var wrap = E('div', {});
+	if (state.statusOk === false)
+		wrap.appendChild(E('div', { 'class': 'alert-message warning', 'style': 'margin-bottom:1em' }, [
+			_('State is DRIFT — the page is read-only until the router re-syncs (keepalive repairs this automatically within ~10 s).')
+		]));
+	wrap.appendChild(buildDevicesToolbar());
+
+	if (Object.keys(t.selected).length)
+		wrap.appendChild(buildBulkBar());
+
+	var table = E('table', { 'class': 'wg-dtable', 'data-wg': 'dev-table' });
+	table.appendChild(devSortHead());
+	var rows = devicesView();
+	rows.forEach(function(r) { table.appendChild(devRow(r, gmap)); });
+	if (!rows.length)
+		table.appendChild(E('tr', {}, [
+			E('td', { 'colspan': String(DEV_COLS.length + 1), 'class': 'wg-empty' },
+				[ _('No devices match the current filters') ])
+		]));
+	wrap.appendChild(E('div', { 'class': 'wg-dtable-wrap' }, [ table ]));
+
+	if (t.drawerMac)
+		wrap.appendChild(buildDeviceDrawer(t.drawerMac));
+
+	state.devWrap.innerHTML = '';
+	state.devWrap.appendChild(wrap);
+	updateBoardFooter();
+}
+
+function reloadDevicesPage() {
+	return load().then(rebuildDevicesPage);
+}
+
 /* ---------- grid factories (issue #46) ---------- */
 
 /* groups grid (named sections: the section id IS the group name);
@@ -2396,6 +3024,21 @@ return L.Class.extend({
 	stageRename: stageRename,
 	showGroupMenu: showGroupMenu,
 	deleteGroup: deleteGroup,
+	stageAssign: stageAssign,
+	deviceRows: deviceRows,
+	ipCompare: ipCompare,
+	devicesView: devicesView,
+	setDevSort: setDevSort,
+	buildDevicesPage: buildDevicesPage,
+	rebuildDevicesPage: rebuildDevicesPage,
+	reloadDevicesPage: reloadDevicesPage,
+	deviceLeaseToggle: deviceLeaseToggle,
+	bulkMove: bulkMove,
+	openDeviceDrawer: openDeviceDrawer,
+	closeDeviceDrawer: closeDeviceDrawer,
+	buildDeviceDrawer: buildDeviceDrawer,
+	drawerSave: drawerSave,
+	copyText: copyText,
 	panelIfaces: panelIfaces,
 	panelDevices: panelDevices,
 	pendingCount: pendingCount,

@@ -194,7 +194,12 @@ const UCI = {
 			this.data = this._base ? JSON.parse(JSON.stringify(this._base)) : (this._src ? parseUci(this._src, 'wanguard') : { wanguard: {} });
 		return Promise.resolve();
 	},
-	unload(conf) { delete this.data[conf]; },
+	unload(conf) {
+		/* real LuCI drops the whole client-side config state incl. the
+		 * staged changes (panel/drawer Cancel, #49/#48) */
+		delete this.data[conf];
+		delete this.staged[conf];
+	},
 	sections(conf, type) {
 		const vals = this.data[conf] || {};
 		const out = [];
@@ -391,7 +396,8 @@ form.Map.prototype.section = function(cls, type, title) {
 const view = { extend(o) { return o; } };
 const poll = { add() {} };
 const ui = {
-	addNotification() {},
+	_notes: [],
+	addNotification(ctx, node, sev) { this._notes.push([sev || '', flat(node)]); },
 	showModal(title, body) { ui._modal = [title, body]; },
 	hideModal() { ui._modal = null; },
 	createHandlerFn(scope, fn) { return function() { return fn.apply(scope, arguments); }; },
@@ -425,6 +431,10 @@ global.location = { href: '' };
 const _ = (s) => s;
 const documentStub = { querySelector() { return null; }, querySelectorAll() { return []; } };
 const windowStub = {};
+/* navigator stub (#48 D11): copyText reads navigator.clipboard — empty
+ * by default (the http:// router case), filled per test for the
+ * secure-context path */
+const NAV = {};
 const localStorageStub = {
 	_s: {},
 	getItem(k) { return (k in this._s) ? this._s[k] : null; },
@@ -438,9 +448,9 @@ const localStorageStub = {
  * real loader, core.js must yield a LuCI class -> return the INSTANCE. */
 function loadCore() {
 	const fn = new Function(
-		'rpc', 'uci', 'ui', 'form', 'poll', 'E', 'L', '_', 'document', 'window', 'localStorage',
+		'rpc', 'uci', 'ui', 'form', 'poll', 'E', 'L', '_', 'document', 'window', 'localStorage', 'navigator',
 		CORE_SRC);
-	const C = fn(RPC, UCI, ui, form, poll, E, L, _, documentStub, windowStub, localStorageStub);
+	const C = fn(RPC, UCI, ui, form, poll, E, L, _, documentStub, windowStub, localStorageStub, NAV);
 	if (typeof C !== 'function')
 		throw new Error('core.js must yield a LuCI class (L.Class.extend)');
 	return new C();
@@ -499,9 +509,14 @@ const scenarios = [];
 function scenario(name, fixtureName, fn) {
 	scenarios.push({ name, run: async () => {
 		UCI.reset(fixtureName ? fixture(fixtureName) : null);
+		UCI._saves = 0; /* per-scenario counter (D8 counts the bulk saves) */
 		RPC.canned = {};
 		localStorageStub._s = {};
 		global.location.href = '';
+		ui._modal = null;
+		ui._notes = [];
+		for (const k in NAV)
+			delete NAV[k];
 		const wg = loadCore();
 		await fn(wg, name);
 	} });
@@ -863,10 +878,8 @@ scenario('M5 groups grid metadata options', 'meta.uci', async (wg, tag) => {
 });
 
 /* --- M6: devices grid gains the devtype override (#43) --- */
-scenario('M6 devices grid devtype', 'legacy.uci', async (wg, tag) => {
-	const dv = loadView('devices', wg);
-	await dv.render();
-	const grid = dv._map.children[0];
+scenario('M6 devices grid devtype (core factory; the #48 page no longer mounts the grid)', 'legacy.uci', async (wg, tag) => {
+	const grid = wg.buildDevicesGrid().devices;
 	const dt = grid.children.find((c) => c.option === 'devtype');
 	ok(tag + ' devtype option (ListValue)', !!dt && dt.__cls === form.ListValue);
 	assertEq(tag + ' auto + the 7 whitelisted types',
@@ -1007,16 +1020,25 @@ scenario('L6 monolith deleted', null, async (wg, tag) => {
 });
 
 /* --- L7: D2 — overview Table = both grids; per-page Maps are single-grid --- */
-scenario('L7 page grids (D2, amended by #47)', 'lb2.uci', async (wg, tag) => {
+scenario('L7 page grids (D2, amended by #47/#48)', 'lb2.uci', async (wg, tag) => {
+	cannedLb2();
 	const ov = loadView('overview', wg);
 	await ov.render();
 	ok(tag + ' overview dropped the in-page table (#20/#47)', ov._map === undefined);
-	ok(tag + ' List button present', !!ov._btnList);
+	ok(tag + ' single Devices link present (#48)', !!ov._btnDevices);
+	ok(tag + ' Board|List toggle collapsed (#48)',
+		ov._btnBoard === undefined && ov._btnList === undefined);
 
+	/* #48: the devices page mounts the custom table (no grid Map); the
+	 * single-grid devices Map lives on in the core factory */
+	const dm = wg.buildDevicesGrid();
+	assertEq(tag + ' devices map (core factory) = member section only',
+		dm.map.children.map(function(s) { return s.sectiontype; }).join(','), 'member');
 	const dv = loadView('devices', wg);
+	await dv.load();
 	await dv.render();
-	assertEq(tag + ' devices map = member section only',
-		dv._map.children.map(function(s) { return s.sectiontype; }).join(','), 'member');
+	ok(tag + ' devices page = custom #48 build (no grid Map)', dv._map === undefined);
+	ok(tag + ' devices page mounts the table container', !!wg.state.devWrap);
 
 	/* #49: the groups page mounts the custom panel page (no grid Map);
 	 * the single-grid groups Map lives on in the core factory */
@@ -1225,12 +1247,13 @@ scenario('B8 column add -> lease preselect (#47)', 'board47.uci', async (wg, tag
 	ok(tag + ' panel flashed for attention', wg.state.leasePanel.classList.contains('wg-lease-flash'));
 });
 
-scenario('B9 List / +Add / New group navigation (#20/#47)', 'board47.uci', async (wg, tag) => {
+scenario('B9 Devices link / +Add / New group navigation (#20/#47/#48)', 'board47.uci', async (wg, tag) => {
 	cannedBoard47();
 	const r = await renderBoard47(wg);
-	ok(tag + ' in-page table mode removed', r.ov._map === undefined);
-	r.ov._btnList.listeners['click'][0]();
-	assertEq(tag + ' List -> devices page', global.location.href, '/admin/network/wanguard/devices');
+	ok(tag + ' view toggle removed', r.ov._btnBoard === undefined && r.ov._btnList === undefined);
+	ok(tag + ' single Devices link present', !!r.ov._btnDevices);
+	r.ov._btnDevices.listeners['click'][0]();
+	assertEq(tag + ' Devices -> devices page', global.location.href, '/admin/network/wanguard/devices');
 	r.ov.showAddMenu();
 	ok(tag + ' + Add opens the menu', !!ui._modal);
 	const items = (ui._modal[1].children || []).filter(function(c) { return c.tag === 'button'; });
@@ -1626,6 +1649,391 @@ scenario('G10 DRIFT read-only (#49)', 'board47.uci', async (wg, tag) => {
 	wg.openGroupPanel(null);
 	ok(tag + ' panel opens back in sync', !!ui._modal);
 	ui.hideModal();
+});
+
+/* ======== #48 devices table page (D1–D13; everything above must stay
+ * green — the page reuses the board's filters/chips/footer and the #49
+ * panel staging semantics; the drawer poll guard lives in the view) ==== */
+
+async function renderDevices47(wg) {
+	const dv = loadView('devices', wg);
+	await dv.load();
+	const root = await dv.render();
+	return { dv: dv, root: root };
+}
+
+function findDevRows(root) {
+	const t = findByWg(root, 'dev-table');
+	const out = [];
+	(t ? t.children : []).forEach(function(c) {
+		if (c.tag === 'tr' && c.attrs && c.attrs['data-mac'])
+			out.push(c);
+	});
+	return out;
+}
+
+function iconsIn(tr) {
+	const out = [];
+	(function walk(n) {
+		if (!n || typeof n !== 'object')
+			return;
+		if (n.attrs && (n.attrs.class || '').indexOf('wg-type-') !== -1)
+			out.push(n.attrs.class);
+		(n.children || []).forEach(walk);
+	})(tr);
+	return out;
+}
+
+function modalButtons() {
+	const out = [];
+	(function walk(n) {
+		if (!n || typeof n !== 'object')
+			return;
+		if (n.tag === 'button') {
+			out.push(n);
+			return;
+		}
+		(n.children || []).forEach(walk);
+	})(ui._modal ? ui._modal[1] : null);
+	return out;
+}
+
+/* fire a checkbox change (the row checkboxes stopPropagation on click,
+ * the change handler drives the selection) */
+function devCheck(root, mac, on) {
+	const tr = findDevRows(root).filter(function(x) { return x.attrs['data-mac'] === mac; })[0];
+	const cb = tr.children[0].children[0];
+	cb.checked = !!on;
+	cb.listeners['change'][0]({ stopPropagation() {} });
+}
+
+function devRowByMac(root, mac) {
+	return findDevRows(root).filter(function(x) { return x.attrs['data-mac'] === mac; })[0];
+}
+
+function openDrawer(root, mac) {
+	devRowByMac(root, mac).listeners['click'][0]();
+}
+
+scenario('D1 devices table build (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	ok(tag + ' toolbar search present', !!findByWg(r.root, 'dev-search'));
+	ok(tag + ' group filter present', !!findByWg(r.root, 'dev-group-filter'));
+	ok(tag + ' add button present', !!findByWg(r.root, 'dev-add'));
+	ok(tag + ' honest footer present', !!wg.state.footerNode);
+	assertEq(tag + ' footer totals', flat(wg.state.footerNode.children[0]), '1 devices · 4 groups');
+	const rows = findDevRows(r.root);
+	assertEq(tag + ' three inventory rows', rows.length, 3);
+	assertEq(tag + ' default name asc',
+		rows.map(function(tr) { return tr.attrs['data-mac']; }).join(','),
+		'aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:99,aa:bb:cc:dd:ee:02');
+	const m01 = devRowByMac(r.root, 'aa:bb:cc:dd:ee:01');
+	const m02 = devRowByMac(r.root, 'aa:bb:cc:dd:ee:02');
+	const m99 = devRowByMac(r.root, 'aa:bb:cc:dd:ee:99');
+	assertEq(tag + ' home row shows the UCI label', flat(m01.children[3]), 'Home');
+	assertEq(tag + ' unassigned row labels itself', flat(m99.children[3]), 'Unassigned');
+	assertEq(tag + ' work route chip', flat(m02.children[4]), 'wg_moscow · VPN');
+	assertEq(tag + ' unassigned route dash', flat(m99.children[4]), '—');
+	assertEq(tag + ' IP cell', flat(m01.children[2]), '192.168.88.79');
+	ok(tag + ' online marker', flat(m01.children[5]).indexOf('Online') !== -1, flat(m01.children[5]));
+	ok(tag + ' offline marker', flat(m99.children[5]).indexOf('Offline') !== -1);
+	assertEq(tag + ' phone icon (43)', iconsIn(m01).join(' '), 'wg-type wg-type-phone');
+	assertEq(tag + ' pc icon (43)', iconsIn(m02).join(' '), 'wg-type wg-type-pc');
+	assertEq(tag + ' unassigned guest keeps its CLI icon', iconsIn(m99).join(' '), 'wg-type wg-type-phone');
+});
+
+scenario('D2 sorting (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	const macs = () => findDevRows(r.root).map(function(tr) { return tr.attrs['data-mac']; }).join(',');
+	const click = (key) => findByWg(r.root, 'sort-' + key).listeners['click'][0]();
+	ok(tag + ' name indicator active', flat(findByWg(r.root, 'sort-name')).indexOf('▲') !== -1);
+	click('ip');
+	assertEq(tag + ' IP asc is octet-wise (58 < 79 < 201)', macs(),
+		'aa:bb:cc:dd:ee:02,aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:99');
+	click('ip');
+	assertEq(tag + ' IP desc', macs(),
+		'aa:bb:cc:dd:ee:99,aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02');
+	click('group');
+	assertEq(tag + ' group asc = Home < Unassigned < work', macs(),
+		'aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:99,aa:bb:cc:dd:ee:02');
+	click('group');
+	assertEq(tag + ' group desc (work first — NOT the name order)', macs(),
+		'aa:bb:cc:dd:ee:02,aa:bb:cc:dd:ee:99,aa:bb:cc:dd:ee:01');
+	click('route');
+	assertEq(tag + ' route asc: unassigned first, then WAN, VPN', macs(),
+		'aa:bb:cc:dd:ee:99,aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02');
+	click('route');
+	assertEq(tag + ' route desc', macs(),
+		'aa:bb:cc:dd:ee:02,aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:99');
+	click('status');
+	assertEq(tag + ' status asc: Offline first', macs(),
+		'aa:bb:cc:dd:ee:99,aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02');
+	click('status');
+	assertEq(tag + ' status desc: Online first (name tiebreak reverses)', macs(),
+		'aa:bb:cc:dd:ee:02,aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:99');
+	ok(tag + ' previous indicator idle', flat(findByWg(r.root, 'sort-ip')).indexOf('↕') !== -1);
+	ok(tag + ' active indicator desc', flat(findByWg(r.root, 'sort-status')).indexOf('▼') !== -1);
+});
+
+scenario('D3 filter combination (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	const cnt = () => findDevRows(r.root).length;
+	wg.setFilter('work');
+	wg.rebuildDevicesPage();
+	assertEq(tag + ' search narrows', cnt(), 1);
+	let gs = findByWg(r.root, 'dev-group-filter');
+	gs.value = 'home';
+	gs.listeners['change'][0]();
+	assertEq(tag + ' search + group AND-combine to zero', cnt(), 0);
+	wg.setFilter('');
+	wg.rebuildDevicesPage();
+	assertEq(tag + ' group filter alone', cnt(), 1);
+	gs = findByWg(r.root, 'dev-group-filter');
+	gs.value = '(unassigned)';
+	gs.listeners['change'][0]();
+	assertEq(tag + ' unassigned sentinel shows the unassigned only', cnt(), 1);
+	assertEq(tag + ' and it is the guest',
+		findDevRows(r.root)[0].attrs['data-mac'], 'aa:bb:cc:dd:ee:99');
+	localStorageStub.setItem('wanguard-hide-offline', '1');
+	wg.state.devTable.groupFilter = 'home';
+	wg.rebuildDevicesPage();
+	assertEq(tag + ' online-only keeps the online member', cnt(), 1);
+	wg.state.devTable.groupFilter = '(unassigned)';
+	wg.rebuildDevicesPage();
+	assertEq(tag + ' online-only + unassigned hides the offline guest', cnt(), 0);
+	localStorageStub.setItem('wanguard-hide-offline', '0');
+	wg.state.devTable.groupFilter = '';
+	wg.rebuildDevicesPage();
+	assertEq(tag + ' filters reset', cnt(), 3);
+});
+
+scenario('D4 device drawer (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:99');
+	assertEq(tag + ' drawer mac registered', wg.state.devTable.drawerMac, 'aa:bb:cc:dd:ee:99');
+	const dr = findByWg(r.root, 'drawer');
+	ok(tag + ' drawer node present', !!dr);
+	assertEq(tag + ' hostname line', flat(findByWg(r.root, 'drawer-host')), 'guest-phone');
+	assertEq(tag + ' group = Unassigned', findByWg(r.root, 'drawer-group').value, '');
+	assertEq(tag + ' route line dash', flat(findByWg(r.root, 'drawer-route')), '—');
+	ok(tag + ' MAC in the drawer', flat(dr).indexOf('aa:bb:cc:dd:ee:99') !== -1);
+	ok(tag + ' IP in the drawer', flat(dr).indexOf('192.168.88.201') !== -1);
+	ok(tag + ' info plate', flat(dr).indexOf('Assignment reflects configuration') !== -1);
+	findByWg(r.root, 'drawer-close').listeners['click'][0]();
+	assertEq(tag + ' × closes', wg.state.devTable.drawerMac, null);
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:99');
+	findByWg(r.root, 'drawer-cancel').listeners['click'][0]();
+	assertEq(tag + ' Cancel closes', wg.state.devTable.drawerMac, null);
+});
+
+scenario('D5 drawer assignment staging -> Save (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	let applied = 0;
+	wg.state.saveHost = { handleSaveApply: function() {
+		applied++;
+		return UCI.save().then(function() { return UCI.apply(); });
+	} };
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:99');
+	const sel = findByWg(r.root, 'drawer-group');
+	sel.value = 'home';
+	sel.listeners['change'][0]();
+	ok(tag + ' drawer dirty after staging', wg.state.devTable.drawerDirty);
+	assertEq(tag + ' staged member section', (wg.findMember('aa:bb:cc:dd:ee:99') || {}).group, 'home');
+	assertEq(tag + ' pending pill counts the staged change', wg.pendingCount(), 1);
+	assertEq(tag + ' select keeps the staged value', findByWg(r.root, 'drawer-group').value, 'home');
+	assertEq(tag + ' route line follows the staged group', flat(findByWg(r.root, 'drawer-route')), 'freedom · WAN');
+	assertEq(tag + ' table shows the staged assignment already',
+		flat(devRowByMac(r.root, 'aa:bb:cc:dd:ee:99').children[3]), 'Home');
+	await findByWg(r.root, 'drawer-save').listeners['click'][0]();
+	assertEq(tag + ' one Save&Apply', applied, 1);
+	assertEq(tag + ' drawer stays open', wg.state.devTable.drawerMac, 'aa:bb:cc:dd:ee:99');
+	ok(tag + ' drawer not dirty anymore', !wg.state.devTable.drawerDirty);
+	assertEq(tag + ' committed member', (wg.findMember('aa:bb:cc:dd:ee:99') || {}).group, 'home');
+});
+
+scenario('D6 unassign both ways (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	wg.state.saveHost = { handleSaveApply: function() {
+		return UCI.save().then(function() { return UCI.apply(); });
+	} };
+	/* (a) staged add fully reverted before Save */
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:99');
+	let sel = findByWg(r.root, 'drawer-group');
+	sel.value = 'home';
+	sel.listeners['change'][0]();
+	assertEq(tag + ' staged add', (wg.findMember('aa:bb:cc:dd:ee:99') || {}).group, 'home');
+	sel = findByWg(r.root, 'drawer-group');
+	sel.value = '';
+	sel.listeners['change'][0]();
+	ok(tag + ' staged add fully reverted', !wg.findMember('aa:bb:cc:dd:ee:99'));
+	ok(tag + ' still dirty (nothing saved)', wg.state.devTable.drawerDirty);
+	/* (b) a REGISTERED device saved to Unassigned (member section removed) */
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:01');
+	sel = findByWg(r.root, 'drawer-group');
+	sel.value = '';
+	sel.listeners['change'][0]();
+	/* NOTE: the stub UCI folds whole-section removal into the data right
+	 * away (changes() stays empty) — real LuCI stages a delete and the
+	 * pending pill shows it; here only the assignment can be asserted */
+	await findByWg(r.root, 'drawer-save').listeners['click'][0]();
+	ok(tag + ' member removed after Save', !wg.findMember('aa:bb:cc:dd:ee:01'));
+	assertEq(tag + ' row shows Unassigned', flat(devRowByMac(r.root, 'aa:bb:cc:dd:ee:01').children[3]), 'Unassigned');
+	/* (c) Cancel discards a staged removal (uci.unload + reload, #49) */
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:02');
+	sel = findByWg(r.root, 'drawer-group');
+	sel.value = '';
+	sel.listeners['change'][0]();
+	ok(tag + ' staged removal hit the client config', !wg.findMember('aa:bb:cc:dd:ee:02'));
+	await findByWg(r.root, 'drawer-cancel').listeners['click'][0]();
+	assertEq(tag + ' Cancel restores the member', (wg.findMember('aa:bb:cc:dd:ee:02') || {}).group, 'work');
+});
+
+scenario('D7 drawer save failure -> rollback (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	wg.state.saveHost = { handleSaveApply: function() {
+		return Promise.reject(new Error('apply down'));
+	} };
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:99');
+	const sel = findByWg(r.root, 'drawer-group');
+	sel.value = 'home';
+	sel.listeners['change'][0]();
+	assertEq(tag + ' staged before the attempt', wg.pendingCount(), 1);
+	await findByWg(r.root, 'drawer-save').listeners['click'][0]();
+	ok(tag + ' failure toast', (ui._notes || []).some(function(n) { return n[0] === 'error'; }));
+	ok(tag + ' staged discarded (rollback)', !wg.findMember('aa:bb:cc:dd:ee:99'));
+	assertEq(tag + ' pending pill clean again', wg.pendingCount(), 0);
+	assertEq(tag + ' drawer still open', wg.state.devTable.drawerMac, 'aa:bb:cc:dd:ee:99');
+	ok(tag + ' drawer not dirty', !wg.state.devTable.drawerDirty);
+	assertEq(tag + ' select back to Unassigned', findByWg(r.root, 'drawer-group').value, '');
+});
+
+scenario('D8 bulk move + bulk unassign (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	devCheck(r.root, 'aa:bb:cc:dd:ee:99', true);
+	devCheck(r.root, 'aa:bb:cc:dd:ee:01', true); /* already home — no-op skip */
+	ok(tag + ' bulk bar appears', !!findByWg(r.root, 'bulk-bar'));
+	findByWg(r.root, 'bulk-target').value = 'home';
+	await findByWg(r.root, 'bulk-move').listeners['click'][0]();
+	assertEq(tag + ' ONE save for the batch', UCI._saves, 1);
+	assertEq(tag + ' guest moved', (wg.findMember('aa:bb:cc:dd:ee:99') || {}).group, 'home');
+	ok(tag + ' selection cleared (bar gone)', !findByWg(r.root, 'bulk-bar'));
+	devCheck(r.root, 'aa:bb:cc:dd:ee:01', true);
+	devCheck(r.root, 'aa:bb:cc:dd:ee:02', true);
+	findByWg(r.root, 'bulk-unassign').listeners['click'][0]();
+	ok(tag + ' unassign asks for confirmation', !!ui._modal);
+	const btns = modalButtons();
+	assertEq(tag + ' confirm modal = Cancel + Unassign', btns.length, 2);
+	await btns[1].listeners['click'][0]();
+	ok(tag + ' both devices unassigned', !wg.findMember('aa:bb:cc:dd:ee:01') && !wg.findMember('aa:bb:cc:dd:ee:02'));
+	assertEq(tag + ' rows show Unassigned', flat(devRowByMac(r.root, 'aa:bb:cc:dd:ee:02').children[3]), 'Unassigned');
+});
+
+scenario('D9 DRIFT read-only (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	wg.state.statusOk = false;
+	wg.rebuildDevicesPage();
+	ok(tag + ' page banner', flat(wg.state.devWrap).indexOf('DRIFT') !== -1);
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:99');
+	ok(tag + ' drawer opens read-only', !!findByWg(r.root, 'drawer'));
+	assertEq(tag + ' select disabled', findByWg(r.root, 'drawer-group').disabled, true);
+	ok(tag + ' drift plate in the drawer', !!findByWg(r.root, 'drawer-drift'));
+	assertEq(tag + ' save disabled', findByWg(r.root, 'drawer-save').attrs['disabled'], 'disabled');
+	devCheck(r.root, 'aa:bb:cc:dd:ee:02', true);
+	findByWg(r.root, 'bulk-move').listeners['click'][0]();
+	ok(tag + ' bulk refused with a toast',
+		(ui._notes || []).some(function(n) { return n[0] === 'error'; }));
+	ok(tag + ' nothing staged (the unassigned guest is untouched)',
+		!wg.findMember('aa:bb:cc:dd:ee:99'));
+	assertEq(tag + ' pending pill clean', wg.pendingCount(), 0);
+	wg.state.statusOk = true;
+	wg.rebuildDevicesPage();
+	assertEq(tag + ' back in sync: select enabled', findByWg(r.root, 'drawer-group').disabled, false);
+	assertEq(tag + ' back in sync: save enabled', findByWg(r.root, 'drawer-save').attrs['disabled'], undefined);
+});
+
+scenario('D10 + Add device -> lease panel (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	ok(tag + ' no lease panel until asked', !wg.state.leasePanel);
+	findByWg(r.root, 'dev-add').listeners['click'][0]();
+	ok(tag + ' lease panel mounted', !!wg.state.leasePanel);
+	ok(tag + ' flashed for attention', wg.state.leasePanel.classList.contains('wg-lease-flash'));
+	assertEq(tag + ' mounted outside the table rebuild', wg.state.devLeaseHolder.children.length, 1);
+	wg.rebuildDevicesPage();
+	ok(tag + ' panel survives the table rebuild', !!wg.state.leasePanel);
+});
+
+scenario('D11 copy buttons (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	openDrawer(r.root, 'aa:bb:cc:dd:ee:99');
+	const dr = findByWg(r.root, 'drawer');
+	const copyBtns = [];
+	(function walk(n) {
+		if (!n || typeof n !== 'object')
+			return;
+		if (n.attrs && n.attrs['data-wg'] === 'copy') {
+			copyBtns.push(n);
+			return;
+		}
+		(n.children || []).forEach(walk);
+	})(dr);
+	assertEq(tag + ' IP + MAC copy rows', copyBtns.length, 2);
+	/* no navigator.clipboard (the http:// router case) -> the document
+	 * stub has no createElement either -> honest failure toast, never
+	 * an exception */
+	copyBtns[0].listeners['click'][0]();
+	ok(tag + ' degraded copy reports failure',
+		(ui._notes || []).some(function(n) { return n[1].indexOf('Copy failed') !== -1; }));
+	/* the secure-context path */
+	NAV.clipboard = { writeText: function(t) { NAV.wrote = t; return Promise.resolve(); } };
+	copyBtns[0].listeners['click'][0]();
+	await new Promise(function(res) { setTimeout(res, 0); });
+	assertEq(tag + ' clipboard got the IP', NAV.wrote, '192.168.88.201');
+	ok(tag + ' success toast',
+		(ui._notes || []).some(function(n) { return n[1].indexOf('Copied: 192.168.88.201') !== -1; }));
+});
+
+scenario('D12 old 4-column CLI degrades (#48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	RPC.canned['exec:/usr/bin/wanguard:devices'] = { stdout: [
+		'aa:bb:cc:dd:ee:01\t192.168.88.79\talice-phone\t1',
+		'aa:bb:cc:dd:ee:02\t192.168.88.58\twork-pc\t1',
+		'aa:bb:cc:dd:ee:99\t192.168.88.201\tguest-phone\t0'
+	].join('\n') };
+	const r = await renderDevices47(wg);
+	assertEq(tag + ' table still renders', findDevRows(r.root).length, 3);
+	ok(tag + ' no icons without the TYPE column',
+		!findDevRows(r.root).some(function(tr) { return iconsIn(tr).length; }));
+});
+
+scenario('D13 60-device render (pagination probe, #48)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const lines = [];
+	for (let i = 1; i <= 60; i++) {
+		const nn = (i < 10 ? '0' : '') + i;
+		lines.push('aa:bb:cc:dd:' + nn + ':' + nn + '\t192.168.88.' + i + '\td' + i + '\t1\tgeneric');
+	}
+	RPC.canned['exec:/usr/bin/wanguard:devices'] = { stdout: lines.join('\n') };
+	const r = await renderDevices47(wg);
+	/* 60 inventory rows + the 2 member sections the (replaced) inventory
+	 * no longer knows about */
+	assertEq(tag + ' all rows rendered fully', findDevRows(r.root).length, 62);
+	ok(tag + ' rows complete (6 cells each)',
+		findDevRows(r.root).every(function(tr) { return tr.children.length === 6; }));
+	wg.setFilter('dd:07:07');
+	wg.rebuildDevicesPage();
+	assertEq(tag + ' MAC search still works at scale', findDevRows(r.root).length, 1);
+	wg.setFilter('');
 });
 
 async function demo() {

@@ -1,9 +1,11 @@
-/* WAN Guard overview (issues #46/#47) — the board-first page: compact
- * sync pill in the header, toolbar (search / "Online only" switch /
- * Board|List / "+ Add"), the kanban board (#14) with per-column
- * add buttons and a "New group" tile, and the honest footer
- * (totals + pending pill). The former in-page Table mode is gone (#20):
- * List opens the devices page, group editing lives on Groups & Routes.
+/* WAN Guard overview (issues #46/#47/#48) — the board-first page:
+ * compact sync pill in the header, toolbar (search / "Online only"
+ * switch / Devices link / "+ Add"), the kanban board (#14) with
+ * per-column add buttons and a "New group" tile, and the honest footer
+ * (totals + pending pill). The former in-page Table mode is gone and
+ * the Board|List toggle collapsed into a single Devices link (#20,
+ * absorbed by the #48 devices table): sorting, bulk moves and the
+ * device drawer live there, group editing on Groups & Routes.
  * All logic lives in the shared wanguard.core module. */
 'use strict';
 'require view';
@@ -57,17 +59,13 @@ return view.extend({
 		});
 		this._sw = sw;
 
-		this._btnBoard = E('button', {
-			'class': 'btn cbi-button cbi-button-action',
-			'click': ui.createHandlerFn(this, function() { wg.rebuildBoard(); })
-		}, [ _('Board') ]);
-		this._btnList = E('button', {
+		this._btnDevices = E('button', {
 			'class': 'btn cbi-button',
-			'title': _('Bulk edits live on the devices page'),
-			'click': ui.createHandlerFn(this, function() {
+			'title': _('Devices table: sorting, bulk moves and device details'),
+			'click': function() {
 				location.href = L.url('admin/network/wanguard/devices');
-			})
-		}, [ _('List') ]);
+			}
+		}, [ _('Devices') ]);
 
 		this._btnAdd = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
@@ -88,7 +86,7 @@ return view.extend({
 					E('span', { 'class': 'wg-switch-track' }, []),
 					_('Online only')
 				]),
-				E('span', { 'class': 'wg-viewtoggle' }, [ this._btnBoard, this._btnList ]),
+				this._btnDevices,
 				this._btnAdd
 			]),
 			E('div', { 'class': 'wg-hint' }, [
