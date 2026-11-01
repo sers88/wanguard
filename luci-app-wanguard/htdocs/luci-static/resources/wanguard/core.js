@@ -102,6 +102,7 @@ var state = {
 	groupsRoot: null,    /* groups-page tab container, set by buildGroupsPage (#49) */
 	groupPanel: null,    /* open panel session: { origName, stagedNew, stagedName, orig } (#49) */
 	devWrap: null,       /* devices-page table container, set by buildDevicesPage (#48) */
+	devToolbarHolder: null, /* devices-page toolbar holder, OUTSIDE the table rebuild (#48) */
 	devLeaseHolder: null, /* devices-page lease-panel holder, outside the table rebuild (#48) */
 	devTable: {          /* devices-table session state (#48) */
 		sortKey: 'name', sortDir: 'asc',
@@ -366,7 +367,7 @@ var BOARD_CSS = [
 	".wg-off { color:#999; }",
 	".wg-dot { display:inline-block; width:.65em; height:.65em; border-radius:50%; margin-right:.4em; vertical-align:.05em; }",
 	".wg-type { opacity:.75; line-height:1; margin-top:.15em; }",
-	".wg-type svg { display:inline; vertical-align:-.12em; }",
+	".wg-type svg { display:inline; vertical-align:-.12em; width:1.2em; height:1.2em; }",
 	".wg-col.wg-drop { outline:2px dashed #4a90d9; outline-offset:-3px; background:rgba(74,144,217,.10); }",
 	".wg-menu button { display:block; width:100%; margin:.25em 0; }",
 	"/* #47: toolbar (search, Online-only switch, Board|List, + Add) */",
@@ -2643,9 +2644,16 @@ function buildDevicesPage() {
 	var root = E('div', {});
 	state.devLeaseHolder = E('div', {});
 	root.appendChild(state.devLeaseHolder);
+	/* the toolbar is built ONCE and lives outside the table rebuild:
+	 * replacing the search input on every debounced keystroke would
+	 * drop the focus mid-word (the overview keeps its toolbar static
+	 * too — only the board container is rebuilt) */
+	state.devToolbarHolder = E('div', {});
+	root.appendChild(state.devToolbarHolder);
 	state.devWrap = E('div', {});
 	root.appendChild(state.devWrap);
 	root.appendChild(buildBoardFooter());
+	state.devToolbarHolder.appendChild(buildDevicesToolbar());
 	rebuildDevicesPage();
 	return root;
 }
@@ -2663,7 +2671,6 @@ function rebuildDevicesPage() {
 		wrap.appendChild(E('div', { 'class': 'alert-message warning', 'style': 'margin-bottom:1em' }, [
 			_('State is DRIFT — the page is read-only until the router re-syncs (keepalive repairs this automatically within ~10 s).')
 		]));
-	wrap.appendChild(buildDevicesToolbar());
 
 	if (Object.keys(t.selected).length)
 		wrap.appendChild(buildBulkBar());

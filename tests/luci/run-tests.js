@@ -1741,6 +1741,8 @@ scenario('D1 devices table build (#48)', 'board47.uci', async (wg, tag) => {
 	assertEq(tag + ' phone icon (43)', iconsIn(m01).join(' '), 'wg-type wg-type-phone');
 	assertEq(tag + ' pc icon (43)', iconsIn(m02).join(' '), 'wg-type wg-type-pc');
 	assertEq(tag + ' unassigned guest keeps its CLI icon', iconsIn(m99).join(' '), 'wg-type wg-type-phone');
+	ok(tag + ' type icons are size-constrained in CSS (an unsized svg fills the td)',
+		wg.BOARD_CSS.indexOf('.wg-type svg { display:inline; vertical-align:-.12em; width:1.2em; height:1.2em; }') !== -1);
 });
 
 scenario('D2 sorting (#48)', 'board47.uci', async (wg, tag) => {
@@ -2034,6 +2036,25 @@ scenario('D13 60-device render (pagination probe, #48)', 'board47.uci', async (w
 	wg.rebuildDevicesPage();
 	assertEq(tag + ' MAC search still works at scale', findDevRows(r.root).length, 1);
 	wg.setFilter('');
+});
+
+scenario('D14 search keeps focus across rebuilds (#48 fix)', 'board47.uci', async (wg, tag) => {
+	cannedBoard47();
+	const r = await renderDevices47(wg);
+	/* the toolbar lives OUTSIDE the rebuilt container: replacing the
+	 * input on every debounced keystroke dropped the focus after the
+	 * first character (owner report, v1.8.0) */
+	const search = findByWg(r.root, 'dev-search');
+	ok(tag + ' toolbar outside the table rebuild', wg.state.devToolbarHolder && wg.state.devToolbarHolder.children.length === 1);
+	search.value = 'work';
+	search.listeners['input'][0]();
+	await new Promise(function(res) { setTimeout(res, 250); }); /* the 200ms debounce */
+	assertEq(tag + ' filter applied after the debounce', wg.state.filter, 'work');
+	assertEq(tag + ' table narrowed', findDevRows(r.root).length, 1);
+	ok(tag + ' the SAME input node is still mounted (focus intact)',
+		findByWg(r.root, 'dev-search') === search);
+	wg.setFilter('');
+	wg.rebuildDevicesPage();
 });
 
 async function demo() {
