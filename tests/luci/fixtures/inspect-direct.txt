@@ -1,0 +1,9 @@
+device	work-pc
+mac	aa:bb:cc:dd:ee:02
+name	work-pc
+ip	192.168.88.58
+online	1
+group	work
+slot	direct	mark=100	table=400	prio=8000	configured=vpn	live=wg0
+set	mac_work	member
+rule	mangle	wg:work:mark	handle=12

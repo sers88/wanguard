@@ -339,6 +339,18 @@ const RPC = {
 
 const cannedExec = (cmd, args, stdout) => { RPC.canned['exec:' + cmd + ':' + args.join(' ')] = { stdout }; };
 
+/* canned diagnostics outputs (#50): the #44/#45 CLI answers on top of
+ * the lb2 fixture set (list/devices/grouplist/dump/leases already there) */
+function cannedDiag() {
+	cannedLb2();
+	RPC.canned['exec:/usr/bin/wanguard:syncstatus'] = { stdout: fixture('syncstatus.txt') };
+	RPC.canned['exec:/usr/bin/wanguard:events 20'] = { stdout: fixture('events.txt') };
+	RPC.canned['exec:/usr/bin/wanguard:diag health'] = { stdout: fixture('diag-health.txt') };
+	RPC.canned['exec:/usr/bin/wanguard:diag rules'] = { stdout: fixture('diag-rules.txt') };
+	RPC.canned['exec:/usr/bin/wanguard:diag tables'] = { stdout: fixture('diag-tables.txt') };
+	RPC.canned['exec:/usr/bin/wanguard:diag nft'] = { stdout: fixture('diag-nft.txt') };
+}
+
 function mkOption(cls, name, title, desc) {
 	return {
 		__cls: cls, option: name, title, description: desc,
@@ -429,8 +441,36 @@ const L = {
 L.url = function(p) { return '/' + p; };
 global.location = { href: '' };
 const _ = (s) => s;
-const documentStub = { querySelector() { return null; }, querySelectorAll() { return []; } };
+/* document stub (#50): createElement + a backed body for the diag-report
+ * download (diagSaveFile) and the copy fallback; _downloads records the
+ * synthetic <a download> clicks for assertions. The stub elements have
+ * no select() and document has no execCommand, so the degraded copy
+ * path still reports an honest failure (D11 semantics unchanged). */
+const documentStub = {
+	querySelector() { return null; }, querySelectorAll() { return []; },
+	_downloads: [],
+	createElement(tag) {
+		const el = E(tag);
+		el.click = function() {
+			documentStub._downloads.push({
+				href: el.href != null ? el.href : (el.attrs.href || ''),
+				download: el.download != null ? el.download : (el.attrs.download || '')
+			});
+		};
+		return el;
+	},
+	body: { appendChild() {}, removeChild() {} }
+};
 const windowStub = {};
+/* URL stub (#50): diagSaveFile downloads via Blob + createObjectURL;
+ * the recorded calls back the download assertions */
+const URLStub = {
+	_objects: [],
+	_revoked: [],
+	createObjectURL(blob) { this._objects.push(blob); return 'blob:fake-' + this._objects.length; },
+	revokeObjectURL(u) { this._revoked.push(u); },
+	reset() { this._objects.length = 0; this._revoked.length = 0; }
+};
 /* navigator stub (#48 D11): copyText reads navigator.clipboard — empty
  * by default (the http:// router case), filled per test for the
  * secure-context path */
@@ -448,9 +488,9 @@ const localStorageStub = {
  * real loader, core.js must yield a LuCI class -> return the INSTANCE. */
 function loadCore() {
 	const fn = new Function(
-		'rpc', 'uci', 'ui', 'form', 'poll', 'E', 'L', '_', 'document', 'window', 'localStorage', 'navigator',
+		'rpc', 'uci', 'ui', 'form', 'poll', 'E', 'L', '_', 'document', 'window', 'localStorage', 'navigator', 'URL',
 		CORE_SRC);
-	const C = fn(RPC, UCI, ui, form, poll, E, L, _, documentStub, windowStub, localStorageStub, NAV);
+	const C = fn(RPC, UCI, ui, form, poll, E, L, _, documentStub, windowStub, localStorageStub, NAV, URLStub);
 	if (typeof C !== 'function')
 		throw new Error('core.js must yield a LuCI class (L.Class.extend)');
 	return new C();
@@ -458,9 +498,9 @@ function loadCore() {
 
 function loadView(name, wg) {
 	const fn = new Function(
-		'view', 'form', 'poll', 'rpc', 'uci', 'ui', 'E', 'L', '_', 'document', 'window', 'localStorage', 'wg',
+		'view', 'form', 'poll', 'rpc', 'uci', 'ui', 'E', 'L', '_', 'document', 'window', 'localStorage', 'wg', 'URL',
 		VIEW_SRC[name]);
-	return fn(view, form, poll, RPC, UCI, ui, E, L, _, documentStub, windowStub, localStorageStub, wg);
+	return fn(view, form, poll, RPC, UCI, ui, E, L, _, documentStub, windowStub, localStorageStub, wg, URLStub);
 }
 
 /* ---------- check harness ---------- */
@@ -515,6 +555,8 @@ function scenario(name, fixtureName, fn) {
 		global.location.href = '';
 		ui._modal = null;
 		ui._notes = [];
+		documentStub._downloads.length = 0; /* #50 download assertions */
+		URLStub.reset();
 		for (const k in NAV)
 			delete NAV[k];
 		const wg = loadCore();
@@ -1990,9 +2032,9 @@ scenario('D11 copy buttons (#48)', 'board47.uci', async (wg, tag) => {
 		(n.children || []).forEach(walk);
 	})(dr);
 	assertEq(tag + ' IP + MAC copy rows', copyBtns.length, 2);
-	/* no navigator.clipboard (the http:// router case) -> the document
-	 * stub has no createElement either -> honest failure toast, never
-	 * an exception */
+	/* no navigator.clipboard (the http:// router case) -> the execCommand
+	 * fallback runs, but the stub has no select()/execCommand -> an
+	 * honest failure toast, never an exception */
 	copyBtns[0].listeners['click'][0]();
 	ok(tag + ' degraded copy reports failure',
 		(ui._notes || []).some(function(n) { return n[1].indexOf('Copy failed') !== -1; }));
@@ -2055,6 +2097,336 @@ scenario('D14 search keeps focus across rebuilds (#48 fix)', 'board47.uci', asyn
 		findByWg(r.root, 'dev-search') === search);
 	wg.setFilter('');
 	wg.rebuildDevicesPage();
+});
+
+/* ======== #50 Diagnostics page (GN1–GN23; parsers over the #44/#45 TAB
+ * grammar, the four status cards + DRIFT coloring, old-CLI degradation,
+ * the lazy dump tabs + copy + highlight, the event feed, service health,
+ * the inspect flow and the diag-report download) ==== */
+
+async function renderDiag(wg) {
+	const dv = loadView('diagnostics', wg);
+	await dv.load();
+	const root = await dv.render();
+	return { dv: dv, root: root };
+}
+
+function diagCards(wg) {
+	return wg.state.diagHolders.cards.children;
+}
+
+function cardPill(card) {
+	let out = null;
+	(function walk(n) {
+		if (out || !n || typeof n !== 'object')
+			return;
+		if (n.attrs && n.attrs['data-pill']) {
+			out = n;
+			return;
+		}
+		(n.children || []).forEach(walk);
+	})(card);
+	return out;
+}
+
+function collectHl(root) {
+	const out = [];
+	(function walk(n) {
+		if (!n || typeof n !== 'object')
+			return;
+		if (n.attrs && (n.attrs.class || '').indexOf('wg-hl') !== -1)
+			out.push(n);
+		(n.children || []).forEach(walk);
+	})(root);
+	return out;
+}
+
+scenario('GN1 parseSyncstatus (#50)', null, async (wg, tag) => {
+	const ok1 = wg.parseSyncstatus(fixture('syncstatus.txt'));
+	ok(tag + ' in-sync parsed', ok1 && ok1.status === 'in-sync');
+	assertEq(tag + ' last_apply int', ok1.lastApply, 1761921600);
+	assertEq(tag + ' age int', ok1.ageSec, 3);
+	const dr = wg.parseSyncstatus(fixture('syncstatus-drift.txt'));
+	assertEq(tag + ' drift verdict', dr.status, 'drift');
+	assertEq(tag + ' old CLI / garbage -> null', wg.parseSyncstatus('nonsense'), null);
+});
+
+scenario('GN2 parseEvents (#50)', null, async (wg, tag) => {
+	const evs = wg.parseEvents(fixture('events.txt'));
+	assertEq(tag + ' eight rows', evs.length, 8);
+	assertEq(tag + ' first row fields', JSON.stringify([ evs[0].ts, evs[0].code, evs[0].detail ]),
+		JSON.stringify([ 1761921590, 'apply_ok', 'applied' ]));
+	assertEq(tag + ' garbage skipped', wg.parseEvents('junk\nno\ttabs\n').length, 0);
+	assertEq(tag + ' empty ring -> empty', wg.parseEvents('').length, 0);
+});
+
+scenario('GN3 eventView mapping (#50)', null, async (wg, tag) => {
+	assertEq(tag + ' applied -> synchronized', wg.eventView({ ts: 1, code: 'apply_ok', detail: 'applied' }).text, 'Rules synchronized');
+	assertEq(tag + ' heartbeat -> in-sync text', wg.eventView({ ts: 1, code: 'apply_ok', detail: 'in-sync' }).text, 'In-sync heartbeat');
+	assertEq(tag + ' validated ok', wg.eventView({ ts: 1, code: 'config_validated', detail: '' }).icon, 'ok');
+	assertEq(tag + ' drift error', wg.eventView({ ts: 1, code: 'drift', detail: 'x' }).icon, 'error');
+	assertEq(tag + ' failover warn', wg.eventView({ ts: 1, code: 'failover', detail: 'm>w2' }).icon, 'warn');
+	assertEq(tag + ' lbover warn', wg.eventView({ ts: 1, code: 'lbover', detail: 'lb:w2>w1' }).icon, 'warn');
+	assertEq(tag + ' unknown code falls back warn', wg.eventView({ ts: 1, code: 'wat', detail: '?' }).icon, 'warn');
+});
+
+scenario('GN4 event time format (#50)', null, async (wg, tag) => {
+	const d = new Date(1761921590 * 1000);
+	const p2 = (n) => (n < 10 ? '0' : '') + n;
+	assertEq(tag + ' local HH:MM:SS', wg.formatEventTime(1761921590),
+		p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds()));
+});
+
+scenario('GN5 formatAge (#50)', null, async (wg, tag) => {
+	assertEq(tag + ' seconds', wg.formatAge(3), '3 seconds ago');
+	assertEq(tag + ' minutes (floor)', wg.formatAge(120), '2 minutes ago');
+	assertEq(tag + ' hours', wg.formatAge(7200), '2 hours ago');
+	assertEq(tag + ' unknown', wg.formatAge(null), 'unknown');
+});
+
+scenario('GN6 parseDiagHealth (#50)', null, async (wg, tag) => {
+	const h = wg.parseDiagHealth(fixture('diag-health.txt'));
+	ok(tag + ' parsed', !!h);
+	assertEq(tag + ' wanguard running', h.wanguard, 'running');
+	assertEq(tag + ' mihomo running', h.mihomo, 'running');
+	assertEq(tag + ' config valid', h.config, 'valid');
+	assertEq(tag + ' version stamp', h.version, '1.8.1');
+	const bad = wg.parseDiagHealth(fixture('diag-health-bad.txt'));
+	assertEq(tag + ' mihomo stopped', bad.mihomo, 'stopped');
+	assertEq(tag + ' config invalid', bad.config, 'invalid');
+	assertEq(tag + ' warning kept', bad.warnings.join('|'), 'group media references missing iface wan9');
+	assertEq(tag + ' old CLI -> null', wg.parseDiagHealth(''), null);
+});
+
+scenario('GN7 parseDiag sections (#50)', null, async (wg, tag) => {
+	const secs = wg.parseDiag(fixture('diag-tables.txt'));
+	assertEq(tag + ' one section', Object.keys(secs).join(','), 'tables');
+	assertEq(tag + ' six rows', secs.tables.length, 6);
+	ok(tag + ' verbatim line shape', secs.tables[1].indexOf('route\ta\t') === 0, secs.tables[1]);
+	const two = wg.parseDiag('section\trules\n0: lookup\nsection\tnft\ntable {}');
+	assertEq(tag + ' two sections', Object.keys(two).sort().join(','), 'nft,rules');
+});
+
+scenario('GN8 parseGrouplistFull (#50)', null, async (wg, tag) => {
+	const rows = wg.parseGrouplistFull(fixture('grouplist.txt'));
+	assertEq(tag + ' three rows (header + lb-only filter gone)', rows.length, 3);
+	assertEq(tag + ' direct row', JSON.stringify([ rows[0].group, rows[0].type, rows[0].iface, rows[0].mark, rows[0].table ]),
+		JSON.stringify([ 'a', 'direct', 'wan3', 100, 400 ]));
+	assertEq(tag + ' lb slots', rows.slice(1).map(function(r) { return r.mark; }).join(','), '200,400');
+	const px = wg.parseGrouplistFull('mihomo   proxy    -          300   500   Meta           2');
+	assertEq(tag + ' proxy row keeps the - iface', px[0].iface, '-');
+});
+
+scenario('GN9 parseInspect (#50)', null, async (wg, tag) => {
+	const r = wg.parseInspect(fixture('inspect-lb.txt'));
+	ok(tag + ' parsed', !!r);
+	assertEq(tag + ' group', r.group, 'lb');
+	assertEq(tag + ' two slots', r.slots.length, 2);
+	assertEq(tag + ' slot0 kv fields', JSON.stringify([ r.slots[0].type, r.slots[0].mark, r.slots[0].table, r.slots[0].configured, r.slots[0].member, r.slots[0].live ]),
+		JSON.stringify([ 'direct-lb', 200, 401, 'wan1', 'wan1', 'eth0' ]));
+	assertEq(tag + ' slot1 live down', r.slots[1].live, 'down');
+	assertEq(tag + ' set membership', JSON.stringify([ r.set.name, r.set.state ]), JSON.stringify([ 'mac_lb', 'member' ]));
+	assertEq(tag + ' rule handle', r.rules[0].handle, '25');
+	const u = wg.parseInspect(fixture('inspect-unreg.txt'));
+	assertEq(tag + ' unregistered group -', u.group, '-');
+	ok(tag + ' note kept', u.note.indexOf('not registered') !== -1);
+	assertEq(tag + ' empty output -> null (cannot resolve / old CLI)', wg.parseInspect(''), null);
+});
+
+scenario('GN10 status cards in-sync (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	const r = await renderDiag(wg);
+	const cards = diagCards(wg);
+	assertEq(tag + ' four cards', cards.length, 4);
+	let p = cardPill(cards[0]);
+	assertEq(tag + ' Configuration pill', JSON.stringify([ p.attrs['data-pill'], flat(p) ]), JSON.stringify([ 'ok', 'In sync' ]));
+	p = cardPill(cards[1]);
+	assertEq(tag + ' Routing rules pill', flat(p), 'Applied');
+	p = cardPill(cards[2]);
+	assertEq(tag + ' Mihomo pill', flat(p), 'Running');
+	p = cardPill(cards[3]);
+	assertEq(tag + ' sync age pill', flat(p), '3 seconds ago');
+	ok(tag + ' Refresh button', !!findByWg(r.root, 'diag-refresh'));
+	ok(tag + ' Download report button', !!findByWg(r.root, 'diag-download'));
+});
+
+scenario('GN11 DRIFT colors the cards (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	RPC.canned['exec:/usr/bin/wanguard:syncstatus'] = { stdout: fixture('syncstatus-drift.txt') };
+	await renderDiag(wg);
+	const cards = diagCards(wg);
+	let p = cardPill(cards[0]);
+	assertEq(tag + ' Configuration DRIFT error pill', JSON.stringify([ p.attrs['data-pill'], flat(p) ]), JSON.stringify([ 'error', 'DRIFT' ]));
+	ok(tag + ' card painted red', cards[0].attrs['class'].indexOf('wg-dcard-bad') !== -1);
+	p = cardPill(cards[1]);
+	assertEq(tag + ' Routing rules Out of sync', flat(p), 'Out of sync');
+});
+
+scenario('GN12 old CLI degrades without exceptions (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedLb2(); /* no syncstatus/events/diag answers — the pre-#44 CLI */
+	const r = await renderDiag(wg);
+	ok(tag + ' page still renders', !!findByWg(r.root, 'diag-cards'));
+	assertEq(tag + ' four unavailable cards', diagCards(wg).length, 4);
+	const txt = flat(wg.state.diagHolders.cards);
+	assertEq(tag + ' unavailable pill count', (txt.match(/Unavailable/g) || []).length, 4);
+	ok(tag + ' summary plate says update', flat(wg.state.diagHolders.routing).indexOf('update the wanguard package') !== -1);
+	ok(tag + ' events panel says update', flat(wg.state.diagHolders.events).indexOf('update the wanguard package') !== -1);
+	ok(tag + ' health panel says update', flat(wg.state.diagHolders.health).indexOf('update the wanguard package') !== -1);
+	ok(tag + ' inspect input present (usable regardless)', !!findByWg(r.root, 'diag-inspect'));
+});
+
+scenario('GN13 summary table (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	await renderDiag(wg);
+	const t = findByWg(wg.state.diagHolders.routing, 'diag-summary');
+	ok(tag + ' summary table present', !!t);
+	assertEq(tag + ' header + three grouplist rows', t.children.length, 4);
+	const row0 = t.children[1].children;
+	assertEq(tag + ' route cell', flat(row0[0]), 'a');
+	assertEq(tag + ' type cell (no proto -> WAN)', flat(row0[1]), 'WAN');
+	assertEq(tag + ' table cell', flat(row0[2]), '400');
+	assertEq(tag + ' mark rendered hex (prototype form)', flat(row0[3]), '0x64');
+	ok(tag + ' state pill Applied', flat(row0[4]).indexOf('Applied') !== -1);
+	ok(tag + ' lb slot rows carry member line', flat(t.children[2]).indexOf('→ wan1') !== -1 && flat(t.children[3]).indexOf('→ wan2') !== -1);
+	ok(tag + ' honesty plate', flat(wg.state.diagHolders.routing).indexOf('not a live connectivity test') !== -1);
+});
+
+scenario('GN14 event feed (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	await renderDiag(wg);
+	const box = findByWg(wg.state.diagHolders.events, 'diag-events');
+	ok(tag + ' feed present', !!box);
+	assertEq(tag + ' eight rows', box.children.length, 8);
+	assertEq(tag + ' newest first', box.children[0].children[0].children[0], wg.formatEventTime(1761922700));
+	ok(tag + ' ok icon class', box.children.some(function(row) {
+		return (row.children[1].attrs.class || '').indexOf('wg-ev-ok') !== -1;
+	}));
+	RPC.canned['exec:/usr/bin/wanguard:events 20'] = { stdout: '' };
+	await wg.diagnosticsLoad();
+	wg.rebuildDiagnosticsPage();
+	ok(tag + ' empty ring -> empty-state', flat(wg.state.diagHolders.events).indexOf('No events yet') !== -1);
+});
+
+scenario('GN15 service health panel (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	await renderDiag(wg);
+	const txt = flat(wg.state.diagHolders.health);
+	ok(tag + ' wanguard row', txt.indexOf('Wanguard') !== -1 && txt.indexOf('Running') !== -1);
+	ok(tag + ' config Valid', txt.indexOf('Valid') !== -1);
+	ok(tag + ' package version row', txt.indexOf('Package') !== -1 && txt.indexOf('1.8.1') !== -1);
+	RPC.canned['exec:/usr/bin/wanguard:diag health'] = { stdout: fixture('diag-health-bad.txt') };
+	await wg.diagnosticsLoad();
+	wg.rebuildDiagnosticsPage();
+	const bad = flat(wg.state.diagHolders.health);
+	ok(tag + ' stopped mihomo named', bad.indexOf('Stopped') !== -1);
+	ok(tag + ' invalid config + warning listed', bad.indexOf('Invalid') !== -1 && bad.indexOf('missing iface wan9') !== -1);
+});
+
+scenario('GN16 dump tabs: lazy load, copy, cache (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	await renderDiag(wg);
+	ok(tag + ' summary tab active by default',
+		findByWg(wg.state.diagHolders.routing, 'diag-tab-summary').attrs['class'].indexOf('wg-tab-active') !== -1);
+	await wg.diagSetTab('nft');
+	ok(tag + ' nft pre rendered', !!findByWg(wg.state.diagHolders.routing, 'diag-pre-nft'));
+	ok(tag + ' copy button present', !!findByWg(wg.state.diagHolders.routing, 'diag-copy-nft'));
+	ok(tag + ' loaded once', wg.state.diag.loadedTabs.nft === true);
+	delete RPC.canned['exec:/usr/bin/wanguard:diag nft'];
+	await wg.diagSetTab('nft'); /* cached: no refetch, dump survives */
+	ok(tag + ' cached dump survives a canned wipe', findByWg(wg.state.diagHolders.routing, 'diag-pre-nft').children.length > 0);
+	await wg.diagSetTab('rules');
+	ok(tag + ' rules tab renders', !!findByWg(wg.state.diagHolders.routing, 'diag-pre-rules'));
+	await wg.diagSetTab('summary');
+	ok(tag + ' back to summary', !!findByWg(wg.state.diagHolders.routing, 'diag-summary'));
+});
+
+scenario('GN17 View matching rules highlights (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	await renderDiag(wg);
+	await wg.diagViewRules('a');
+	assertEq(tag + ' switched to nft', wg.state.diag.activeTab, 'nft');
+	assertEq(tag + ' highlight group set', wg.state.diag.highlightGroup, 'a');
+	const hl = collectHl(wg.state.diagHolders.routing);
+	assertEq(tag + ' both wg:a: lines highlighted', hl.length, 2);
+	ok(tag + ' highlighted lines carry the tag', hl.every(function(n) { return flat(n).indexOf('wg:a:') !== -1; }));
+});
+
+scenario('GN18 inspect flow (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	RPC.canned['exec:/usr/bin/wanguard:inspect aa:bb:cc:dd:ee:55'] = { stdout: fixture('inspect-lb.txt') };
+	await renderDiag(wg);
+	ok(tag + ' hint before a query', flat(wg.state.diagHolders.inspectResults).indexOf('Type a device name') !== -1);
+	await wg.diagInspect('aa:bb:cc:dd:ee:55');
+	const res = flat(wg.state.diagHolders.inspectResults);
+	ok(tag + ' group row', res.indexOf('Group') !== -1 && res.indexOf('lb') !== -1);
+	ok(tag + ' configured vs live rows', res.indexOf('Configured route') !== -1 && res.indexOf('Interface (live)') !== -1);
+	ok(tag + ' down slot divergence named', res.indexOf('configured vs live differ') !== -1);
+	ok(tag + ' routing table row', res.indexOf('Routing table') !== -1 && res.indexOf('401') !== -1);
+	ok(tag + ' View matching rules button', !!findByWg(wg.state.diagHolders.inspectResults, 'diag-viewrules'));
+	ok(tag + ' advanced details block', !!findByWg(wg.state.diagHolders.inspectResults, 'diag-advanced'));
+	ok(tag + ' raw facts in advanced', flat(findByWg(wg.state.diagHolders.inspectResults, 'diag-advanced')).indexOf('member=wan1') !== -1);
+});
+
+scenario('GN19 inspect: unregistered + not found (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	RPC.canned['exec:/usr/bin/wanguard:inspect 192.168.1.99'] = { stdout: fixture('inspect-unreg.txt') };
+	RPC.canned['exec:/usr/bin/wanguard:inspect ghost'] = { stdout: '', stderr: 'cannot resolve', code: 1 };
+	await renderDiag(wg);
+	await wg.diagInspect('192.168.1.99');
+	const res = flat(wg.state.diagHolders.inspectResults);
+	ok(tag + ' outside-the-groups is a valid answer', res.indexOf('Not registered') !== -1);
+	ok(tag + ' no view-rules button for the unregistered', !findByWg(wg.state.diagHolders.inspectResults, 'diag-viewrules'));
+	await wg.diagInspect('ghost');
+	ok(tag + ' unresolved -> inline not-found (no exception)',
+		flat(wg.state.diagHolders.inspectResults).indexOf('Device not found') !== -1);
+	await wg.diagInspect('');
+	ok(tag + ' cleared query -> hint again', flat(wg.state.diagHolders.inspectResults).indexOf('Type a device name') !== -1);
+});
+
+scenario('GN20 download report (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	RPC.canned['exec:/usr/bin/wanguard:diag-report'] = { stdout: '# wanguard diag-report\ngenerated\t2026-11-01 12:00:00\nsync\tin-sync\n' };
+	await renderDiag(wg);
+	await wg.diagDownloadReport();
+	assertEq(tag + ' one blob created', URLStub._objects.length, 1);
+	assertEq(tag + ' download filename', /^wanguard-diag-report-.*\.txt$/.test(documentStub._downloads[0].download), true);
+	assertEq(tag + ' blob href', documentStub._downloads[0].href, 'blob:fake-1');
+	RPC.canned['exec:/usr/bin/wanguard:diag-report'] = { stdout: '' };
+	await wg.diagDownloadReport();
+	ok(tag + ' old CLI / empty report -> toast',
+		(ui._notes || []).some(function(n) { return n[0] === 'error' && n[1].indexOf('Report unavailable') !== -1; }));
+});
+
+scenario('GN21 availability probe (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	await wg.diagnosticsLoad();
+	assertEq(tag + ' syncstatus answered -> available', wg.state.diag.available, true);
+	cannedLb2();
+	await wg.diagnosticsLoad();
+	assertEq(tag + ' silence -> unavailable', wg.state.diag.available, false);
+});
+
+scenario('GN22 sync age drifts forward (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	await wg.diagnosticsLoad();
+	assertEq(tag + ' fresh age from the CLI', wg.diagSyncAge(), 3);
+	wg.state.diag.sync.fetchedAt = Date.now() - 10500; /* polled 10.5 s ago */
+	assertEq(tag + ' recomputed on the render path', wg.diagSyncAge(), 13);
+});
+
+scenario('GN23 view wiring (#50)', 'lb2.uci', async (wg, tag) => {
+	cannedDiag();
+	const r = await renderDiag(wg);
+	ok(tag + ' BOARD_CSS mounted', r.root.children.some(function(c) {
+		return c.tag === 'style' && flat(c).indexOf('.wg-dcard') !== -1;
+	}));
+	ok(tag + ' status pill node registered', !!wg.state.statusNode);
+	ok(tag + ' page inside the view', !!findByWg(r.root, 'diag-refresh'));
+	ok(tag + ' inspect input static across rebuilds', (function() {
+		const input = findByWg(r.root, 'diag-inspect');
+		wg.rebuildDiagnosticsPage();
+		return findByWg(r.root, 'diag-inspect') === input;
+	})());
 });
 
 async function demo() {

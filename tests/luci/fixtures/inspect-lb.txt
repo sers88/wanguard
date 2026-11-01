@@ -1,0 +1,10 @@
+device	aa:bb:cc:dd:ee:55
+mac	aa:bb:cc:dd:ee:55
+name	client
+ip	192.168.1.55
+online	1
+group	lb
+slot	direct-lb	mark=200	table=401	prio=8001	configured=wan1	member=wan1	live=eth0
+slot	direct-lb	mark=400	table=402	prio=8002	configured=wan2	member=wan2	live=down
+set	mac_lb	member
+rule	mangle	wg:lb:mark	handle=25

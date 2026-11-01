@@ -1,0 +1,5 @@
+section	health
+service	wanguard	running
+service	mihomo	running
+config	valid
+version	1.8.1

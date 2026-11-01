@@ -1,0 +1,8 @@
+1761921590	apply_ok	applied
+1761921591	config_validated	group media references missing iface wan9
+1761921595	apply_ok	in-sync
+1761922000	drift	mac_work: live differs from desired
+1761922400	restored	apply repaired the drift
+1761922500	flush	flush:work>wan1(192.168.1.55)
+1761922600	failover	media>wan2
+1761922700	lbover	lb:wan2>wan1

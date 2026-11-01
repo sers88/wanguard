@@ -48,7 +48,12 @@ incident post-mortems, boot order).
 card opens a "Move to" menu (touch fallback). DRIFT switches the board to
 read-only until keepalive re-syncs the state. A table view remains for bulk
 edits. **Devices** / **Groups & Routes** — the same grids standalone;
-**Diagnostics** — a read-only sync summary.
+**Diagnostics** — read-only status over the #44/#45 data plane: four
+live status cards (Configuration / Routing rules / Mihomo / Last sync),
+routing-state tabs (Summary + verbatim IP rules / tables / nftables
+dumps, copyable), the event feed, service health, a device inspector
+(group → configured vs live route → matching nft rules) and a
+`diag-report` download. Old CLIs degrade to "unavailable" panels.
 
 ## Installation
 

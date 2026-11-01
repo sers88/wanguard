@@ -117,7 +117,22 @@ var state = {
 	footerNode: null,    /* overview footer bar node (#47) */
 	leasePanel: null,    /* DHCP lease-add panel node (#47) */
 	statusCompact: false, /* overview header shows the short sync pill (#47) */
-	saveHost: null      /* view providing handleSaveApply (lease panel, #46) */
+	saveHost: null,      /* view providing handleSaveApply (lease panel, #46) */
+	diag: {              /* Diagnostics page session state (#50) */
+		available: null,  /* syncstatus answered -> the #44/#45 CLI is live */
+		sync: null,       /* parseSyncstatus: { status, lastApply, ageSec, fetchedAt } */
+		events: null,     /* parseEvents: [{ ts, code, detail }] */
+		health: null,     /* parseDiagHealth: { wanguard, mihomo, config, warnings, version } */
+		grouplist: [],    /* parseGrouplistFull: every grouplist row (all types) */
+		dumps: {},        /* diag section -> [verbatim lines] | null (unavailable) */
+		busyDump: {},     /* diag section -> true while the exec is in flight */
+		loadedTabs: {},   /* diag section -> fetched once (Refresh refetches) */
+		activeTab: 'summary',
+		inspect: { q: '', busy: false, failed: false, result: null },
+		highlightGroup: '', /* nft-tab highlight group (View matching rules) */
+		reportBusy: false
+	},
+	diagHolders: null    /* static page nodes, set by buildDiagnosticsPage (#50) */
 };
 
 function normalizeMac(s) {
@@ -475,6 +490,36 @@ var BOARD_CSS = [
 	".wg-copyrow { display:flex; align-items:center; gap:.5em; flex-wrap:wrap; }",
 	".wg-copy { background:none; border:1px solid rgba(128,128,128,.4); border-radius:3px; cursor:pointer; font-size:.78em; padding:.05em .5em; opacity:.7; color:inherit; }",
 	".wg-copy:hover { opacity:1; }",
+	"/* #50: Diagnostics page */",
+	".wg-diag-head { display:flex; justify-content:space-between; align-items:flex-start; gap:1em; flex-wrap:wrap; }",
+	".wg-diag-actions { display:flex; gap:.6em; flex-wrap:wrap; flex-shrink:0; }",
+	".wg-diag-cards { display:flex; gap:.75em; flex-wrap:wrap; margin:.9em 0; }",
+	".wg-dcard { flex:1 1 11em; min-width:10.5em; background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.3); border-radius:6px; padding:.65em .85em; }",
+	".wg-dcard-bad { border-color:#d9534f; }",
+	".wg-dcard-title { font-size:.8em; opacity:.6; margin-bottom:.3em; }",
+	".wg-dcard-value { font-weight:bold; display:flex; align-items:center; gap:.45em; }",
+	".wg-diag-grid { display:flex; gap:.75em; align-items:flex-start; flex-wrap:wrap; }",
+	".wg-diag-col { flex:1 1 24em; min-width:22em; display:flex; flex-direction:column; gap:.75em; }",
+	".wg-dpanel { background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.3); border-radius:6px; padding:.75em .9em; }",
+	".wg-dpanel h3 { margin:0 0 .5em; font-size:1.05em; }",
+	".wg-pre { font-family:monospace,monospace; font-size:.82em; background:rgba(128,128,128,.08); border:1px solid rgba(128,128,128,.22); border-radius:4px; padding:.6em; max-height:22em; overflow:auto; white-space:pre; margin:0; }",
+	".wg-pre-s { max-height:14em; margin-top:.4em; }",
+	".wg-hl { background:rgba(250,204,21,.4); border-radius:2px; }",
+	".wg-ev-scroll { max-height:17em; overflow-y:auto; }",
+	".wg-ev { display:flex; gap:.6em; align-items:baseline; padding:.32em 0; border-bottom:1px solid rgba(128,128,128,.1); font-size:.9em; }",
+	".wg-ev:last-child { border-bottom:none; }",
+	".wg-ev-time { opacity:.6; font-variant-numeric:tabular-nums; white-space:nowrap; }",
+	".wg-ev-ok { color:#22c55e; }",
+	".wg-ev-warn { color:#ea580c; }",
+	".wg-ev-error { color:#d9534f; }",
+	".wg-drow { display:flex; justify-content:space-between; gap:1em; padding:.35em 0; border-bottom:1px solid rgba(128,128,128,.1); font-size:.92em; }",
+	".wg-drow:last-child { border-bottom:none; }",
+	".wg-drow-label { opacity:.6; white-space:nowrap; }",
+	".wg-drow-val { font-weight:bold; text-align:right; overflow-wrap:anywhere; }",
+	".wg-dpill { display:inline-flex; align-items:center; gap:.4em; }",
+	".wg-unavail { opacity:.55; font-style:italic; }",
+	".wg-adv { margin-top:.7em; }",
+	".wg-adv summary { cursor:pointer; opacity:.7; }",
 	"@media (max-width:640px) { .wg-drawer { width:100%; max-width:100%; } }"
 ].join('\n');
 
@@ -2698,6 +2743,860 @@ function reloadDevicesPage() {
 	return load().then(rebuildDevicesPage);
 }
 
+/* ---------- Diagnostics page (#50; data plane = CLI #44/#45) ----------
+ *
+ * Read-only page over `wanguard syncstatus|events|diag|inspect|
+ * diag-report` (docs/spike-ucode/wand.uc, TAB grammar). The only RPC is
+ * the file.exec on /usr/bin/wanguard the ACL already grants — no new
+ * rpcd surface. An old CLI (empty/malformed stdout, missing subcommand)
+ * degrades to per-panel "unavailable" states; nothing throws.
+ *
+ * Poll contract (the thin view wires it): the light set (syncstatus,
+ * events, diag health, grouplist) refreshes every 15 s — that is what
+ * the status cards, the event feed and Service health read. The heavy
+ * dumps (rules/tables/nft) are SNAPSHOTS loaded on tab open / Refresh —
+ * a 15 s refetch would keep resetting the reader's scroll and selection
+ * without new information (the Summary plate says exactly that). */
+
+function parseSyncstatus(out) {
+	/* status=|last_apply=|age= lines (wand.uc cmd_syncstatus); null when
+	 * the CLI predates #44 (empty/malformed output) */
+	var r = { status: '', lastApply: null, ageSec: null, fetchedAt: 0 };
+	(out || '').split('\n').forEach(function(line) {
+		var m = line.match(/^(status|last_apply|age)=(.*)$/);
+		if (!m)
+			return;
+		if (m[1] == 'status')
+			r.status = m[2];
+		else if (m[1] == 'last_apply' && /^\d+$/.test(m[2]))
+			r.lastApply = parseInt(m[2], 10);
+		else if (m[1] == 'age' && /^\d+$/.test(m[2]))
+			r.ageSec = parseInt(m[2], 10);
+	});
+	return r.status ? r : null;
+}
+
+function parseEvents(out) {
+	/* ring tail rows: ts<TAB>code<TAB>detail (#44); garbage lines are
+	 * skipped — the ring is machine-written, a foreign line is not a
+	 * rendering emergency */
+	var evs = [];
+	(out || '').split('\n').forEach(function(line) {
+		if (!line.trim())
+			return;
+		var f = line.split('\t');
+		if (f.length < 2 || !/^\d+$/.test(f[0]))
+			return;
+		evs.push({ ts: parseInt(f[0], 10), code: f[1], detail: f.slice(2).join('\t') });
+	});
+	return evs;
+}
+
+function eventView(ev) {
+	/* presentation mapping per ring code: icon class + human text.
+	 * ok = healthy lifecycle (apply/validate/repair/flush/failback),
+	 * warn = a guardrail tripped (failover, LB overflow),
+	 * error = state or apply is broken (drift, apply_err) */
+	var map = {
+		apply_ok:         [ 'ok', (ev.detail == 'applied') ? _('Rules synchronized') : _('In-sync heartbeat') ],
+		config_validated: [ 'ok', _('Configuration validated') ],
+		restored:         [ 'ok', _('Drift repaired') ],
+		flush:            [ 'ok', _('Flows flushed: %s').format(ev.detail) ],
+		failback:         [ 'ok', _('Failback: %s').format(ev.detail) ],
+		failover:         [ 'warn', _('Failover: %s').format(ev.detail) ],
+		lbover:           [ 'warn', _('LB overflow: %s').format(ev.detail) ],
+		drift:            [ 'error', _('Drift detected: %s').format(ev.detail) ],
+		apply_err:        [ 'error', _('Apply error: %s').format(ev.detail) ]
+	};
+	var v = map[ev.code];
+	if (!v)
+		v = [ 'warn', '%s: %s'.format(ev.code, ev.detail) ];
+	return { icon: v[0], text: v[1] };
+}
+
+function formatEventTime(ts) {
+	/* local HH:MM:SS for a ring unix-ts (padded manually — the %d of
+	 * String.format eats the leading zero) */
+	var d = new Date(ts * 1000);
+	var p2 = function(n) { return (n < 10 ? '0' : '') + n; };
+	return p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+}
+
+function parseDiagHealth(out) {
+	/* `diag health` rows (wand.uc diag_health); null on old CLIs */
+	var h = null;
+	var ensure = function() {
+		if (!h)
+			h = { wanguard: 'unknown', mihomo: 'unknown', config: '', warnings: [], version: '' };
+		return h;
+	};
+	(out || '').split('\n').forEach(function(line) {
+		if (!line.trim())
+			return;
+		var f = line.split('\t');
+		if (f[0] == 'service' && f[1])
+			ensure()[f[1]] = f[2] || 'unknown';
+		else if (f[0] == 'config')
+			ensure().config = f[1] || '';
+		else if (f[0] == 'warning')
+			ensure().warnings.push(f.slice(1).join('\t'));
+		else if (f[0] == 'version')
+			ensure().version = f[1] || '';
+	});
+	return h;
+}
+
+function parseDiag(out) {
+	/* split diag output on `section\t<name>` headers into
+	 * { name: [verbatim lines] } — the dump lines keep their original
+	 * (nft-indented) shape; blank lines are dropped for display */
+	var sections = {};
+	var cur = null;
+	(out || '').split('\n').forEach(function(line) {
+		var f = line.split('\t');
+		if (f[0] == 'section' && f[1]) {
+			cur = (sections[f[1]] = sections[f[1]] || []);
+			return;
+		}
+		if (cur && line.trim())
+			cur.push(line);
+	});
+	return sections;
+}
+
+function parseGrouplistFull(out) {
+	/* ALL `wanguard grouplist` rows for the Diagnostics summary (#50):
+	 * direct/direct-lb/proxy, one row per LB slot. The #40 parseGrouplist
+	 * (direct-lb only -> state.LB_GROUPLIST) stays byte-untouched. */
+	var rows = [];
+	(out || '').split('\n').forEach(function(line) {
+		var f = line.trim().split(/\s+/);
+		if (f.length < 7 || f[0] == 'GROUP')
+			return;
+		rows.push({
+			group: f[0], type: f[1], iface: f[2],
+			mark: parseInt(f[3], 10), table: parseInt(f[4], 10),
+			device: f[5], members: f[6]
+		});
+	});
+	return rows;
+}
+
+function parseInspect(out) {
+	/* `inspect` rows -> structured result (wand.uc cmd_inspect); null on
+	 * empty output = the unresolvable-query contract answer (rc 1) or an
+	 * old CLI. slot sub-fields are key=value TABs, member= is optional. */
+	var r = null;
+	var ensure = function() {
+		if (!r)
+			r = { device: '', mac: '', name: '', ip: '', online: false,
+				group: '', note: '', slots: [], set: null, rules: [] };
+		return r;
+	};
+	(out || '').split('\n').forEach(function(line) {
+		if (!line.trim())
+			return;
+		var f = line.split('\t');
+		var h = ensure();
+		if (f[0] == 'device')
+			h.device = f[1] || '';
+		else if (f[0] == 'mac')
+			h.mac = f[1] || '';
+		else if (f[0] == 'name')
+			h.name = f[1] || '';
+		else if (f[0] == 'ip')
+			h.ip = f[1] || '';
+		else if (f[0] == 'online')
+			h.online = (f[1] == '1');
+		else if (f[0] == 'group')
+			h.group = f[1] || '';
+		else if (f[0] == 'note')
+			h.note = f.slice(1).join('\t');
+		else if (f[0] == 'slot') {
+			var s = { type: f[1] || '', mark: null, table: null, prio: null,
+				configured: '', member: '', live: '' };
+			f.slice(2).forEach(function(kv) {
+				var i = kv.indexOf('=');
+				if (i == -1)
+					return;
+				var k = kv.slice(0, i), v = kv.slice(i + 1);
+				if (k == 'mark' || k == 'table' || k == 'prio')
+					s[k] = parseInt(v, 10);
+				else
+					s[k] = v;
+			});
+			h.slots.push(s);
+		}
+		else if (f[0] == 'set')
+			h.set = { name: f[1] || '', state: f[2] || '' };
+		else if (f[0] == 'rule')
+			h.rules.push({ chain: f[1] || '', tag: f[2] || '',
+				handle: (f[3] || '').replace(/^handle=/, '') });
+	});
+	return r;
+}
+
+function formatAge(sec) {
+	/* "3 seconds ago" style for the Last-successful-sync card */
+	if (sec == null || isNaN(sec))
+		return _('unknown');
+	if (sec < 60)
+		return _('%d seconds ago').format(sec);
+	if (sec < 3600)
+		return _('%d minutes ago').format(Math.floor(sec / 60));
+	if (sec < 86400)
+		return _('%d hours ago').format(Math.floor(sec / 3600));
+	return _('%d days ago').format(Math.floor(sec / 86400));
+}
+
+function diagSyncAge() {
+	/* live age: the polled ageSec drifts forward between polls */
+	var s = state.diag.sync;
+	if (!s || s.ageSec == null)
+		return null;
+	var drift = Math.max(0, Math.floor((Date.now() - (s.fetchedAt || Date.now())) / 1000));
+	return s.ageSec + drift;
+}
+
+function diagnosticsLoad() {
+	/* the light poll set: syncstatus + events + diag health + grouplist
+	 * (one exec each). Empty/failed answers -> null data -> "unavailable"
+	 * panels; syncstatus is the availability probe. */
+	return Promise.all([
+		callWanguard('/usr/bin/wanguard', [ 'syncstatus' ]).catch(function() { return null; }),
+		callWanguard('/usr/bin/wanguard', [ 'events', '20' ]).catch(function() { return null; }),
+		callWanguard('/usr/bin/wanguard', [ 'diag', 'health' ]).catch(function() { return null; }),
+		callWanguard('/usr/bin/wanguard', [ 'grouplist' ]).catch(function() { return null; })
+	]).then(function(data) {
+		state.diag.sync = parseSyncstatus((data[0] && data[0].stdout) || '');
+		if (state.diag.sync)
+			state.diag.sync.fetchedAt = Date.now();
+		state.diag.events = parseEvents((data[1] && data[1].stdout) || '');
+		state.diag.health = parseDiagHealth((data[2] && data[2].stdout) || '');
+		state.diag.grouplist = parseGrouplistFull((data[3] && data[3].stdout) || '');
+		state.diag.available = (state.diag.sync != null);
+	});
+}
+
+function diagFetchSection(sec) {
+	/* one diag section (rules|tables|nft) -> verbatim lines; a failed or
+	 * empty answer stores null (the tab renders "unavailable"). Loaded
+	 * once per session; Refresh refetches what is on the page. */
+	if (state.diag.busyDump[sec])
+		return Promise.resolve();
+	state.diag.busyDump[sec] = true;
+	rebuildDiagnosticsPage();
+	return callWanguard('/usr/bin/wanguard', [ 'diag', sec ]).then(function(res) {
+		var sections = parseDiag((res && res.stdout) || '');
+		state.diag.dumps[sec] = sections[sec] || null;
+		state.diag.loadedTabs[sec] = true;
+		state.diag.busyDump[sec] = false;
+		rebuildDiagnosticsPage();
+	}).catch(function() {
+		state.diag.dumps[sec] = null;
+		state.diag.loadedTabs[sec] = true;
+		state.diag.busyDump[sec] = false;
+		rebuildDiagnosticsPage();
+	});
+}
+
+function diagSetTab(tab) {
+	/* tab switch: the heavy sections load lazily on first open */
+	state.diag.activeTab = tab;
+	if ((tab == 'rules' || tab == 'tables' || tab == 'nft') && !state.diag.loadedTabs[tab])
+		return diagFetchSection(tab);
+	rebuildDiagnosticsPage();
+	return Promise.resolve();
+}
+
+function diagViewRules(group) {
+	/* Inspect -> nftables tab with the group's wg:<group>: rules
+	 * highlighted (the applied-state proof for that device) */
+	state.diag.highlightGroup = group || '';
+	state.diag.activeTab = 'nft';
+	if (!state.diag.loadedTabs.nft)
+		return diagFetchSection('nft');
+	rebuildDiagnosticsPage();
+	return Promise.resolve();
+}
+
+function diagInspect(q) {
+	/* `wanguard inspect <q>`; unparseable/failed output -> failed=true —
+	 * the "not found" inline state is a valid contract answer, not an
+	 * exception path */
+	q = (q == null) ? '' : ('' + q);
+	state.diag.inspect.q = q;
+	if (!q.trim()) {
+		state.diag.inspect.result = null;
+		state.diag.inspect.failed = false;
+		rebuildDiagnosticsPage();
+		return Promise.resolve();
+	}
+	state.diag.inspect.busy = true;
+	rebuildDiagnosticsPage();
+	return callWanguard('/usr/bin/wanguard', [ 'inspect', q.trim() ]).then(function(res) {
+		state.diag.inspect.busy = false;
+		var r = parseInspect((res && res.stdout) || '');
+		state.diag.inspect.result = r;
+		state.diag.inspect.failed = !r;
+		rebuildDiagnosticsPage();
+	}).catch(function() {
+		state.diag.inspect.busy = false;
+		state.diag.inspect.result = null;
+		state.diag.inspect.failed = true;
+		rebuildDiagnosticsPage();
+	});
+}
+
+function diagnosticsRefresh() {
+	/* the Refresh button: the light set + every opened dump + a running
+	 * inspect query — everything the page has shown, fresh */
+	var jobs = [ diagnosticsLoad() ];
+	[ 'rules', 'tables', 'nft' ].forEach(function(sec) {
+		if (state.diag.loadedTabs[sec])
+			jobs.push(diagFetchSection(sec));
+	});
+	if (state.diag.inspect.q.trim())
+		jobs.push(diagInspect(state.diag.inspect.q));
+	return Promise.all(jobs).then(function() {
+		rebuildDiagnosticsPage();
+	});
+}
+
+function diagSaveFile(text) {
+	/* Blob + a[download]: no secure-context requirement, so this works
+	 * on the router's http:// LuCI; every failure degrades to a toast
+	 * with the SSH fallback (never throws) */
+	try {
+		if (typeof Blob != 'function' || typeof URL == 'undefined' ||
+			typeof URL.createObjectURL != 'function')
+			throw new Error('no blob support');
+		var blob = new Blob([ text ], { type: 'text/plain' });
+		var url = URL.createObjectURL(blob);
+		var a = document.createElement('a');
+		a.href = url;
+		a.download = 'wanguard-diag-report-' +
+			new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19) + '.txt';
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		if (typeof setTimeout == 'function')
+			setTimeout(function() {
+				try { URL.revokeObjectURL(url); } catch (e) { /* gone already */ }
+			}, 5000);
+		return true;
+	}
+	catch (e) {
+		ui.addNotification(null, E('p', {},
+			_('Download failed — fetch the report over SSH: wanguard diag-report')), 'error');
+		return false;
+	}
+}
+
+function diagDownloadReport() {
+	/* "Download report": diag-report (the #45 one-shot) as a file */
+	if (state.diag.reportBusy)
+		return Promise.resolve();
+	state.diag.reportBusy = true;
+	rebuildDiagnosticsPage();
+	return callWanguard('/usr/bin/wanguard', [ 'diag-report' ]).then(function(res) {
+		state.diag.reportBusy = false;
+		var text = (res && res.stdout) || '';
+		if (!text.trim()) {
+			ui.addNotification(null, E('p', {},
+				_('Report unavailable — update the wanguard package (old CLI).')), 'error');
+			rebuildDiagnosticsPage();
+			return;
+		}
+		diagSaveFile(text);
+		rebuildDiagnosticsPage();
+	}).catch(function() {
+		state.diag.reportBusy = false;
+		ui.addNotification(null, E('p', {},
+			_('Report failed — try again or fetch it over SSH.')), 'error');
+		rebuildDiagnosticsPage();
+	});
+}
+
+/* ---------- Diagnostics page builders (#50) ---------- */
+
+var DIAG_TABS = [
+	[ 'summary', 'Summary' ],
+	[ 'rules', 'IP rules' ],
+	[ 'tables', 'Routing tables' ],
+	[ 'nft', 'nftables' ]
+];
+
+function diagPillNode(kind, text) {
+	var color = { ok: '#22c55e', warn: '#ea580c', error: '#d9534f', muted: '#999' }[kind] || '#999';
+	return E('span', { 'class': 'wg-dpill', 'data-pill': kind }, [
+		E('span', { 'class': 'wg-dot', 'style': 'background:%s'.format(color) }, []),
+		text
+	]);
+}
+
+function diagSyncVerdict() {
+	/* the shared in-sync/DRIFT verdict (Configuration card, Routing
+	 * rules card, Summary State column) — from syncstatus, the live
+	 * probe; the header pill stays on `wanguard list` (unchanged) */
+	var s = state.diag.sync;
+	if (!state.diag.available || !s)
+		return { kind: 'muted', text: _('Unavailable') };
+	if (s.status == 'drift')
+		return { kind: 'error', text: 'DRIFT' };
+	if (s.status == 'in-sync')
+		return { kind: 'ok', text: _('In sync') };
+	return { kind: 'muted', text: s.status || _('unknown') };
+}
+
+function diagRowState(mutedText) {
+	/* verdict -> the Applied / Out of sync wording (cards and rows) */
+	var v = diagSyncVerdict();
+	if (v.kind == 'ok')
+		return { kind: 'ok', text: _('Applied') };
+	if (v.kind == 'error')
+		return { kind: 'error', text: _('Out of sync') };
+	return { kind: 'muted', text: mutedText };
+}
+
+function diagStatusCard(title, state2) {
+	return E('div', { 'class': 'wg-dcard' + (state2.kind == 'error' ? ' wg-dcard-bad' : '') }, [
+		E('div', { 'class': 'wg-dcard-title' }, [ title ]),
+		E('div', { 'class': 'wg-dcard-value' }, [ diagPillNode(state2.kind, state2.text) ])
+	]);
+}
+
+function diagTypeCell(row) {
+	/* WAN vs VPN via the netifd proto (wireguard = VPN — the #47 rule);
+	 * grouplist has no proto, the dump does */
+	if (row.type == 'proxy')
+		return _('Proxy');
+	if (row.type == 'direct-lb')
+		return 'LB';
+	var proto = state.ifaceProto[row.iface] || '';
+	return (proto == 'wireguard') ? 'VPN' : 'WAN';
+}
+
+function diagMarkText(mark) {
+	/* the prototype renders marks as hex: 100 -> 0x64 */
+	return (mark != null && !isNaN(mark)) ? '0x' + mark.toString(16) : '—';
+}
+
+function diagLbWeight(row) {
+	/* best-effort weight for an LB slot row — the client-side #40 math
+	 * (staged config) matched onto the applied slot by mark; '' when the
+	 * two diverge (honest: no invented numbers) */
+	try {
+		var slots = (lbSlotMap()[row.group] || {}).slots || [];
+		for (var i = 0; i < slots.length; i++)
+			if (slots[i].mark == row.mark)
+				return ' · %d%%'.format(slots[i].b);
+	}
+	catch (e) { /* degrade silently */ }
+	return '';
+}
+
+function diagSummaryNode() {
+	var wrap = E('div', {});
+	var rows = state.diag.grouplist || [];
+	if (!state.diag.available) {
+		wrap.appendChild(E('div', { 'class': 'wg-unavail' }, [
+			_('Routing data unavailable — update the wanguard package (diag needs CLI #45).')
+		]));
+		return wrap;
+	}
+	if (!rows.length) {
+		wrap.appendChild(E('div', { 'class': 'wg-unavail' }, [
+			_('No routed groups (wanguard grouplist is empty).')
+		]));
+		return wrap;
+	}
+	var st = diagRowState(_('—'));
+	var t = E('table', { 'class': 'wg-dtable', 'data-wg': 'diag-summary' });
+	t.appendChild(E('tr', {}, [ 'Route', 'Type', 'Table', 'Mark', 'State' ].map(function(hh) {
+		return E('th', {}, [ _(hh) ]);
+	})));
+	rows.forEach(function(r) {
+		var routeCell;
+		if (r.type == 'direct-lb') {
+			/* one row per slot (issue #50): member + weight under the name */
+			routeCell = E('div', {}, [
+				E('div', {}, [ r.group ]),
+				E('div', { 'class': 'wg-slots' }, [ '→ %s%s'.format(r.iface, diagLbWeight(r)) ])
+			]);
+		}
+		else
+			routeCell = E('div', {}, [ r.group ]);
+		t.appendChild(E('tr', {}, [
+			E('td', {}, [ routeCell ]),
+			E('td', {}, [ diagTypeCell(r) ]),
+			E('td', {}, [ String(r.table) ]),
+			E('td', {}, [ diagMarkText(r.mark) ]),
+			E('td', {}, [ diagPillNode(st.kind, st.text) ])
+		]));
+	});
+	wrap.appendChild(t);
+	wrap.appendChild(E('div', { 'class': 'wg-hint' }, [
+		_('Configuration matches the last applied ruleset. This is not a live connectivity test.')
+	]));
+	return wrap;
+}
+
+function diagPreNode(sec) {
+	/* a diag dump tab: monospace, scrollable, copyable; nft lines carrying
+	 * the highlighted group's wg:<group>: tags get the yellow mark */
+	var wrap = E('div', {});
+	if (state.diag.busyDump[sec]) {
+		wrap.appendChild(E('div', { 'class': 'wg-unavail' }, [ _('Loading…') ]));
+		return wrap;
+	}
+	var lines = state.diag.dumps[sec];
+	if (lines == null) {
+		wrap.appendChild(E('div', { 'class': 'wg-unavail' }, [
+			_('Section unavailable — update the wanguard package (diag needs CLI #45).')
+		]));
+		return wrap;
+	}
+	var hl = (sec == 'nft') ? state.diag.highlightGroup : '';
+	var kids = [];
+	lines.forEach(function(line, i) {
+		if (i)
+			kids.push('\n');
+		if (hl && line.indexOf('wg:' + hl + ':') != -1)
+			kids.push(E('span', { 'class': 'wg-hl' }, [ line ]));
+		else
+			kids.push(line);
+	});
+	wrap.appendChild(E('div', { 'class': 'wg-copyrow', 'style': 'justify-content:flex-end;margin-bottom:.35em' }, [
+		E('button', {
+			'class': 'wg-copy', 'data-wg': 'diag-copy-' + sec,
+			'title': _('Copy'), 'aria-label': _('Copy'),
+			'click': function() { copyText(lines.join('\n')); }
+		}, [ _('Copy') ])
+	]));
+	wrap.appendChild(E('pre', { 'class': 'wg-pre', 'data-wg': 'diag-pre-' + sec },
+		kids.length ? kids : [ _('(empty)') ]));
+	return wrap;
+}
+
+function diagHealthRow(label, kind, text) {
+	return E('div', { 'class': 'wg-drow' }, [
+		E('span', { 'class': 'wg-drow-label' }, [ label ]),
+		E('span', { 'class': 'wg-drow-val' }, [ diagPillNode(kind, text) ])
+	]);
+}
+
+function rebuildDiagCards() {
+	var h = state.diagHolders;
+	if (!h)
+		return;
+	var v = diagSyncVerdict();
+	var rules = diagRowState(_('Unavailable'));
+	var mh = state.diag.health;
+	var mihomo;
+	if (!state.diag.available || !mh)
+		mihomo = { kind: 'muted', text: _('Unavailable') };
+	else if (mh.mihomo == 'running')
+		mihomo = { kind: 'ok', text: _('Running') };
+	else if (mh.mihomo == 'stopped')
+		mihomo = { kind: 'error', text: _('Stopped') };
+	else
+		mihomo = { kind: 'muted', text: mh.mihomo || _('unknown') };
+	var syncCard;
+	if (!state.diag.available || !state.diag.sync)
+		syncCard = { kind: 'muted', text: _('Unavailable') };
+	else if (state.diag.sync.lastApply == null)
+		syncCard = { kind: 'muted', text: _('Never') };
+	else
+		syncCard = { kind: 'ok', text: formatAge(diagSyncAge()) };
+
+	h.cards.innerHTML = '';
+	[
+		diagStatusCard(_('Configuration'), v),
+		diagStatusCard(_('Routing rules'), rules),
+		diagStatusCard(_('Mihomo'), mihomo),
+		diagStatusCard(_('Last successful sync'), syncCard)
+	].forEach(function(c) { h.cards.appendChild(c); });
+}
+
+function rebuildDiagRouting() {
+	var h = state.diagHolders;
+	if (!h)
+		return;
+	var panel = E('div', { 'class': 'wg-dpanel' });
+	panel.appendChild(E('h3', {}, [ _('Routing state') ]));
+	var tabs = E('div', { 'class': 'wg-tabs', 'role': 'tablist' });
+	DIAG_TABS.forEach(function(t) {
+		tabs.appendChild(E('button', {
+			'class': 'wg-tab' + (state.diag.activeTab == t[0] ? ' wg-tab-active' : ''),
+			'role': 'tab', 'data-wg': 'diag-tab-' + t[0],
+			'aria-selected': (state.diag.activeTab == t[0]) ? 'true' : 'false',
+			'click': function() { diagSetTab(t[0]); }
+		}, [ _(t[1]) ]));
+	});
+	panel.appendChild(tabs);
+	panel.appendChild(state.diag.activeTab == 'summary'
+		? diagSummaryNode()
+		: diagPreNode(state.diag.activeTab));
+	h.routing.innerHTML = '';
+	h.routing.appendChild(panel);
+}
+
+function rebuildDiagEvents() {
+	var h = state.diagHolders;
+	if (!h)
+		return;
+	var panel = E('div', { 'class': 'wg-dpanel' });
+	panel.appendChild(E('h3', {}, [ _('Recent events') ]));
+	if (!state.diag.available) {
+		panel.appendChild(E('div', { 'class': 'wg-unavail' }, [
+			_('Event feed unavailable — update the wanguard package (events needs CLI #44).')
+		]));
+	}
+	else {
+		var evs = (state.diag.events || []).slice().reverse(); /* newest first */
+		if (!evs.length) {
+			panel.appendChild(E('div', { 'class': 'wg-empty' }, [
+				_('No events yet — apply/tick events land here.')
+			]));
+		}
+		else {
+			var box = E('div', { 'class': 'wg-ev-scroll', 'data-wg': 'diag-events' });
+			evs.forEach(function(ev) {
+				var v = eventView(ev);
+				box.appendChild(E('div', { 'class': 'wg-ev' }, [
+					E('span', { 'class': 'wg-ev-time' }, [ formatEventTime(ev.ts) ]),
+					E('span', { 'class': 'wg-ev-ic wg-ev-' + v.icon }, [ '●' ]),
+					E('span', { 'class': 'wg-ev-text' }, [ v.text ])
+				]));
+			});
+			panel.appendChild(box);
+		}
+	}
+	h.events.innerHTML = '';
+	h.events.appendChild(panel);
+}
+
+function rebuildDiagHealth() {
+	var h = state.diagHolders;
+	if (!h)
+		return;
+	var panel = E('div', { 'class': 'wg-dpanel' });
+	panel.appendChild(E('h3', {}, [ _('Service health') ]));
+	var mh = state.diag.health;
+	if (!state.diag.available || !mh) {
+		panel.appendChild(E('div', { 'class': 'wg-unavail' }, [
+			_('Health data unavailable — update the wanguard package (diag needs CLI #45).')
+		]));
+	}
+	else {
+		var svcRow = function(name, label) {
+			var st = mh[name] || 'unknown';
+			return diagHealthRow(label,
+				(st == 'running') ? 'ok' : (st == 'stopped' ? 'error' : 'muted'),
+				st.charAt(0).toUpperCase() + st.slice(1));
+		};
+		panel.appendChild(svcRow('wanguard', _('Wanguard')));
+		panel.appendChild(svcRow('mihomo', _('Mihomo')));
+		panel.appendChild(diagHealthRow(_('Configuration'),
+			(mh.config == 'valid') ? 'ok' : (mh.config == 'invalid' ? 'error' : 'muted'),
+			mh.config ? (mh.config.charAt(0).toUpperCase() + mh.config.slice(1)) : _('unknown')));
+		if (mh.config == 'invalid')
+			(mh.warnings || []).forEach(function(w) {
+				panel.appendChild(E('div', { 'class': 'wg-diag-hint' }, [ '⚠ ' + w ]));
+			});
+		if (mh.version)
+			panel.appendChild(diagHealthRow(_('Package'), 'muted', mh.version));
+	}
+	h.health.innerHTML = '';
+	h.health.appendChild(panel);
+}
+
+function inspectRawText(r) {
+	/* the raw inspect facts for Advanced details (the same TAB grammar
+	 * the CLI prints — copyable verbatim) */
+	var lines = [ 'device\t' + r.device ];
+	if (r.mac)
+		lines.push('mac\t' + r.mac);
+	if (r.name)
+		lines.push('name\t' + r.name);
+	if (r.ip)
+		lines.push('ip\t' + r.ip);
+	lines.push('online\t' + (r.online ? '1' : '0'));
+	if (r.group)
+		lines.push('group\t' + r.group);
+	r.slots.forEach(function(s) {
+		lines.push('slot\t' + s.type +
+			'\tmark=' + (s.mark == null ? '-' : s.mark) +
+			'\ttable=' + (s.table == null ? '-' : s.table) +
+			'\tprio=' + (s.prio == null ? '-' : s.prio) +
+			'\tconfigured=' + (s.configured || '-') +
+			(s.member ? '\tmember=' + s.member : '') +
+			'\tlive=' + (s.live || 'down'));
+	});
+	if (r.set)
+		lines.push('set\t' + r.set.name + '\t' + r.set.state);
+	r.rules.forEach(function(x) {
+		lines.push('rule\t' + x.chain + '\t' + x.tag + '\thandle=' + x.handle);
+	});
+	if (r.note)
+		lines.push('note\t' + r.note);
+	return lines.join('\n');
+}
+
+function rebuildDiagInspect() {
+	var h = state.diagHolders;
+	if (!h || !h.inspectResults)
+		return;
+	var box = E('div', {});
+	var ins = state.diag.inspect;
+	if (ins.busy) {
+		box.appendChild(E('div', { 'class': 'wg-unavail' }, [ _('Resolving…') ]));
+	}
+	else if (ins.failed) {
+		box.appendChild(E('div', { 'class': 'wg-unavail' }, [
+			_('Device not found — try the name, IP or MAC exactly as the router knows it.')
+		]));
+	}
+	else if (ins.result) {
+		var r = ins.result;
+		if (r.group == '-' || !r.slots.length) {
+			/* outside the groups (valid answer) / no allocation slot */
+			box.appendChild(diagHealthRow(_('Group'), 'muted',
+				r.group == '-' ? _('Not registered') : r.group));
+			if (r.note)
+				box.appendChild(E('div', { 'class': 'wg-diag-hint' }, [ r.note ]));
+		}
+		else {
+			box.appendChild(diagHealthRow(_('Group'), 'muted', r.group));
+			var diverged = 0;
+			r.slots.forEach(function(s) {
+				var liveOk = s.live && s.live != 'down';
+				if (!liveOk)
+					diverged++;
+				box.appendChild(diagHealthRow(_('Configured route'), 'muted', s.configured || '—'));
+				box.appendChild(diagHealthRow(_('Interface (live)'), liveOk ? 'ok' : 'error', s.live || 'down'));
+				box.appendChild(diagHealthRow(_('Routing table'), 'muted',
+					(s.table != null) ? String(s.table) : '—'));
+				if (s.type == 'direct-lb' && s.member)
+					box.appendChild(diagHealthRow(_('LB member'), 'muted', s.member));
+			});
+			if (diverged)
+				box.appendChild(E('div', { 'class': 'wg-diag-hint' }, [
+					_('%d slot(s) have no live interface — configured vs live differ.').format(diverged)
+				]));
+		}
+		if (r.group && r.group != '-') {
+			box.appendChild(E('div', { 'style': 'margin-top:.6em' }, [
+				E('button', {
+					'class': 'btn cbi-button', 'data-wg': 'diag-viewrules',
+					'click': function() { diagViewRules(r.group); }
+				}, [ _('View matching rules') ])
+			]));
+		}
+		box.appendChild(E('details', { 'class': 'wg-adv', 'data-wg': 'diag-advanced' }, [
+			E('summary', {}, [ _('Advanced details') ]),
+			E('div', { 'class': 'wg-diag-hint' }, [ _('Marks, generated rules and interface data.') ]),
+			E('pre', { 'class': 'wg-pre wg-pre-s' }, [ inspectRawText(r) ])
+		]));
+	}
+	else {
+		box.appendChild(E('div', { 'class': 'wg-hint' }, [
+			_('Type a device name, IP or MAC — the live routing facts come from wanguard inspect.')
+		]));
+	}
+	h.inspectResults.innerHTML = '';
+	h.inspectResults.appendChild(box);
+}
+
+function buildDiagInspectCard() {
+	/* built ONCE (the #48 lesson): the search input must survive the
+	 * 15 s poll rebuilds mid-word — only the results holder is refilled */
+	var card = E('div', { 'class': 'wg-dpanel' });
+	card.appendChild(E('h3', {}, [ _('Inspect device') ]));
+	var input = E('input', {
+		'type': 'search', 'class': 'wg-search', 'data-wg': 'diag-inspect',
+		'placeholder': _('Search by device name, IP or MAC'),
+		'aria-label': _('Search by device name, IP or MAC'),
+		'value': state.diag.inspect.q
+	});
+	var timer = null;
+	input.addEventListener('input', function() {
+		if (typeof clearTimeout == 'function')
+			clearTimeout(timer);
+		timer = (typeof setTimeout == 'function') ? setTimeout(function() {
+			diagInspect(input.value);
+		}, 400) : null;
+	});
+	input.addEventListener('keydown', function(ev) {
+		/* Enter resolves immediately (no debounce wait) */
+		if (ev && ev.key == 'Enter' && typeof clearTimeout == 'function') {
+			clearTimeout(timer);
+			diagInspect(input.value);
+		}
+	});
+	card.appendChild(input);
+	state.diagHolders.inspectResults = E('div', { 'data-wg': 'diag-inspect-results' });
+	card.appendChild(state.diagHolders.inspectResults);
+	return card;
+}
+
+function buildDiagnosticsPage() {
+	/* static skeleton (the #48 toolbar lesson): header + action buttons,
+	 * the four panel holders and the inspect card are built once; every
+	 * rebuild only refills the holders */
+	var root = E('div', {});
+	state.diagHolders = {
+		toolbar: E('div', {}),
+		cards: E('div', { 'class': 'wg-diag-cards', 'data-wg': 'diag-cards' }),
+		routing: E('div', {}),
+		events: E('div', {}),
+		health: E('div', {}),
+		inspectResults: null
+	};
+
+	state.diagHolders.toolbar.appendChild(E('div', { 'class': 'wg-diag-head' }, [
+		E('div', { 'class': 'wg-header' }, [
+			E('h2', {}, [ _('Diagnostics') ]),
+			E('span', { 'class': 'wg-subtitle' }, [ _('Inspect applied routing rules and service health.') ])
+		]),
+		E('div', { 'class': 'wg-diag-actions' }, [
+			E('button', {
+				'class': 'btn cbi-button cbi-button-action', 'data-wg': 'diag-refresh',
+				'click': function() { diagnosticsRefresh(); }
+			}, [ _('Refresh') ]),
+			E('button', {
+				'class': 'btn cbi-button', 'data-wg': 'diag-download',
+				'click': function() { diagDownloadReport(); }
+			}, [ state.diag.reportBusy ? _('Preparing…') : _('Download report') ])
+		])
+	]));
+
+	var left = E('div', { 'class': 'wg-diag-col' }, [
+		state.diagHolders.routing, state.diagHolders.events
+	]);
+	var right = E('div', { 'class': 'wg-diag-col' }, [
+		state.diagHolders.health, buildDiagInspectCard()
+	]);
+
+	root.appendChild(state.diagHolders.toolbar);
+	root.appendChild(state.diagHolders.cards);
+	root.appendChild(E('div', { 'class': 'wg-diag-grid' }, [ left, right ]));
+
+	rebuildDiagnosticsPage();
+	return root;
+}
+
+function rebuildDiagnosticsPage() {
+	if (!state.diagHolders)
+		return;
+	rebuildDiagCards();
+	rebuildDiagRouting();
+	rebuildDiagEvents();
+	rebuildDiagHealth();
+	rebuildDiagInspect();
+}
+
 /* ---------- grid factories (issue #46) ---------- */
 
 /* groups grid (named sections: the section id IS the group name);
@@ -3039,6 +3938,27 @@ return L.Class.extend({
 	buildDevicesPage: buildDevicesPage,
 	rebuildDevicesPage: rebuildDevicesPage,
 	reloadDevicesPage: reloadDevicesPage,
+	/* #50: Diagnostics page */
+	parseSyncstatus: parseSyncstatus,
+	parseEvents: parseEvents,
+	eventView: eventView,
+	formatEventTime: formatEventTime,
+	parseDiagHealth: parseDiagHealth,
+	parseDiag: parseDiag,
+	parseGrouplistFull: parseGrouplistFull,
+	parseInspect: parseInspect,
+	formatAge: formatAge,
+	diagSyncAge: diagSyncAge,
+	diagnosticsLoad: diagnosticsLoad,
+	diagnosticsRefresh: diagnosticsRefresh,
+	diagFetchSection: diagFetchSection,
+	diagSetTab: diagSetTab,
+	diagViewRules: diagViewRules,
+	diagInspect: diagInspect,
+	diagDownloadReport: diagDownloadReport,
+	diagSaveFile: diagSaveFile,
+	buildDiagnosticsPage: buildDiagnosticsPage,
+	rebuildDiagnosticsPage: rebuildDiagnosticsPage,
 	deviceLeaseToggle: deviceLeaseToggle,
 	bulkMove: bulkMove,
 	openDeviceDrawer: openDeviceDrawer,

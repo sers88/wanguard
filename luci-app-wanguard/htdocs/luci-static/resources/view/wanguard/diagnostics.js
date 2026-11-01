@@ -1,17 +1,21 @@
-/* WAN Guard diagnostics page (issue #46) — read-only summary built from
- * the data the other pages already load (in-sync/DRIFT from `wanguard
- * list`, registered/group/unclassified counts from UCI + `wanguard
- * devices`). No new CLI calls, no editing. All logic lives in the shared
+/* WAN Guard Diagnostics page (issue #50, prototype
+ * designe/generated-image (4).png) — the four status cards
+ * (Configuration / Routing rules / Mihomo / Last successful sync), the
+ * Routing state tabs (Summary / IP rules / Routing tables / nftables),
+ * the #44 event feed, Service health, the #45 inspect-device search and
+ * the diag-report download. Read-only over `wanguard syncstatus/events/
+ * diag/inspect/diag-report` — the same single /usr/bin/wanguard exec the
+ * ACL already grants, no new rpcd surface. Old CLIs degrade to
+ * "unavailable" panels without exceptions. All logic lives in the shared
  * wanguard.core module. */
 'use strict';
 'require view';
 'require poll';
-'require uci';
 'require wanguard.core as wg';
 
 return view.extend({
 	load: function() {
-		return wg.load();
+		return Promise.all([ wg.load(), wg.diagnosticsLoad() ]);
 	},
 
 	render: function() {
@@ -22,42 +26,25 @@ return view.extend({
 		wg.state.statusNode = statusNode;
 		this._statusNode = statusNode;
 
-		this._info = E('div', { 'class': 'cbi-map' });
-		this.updateInfo();
+		var page = wg.buildDiagnosticsPage();
 
+		/* the light poll: status cards + event feed + service health
+		 * (one exec each). The heavy dumps (rules/tables/nft) stay the
+		 * snapshots loaded on tab open / Refresh — a 15 s refetch would
+		 * reset the reader's scroll and selection for no new
+		 * information; the Summary plate says exactly that. The header
+		 * pill keeps its `wanguard list` contract (parseStatus). */
 		poll.add(function() {
-			return wg.refreshStatus(self._statusNode).then(function() {
-				self.updateInfo();
-			});
+			return Promise.all([
+				wg.refreshStatus(self._statusNode),
+				wg.diagnosticsLoad()
+			]).then(wg.rebuildDiagnosticsPage);
 		}, 15);
 
-		return E([
+		return E('div', {}, [
+			E('style', { 'type': 'text/css' }, [ wg.BOARD_CSS ]),
 			statusNode,
-			this._info
+			page
 		]);
-	},
-
-	/* summary rows from already-loaded state (no extra RPC) */
-	updateInfo: function() {
-		var members = (uci.sections('wanguard', 'member') || []);
-		var known = wg.knownMacMap();
-		var unclassified = (wg.state.inventory || []).filter(function(d) {
-			return !known[d.mac];
-		}).length;
-
-		var rows = [
-			[ _('Sync state'), (wg.state.statusOk === false)
-				? _('DRIFT — keepalive repairs this automatically within ~10 s')
-				: (wg.state.statusOk === true ? _('in-sync') : _('unknown')) ],
-			[ _('Registered devices'), String(members.length) ],
-			[ _('Groups'), String((uci.sections('wanguard', 'group') || []).length) ],
-			[ _('Unclassified devices'), String(unclassified) ]
-		];
-
-		this._info.innerHTML = '';
-		this._info.appendChild(E('div', { 'class': 'cbi-map-descr' },
-			rows.map(function(r) {
-				return E('div', {}, [ E('strong', {}, [ r[0] + ': ' ]), r[1] ]);
-			})));
 	}
 });

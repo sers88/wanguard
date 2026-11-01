@@ -328,9 +328,10 @@ Properties and constraints:
   member `devtype` override (#43). Save & Apply commits UCI and runs
   `wanguard apply`
   via rpcd file-exec (ACL in acl.d). The **Devices** and **Groups &
-  Routes** pages expose the same grids standalone; **Diagnostics** is a
-  read-only summary (sync state, registered/group/unclassified counts)
-  built from already-loaded data. The browser never touches nft
+  Routes** pages expose the same grids standalone; **Diagnostics** (#50)
+  is a read-only status page over the #44/#45 data plane (status cards,
+  routing-state tabs, event feed, service health, device inspect, report
+  download — see 5.2). The browser never touches nft
   directly — only UCI + CLI apply. Online status and Unclassified come from
   `wanguard devices` (leases + ARP: static IPs are visible; the ACL was not
   extended — no router-side data). Files: `luci-app-wanguard/` (4 views +
@@ -355,6 +356,51 @@ changes pill fed by `uci.changes()` — the same source as the "Unsaved
 changes" badge; DRIFT keeps the board read-only. The former in-page
 table mode is retired: grids live on the Devices and Groups & Routes
 pages (#46).
+
+### 5.2 LuCI Diagnostics page (#50)
+
+The Diagnostics page is read-only over the #44/#45 CLI data plane —
+`wanguard syncstatus | events | diag | inspect | diag-report`, the same
+single `/usr/bin/wanguard` file-exec the ACL already grants (no new
+rpcd/ACL surface):
+
+- **Status cards** (on the 15 s poll): Configuration (In sync/DRIFT) and
+  Routing rules (Applied/Out of sync) — the `syncstatus` verdict, live
+  sets-diff; Mihomo (Running/Stopped) and the Last-successful-sync age
+  ("N seconds ago", recomputed between polls) — `diag health` +
+  `syncstatus`. DRIFT colors the cards red; the header pill keeps its
+  `wanguard list` contract.
+- **Routing state** tabs: **Summary** — one row per `wanguard grouplist`
+  row (LB = one row per slot, weight matched from the client-side #40
+  math by mark; marks hex like the prototype: 100 → 0x64) with the
+  applied/out-of-sync State column and the honesty plate ("not a live
+  connectivity test"). **IP rules / Routing tables / nftables** — verbatim
+  `diag` dumps: monospace, scrollable, copyable (execCommand fallback on
+  the http:// router). The dumps are SNAPSHOTS loaded lazily on tab open
+  / Refresh — the light poll (syncstatus/events/health/grouplist) never
+  refetches them, so the reader's scroll and selection survive.
+- **Recent events** — the #44 ring (`events 20`), newest first, ok/warn/
+  error icons per code, local HH:MM:SS, empty-state when the ring is
+  silent.
+- **Service health** — Wanguard/Mihomo procd states, config validity
+  (warnings listed when invalid) and the package build stamp.
+- **Inspect device** — name/IP/MAC search → `wanguard inspect`: group,
+  configured route vs live interface (divergence named), routing table,
+  LB members; **View matching rules** switches to the nftables tab and
+  highlights the group's `wg:<group>:` lines; Advanced details carries
+  the raw TAB facts (marks, generated rules, set membership) copyable
+  verbatim. An unresolvable query is a valid inline "not found" state,
+  not an exception.
+- **Download report** — `diag-report` as a text file (Blob + a[download],
+  no secure-context requirement on the http:// router); failures degrade
+  to a toast with the SSH fallback.
+
+An old CLI (pre-#44) answers with empty output: `syncstatus` is the
+availability probe — the page then renders per-panel "unavailable" states
+with an update-the-package hint, without exceptions. Parsers pin the TAB
+grammar (`parseSyncstatus/parseEvents/parseDiagHealth/parseDiag/
+parseGrouplistFull/parseInspect`; the #40 `parseGrouplist` contract stays
+byte-untouched) — battery GN1–GN23 in `tests/luci`.
 
 ## 6. MTU/MSS
 

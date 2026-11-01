@@ -1,0 +1,7 @@
+section	tables
+slot	a	direct	eth2	mark=100	table=400	prio=8000
+route	a	default via 10.10.0.1 dev eth2
+slot	lb	direct-lb	eth0	mark=200	table=401	prio=8001
+route	lb	default via 192.0.2.1 dev eth0
+slot	lb	direct-lb	eth1	mark=400	table=402	prio=8002
+route	lb	default via 198.51.100.1 dev eth1

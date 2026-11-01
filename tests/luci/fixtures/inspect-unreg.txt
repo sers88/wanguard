@@ -1,0 +1,7 @@
+device	192.168.1.99
+mac	aa:bb:cc:dd:ee:99
+name	guest
+ip	192.168.1.99
+online	0
+group	-
+note	not registered (use: wanguard add <mac> <group>)

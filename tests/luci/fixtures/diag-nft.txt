@@ -1,0 +1,12 @@
+section	nft
+table inet wanguard {
+	set mac_a {
+		type ifname
+		elements = { "aa:bb:cc:dd:ee:02" }
+	}
+	chain forward {
+		type filter hook forward priority 0; policy accept;
+		meta mark set 0x64 comment "wg:a:mark" counter
+		ip daddr 192.0.2.0/24 comment "wg:a:nomark" counter return
+	}
+}

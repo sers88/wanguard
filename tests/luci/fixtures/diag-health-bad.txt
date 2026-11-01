@@ -1,0 +1,6 @@
+section	health
+service	wanguard	running
+service	mihomo	stopped
+config	invalid
+warning	group media references missing iface wan9
+version	1.8.1
