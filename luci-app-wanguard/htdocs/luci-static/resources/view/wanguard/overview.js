@@ -106,7 +106,11 @@ return view.extend({
 		return root;
 	},
 
-	/* "+ Add" dropdown (#47): lease-add focus or the groups page */
+	/* "+ Add" dropdown (#47): lease-add focus or the groups page.
+	 * Close lives in a .button-row wrapper (#52): stock LuCI's Esc
+	 * handler (cancelModal on #modal_overlay, 25.12 ui.js) clicks the
+	 * first '.button-row > .btn', so the menu closes on Esc too; a
+	 * click-outside close is not a stock LuCI behavior at all. */
 	showAddMenu: function() {
 		ui.showModal(_('Add device or group'), E('div', { 'class': 'wg-menu' }, [
 			E('button', {
@@ -122,7 +126,13 @@ return view.extend({
 					ui.hideModal();
 					location.href = L.url('admin/network/wanguard/groups');
 				})
-			}, [ _('New group') ])
+			}, [ _('New group') ]),
+			E('div', { 'class': 'button-row', 'style': 'margin-top:.75em' }, [
+				E('button', {
+					'class': 'btn cbi-button',
+					'click': ui.createHandlerFn(null, function() { ui.hideModal(); })
+				}, [ _('Close') ])
+			])
 		]));
 	},
 

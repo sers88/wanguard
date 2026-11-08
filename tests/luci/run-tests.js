@@ -1300,6 +1300,28 @@ scenario('B9 Devices link / +Add / New group navigation (#20/#47/#48)', 'board47
 	ok(tag + ' + Add opens the menu', !!ui._modal);
 	const items = (ui._modal[1].children || []).filter(function(c) { return c.tag === 'button'; });
 	assertEq(tag + ' menu = Add device + New group', items.length, 2);
+	/* #52: the menu was inescapable - now a Close button lives in a
+	 * .button-row wrapper. The wrapper class is load-bearing: stock
+	 * LuCI's cancelModal (Esc on #modal_overlay, 25.12 ui.js) clicks
+	 * the first '.button-row > .btn', so Esc closes the menu too;
+	 * click-outside close is not a stock LuCI behavior. */
+	const closeRow = (function walk(nod) {
+		if (nod && nod.attrs && (nod.attrs.class || '').indexOf('button-row') !== -1)
+			return nod;
+		const kids = (nod && nod.children) || [];
+		for (let i = 0; i < kids.length; i++) {
+			const x = walk(kids[i]);
+			if (x) return x;
+		}
+		return null;
+	})(ui._modal[1]);
+	ok(tag + ' #52 Close row present', !!closeRow);
+	const rowBtns = (closeRow.children || []).filter(function(c) { return c && c.tag === 'button'; });
+	assertEq(tag + ' #52 row holds exactly one button', rowBtns.length, 1);
+	assertEq(tag + ' #52 button is Close', rowBtns[0] && flat(rowBtns[0]), 'Close');
+	rowBtns[0].listeners['click'][0]();
+	ok(tag + ' #52 Close closes the menu', ui._modal === null);
+	assertEq(tag + ' #52 Close does not navigate', global.location.href, '/admin/network/wanguard/devices');
 	items[0].listeners['click'][0]();
 	ok(tag + ' Add device focuses the lease panel', !!wg.state.leasePanel);
 	assertEq(tag + ' menu closed', ui._modal, null);
