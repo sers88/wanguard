@@ -91,6 +91,16 @@ Updates: `apk update && apk upgrade`. For files that must survive a sysupgrade,
 add them to `/etc/sysupgrade.conf` (`/usr/bin/wanguard*`,
 `/usr/share/wanguard/`, `/etc/init.d/wanguard`, `/etc/init.d/wan-watch`).
 
+**Troubleshooting — silent no-upgrade:** if `apk upgrade` skips
+`wanguard`/`luci-app-wanguard`, check `/etc/apk/world` for version pins
+(`wanguard=1.2.3-r1`) left behind by a versioned `apk add` — apk v3 obeys
+pins and silently no-ops the upgrade. Unpin by re-adding without a version
+(`apk add wanguard luci-app-wanguard`). Never install on the router with
+`apk add pkg=version`: it re-pins the world file and the next documented
+upgrade silently skips again. The same applies to hash-constraint world
+entries (`pkg><base64=`) left by the sysupgrade flow — strip them with
+`sed -i "s/><.*//" /etc/apk/world` (savepoint first).
+
 ### Deploy scripts (development)
 
 Requires ssh key access to the router:
