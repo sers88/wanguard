@@ -406,7 +406,9 @@ form.Map.prototype.section = function(cls, type, title) {
 };
 
 const view = { extend(o) { return o; } };
-const poll = { add() {} };
+/* #74: the recorded callbacks let tests fire poll ticks (views register
+ * through render; take the LAST entry = the most recent render) */
+const poll = { add(fn, iv) { poll._cbs.push(fn); }, _cbs: [] };
 const ui = {
 	_notes: [],
 	addNotification(ctx, node, sev) { this._notes.push([sev || '', flat(node)]); },
@@ -1339,6 +1341,47 @@ scenario('B9 Devices link / +Add / New group navigation (#20/#47/#48)', 'board47
 	ok(tag + ' New group tile present', !!tile);
 	tile.children[0].listeners['click'][0]();
 	assertEq(tag + ' tile -> groups page', global.location.href, '/admin/network/wanguard/groups');
+});
+
+/* #74: the DRIFT banner (built by buildBoard) used to be stale until a
+ * full reload - the overview poll refreshed state but never re-rendered.
+ * The tick now refreshes the leaf pills every time and rebuilds the
+ * board only on a verdict transition (drag&drop stays alive otherwise). */
+scenario('B10 DRIFT banner heals on a poll tick (#74)', 'board47.uci', async (wg, tag) => {
+	const findAlert = function(root) {
+		return (function walk(nod) {
+			if (nod && nod.attrs && (nod.attrs.class || '') === 'alert-message warning')
+				return nod;
+			const kids = (nod && nod.children) || [];
+			for (let i = 0; i < kids.length; i++) {
+				const x = walk(kids[i]);
+				if (x) return x;
+			}
+			return null;
+		})(root);
+	};
+	cannedBoard47();
+	poll._cbs.length = 0;
+	const r = await renderBoard47(wg);
+	const tick = poll._cbs[poll._cbs.length - 1];
+	ok(tag + ' overview registered a poll callback', typeof tick === 'function');
+	ok(tag + ' no banner while in-sync', !findAlert(r.root));
+	/* drift appears -> the next tick must insert the banner */
+	RPC.canned['exec:/usr/bin/wanguard:list'] = { stdout: 'members: 2\n\nnft: drift detected: applied != running' };
+	const before = wg.state.boardWrap.children[0];
+	await tick();
+	ok(tag + ' status flipped to DRIFT', wg.state.statusOk === false);
+	ok(tag + ' banner appears after the tick', !!findAlert(r.root));
+	ok(tag + ' board rebuilt on the transition', wg.state.boardWrap.children[0] !== before);
+	/* keepalive repairs -> the next tick must remove the banner (no F5) */
+	RPC.canned['exec:/usr/bin/wanguard:list'] = { stdout: 'members: 2\n\naa:bb:cc:dd:ee:01 home\naa:bb:cc:dd:ee:02 work\nnft: in-sync' };
+	await tick();
+	ok(tag + ' status back in-sync', wg.state.statusOk === true);
+	ok(tag + ' banner gone without a reload', !findAlert(r.root));
+	/* no verdict transition -> no rebuild (an active drag survives ticks) */
+	const stable = wg.state.boardWrap.children[0];
+	await tick();
+	ok(tag + ' no rebuild without a verdict transition', wg.state.boardWrap.children[0] === stable);
 });
 
 /* ======== #49 Groups & Routes page (G1–G10; everything above must stay

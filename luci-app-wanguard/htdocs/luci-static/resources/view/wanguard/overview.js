@@ -99,7 +99,17 @@ return view.extend({
 		poll.add(function() {
 			if (wg.state.busy)
 				return;
-			return wg.load();
+			var prev = wg.state.statusOk;
+			return wg.load().then(function() {
+				/* the leaf pills refresh every tick (#74); the board itself
+				 * rebuilds only on a verdict transition (DRIFT appears/heals,
+				 * null<->true<->false) — a tickly full rebuild would cancel an
+				 * active drag&drop of a card */
+				wg.updateStatusNode(statusNode);
+				wg.updateBoardFooter();
+				if (wg.state.statusOk !== prev)
+					wg.rebuildBoard();
+			});
 		}, 15);
 
 		wg.rebuildBoard();
