@@ -2,10 +2,10 @@
 deploy-luci.ps1 — install/update luci-app-wanguard on the router (issue #8,
 four-page layout per issue #46).
 
-Installs the five JS files (four views + shared core module), menu.d and
-acl.d, removes the retired monolith view, clears LuCI caches and restarts
-rpcd so the new menu/ACL take effect. Live /etc/config/wanguard is NOT
-touched.
+Installs the six JS files (five views incl. the #79 antidpi placeholder +
+shared core module), menu.d and acl.d, removes the retired monolith view,
+clears LuCI caches and restarts rpcd so the new menu/ACL take effect. Live
+/etc/config/wanguard is NOT touched.
 
 Usage:
   .\scripts\deploy-luci.ps1                 # 192.168.1.1
@@ -27,6 +27,7 @@ $Files = @(
     @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard\devices.js"; Dst = "/www/luci-static/resources/view/wanguard/devices.js" },
     @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard\groups.js"; Dst = "/www/luci-static/resources/view/wanguard/groups.js" },
     @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard\diagnostics.js"; Dst = "/www/luci-static/resources/view/wanguard/diagnostics.js" },
+@{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\view\wanguard\antidpi-placeholder.js"; Dst = "/www/luci-static/resources/view/wanguard/antidpi-placeholder.js" },
     @{ Src = "$Root\luci-app-wanguard\htdocs\luci-static\resources\wanguard\core.js"; Dst = "/www/luci-static/resources/wanguard/core.js" },
     @{ Src = "$Root\luci-app-wanguard\usr\share\luci\menu.d\luci-app-wanguard.json"; Dst = "/usr/share/luci/menu.d/luci-app-wanguard.json" },
     @{ Src = "$Root\luci-app-wanguard\usr\share\rpcd\acl.d\luci-app-wanguard.json"; Dst = "/usr/share/rpcd/acl.d/luci-app-wanguard.json" }

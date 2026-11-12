@@ -3,12 +3,12 @@
 /*
  * luci-app-wanguard harness (#40, re-laid out for #46): runs the REAL
  * code from luci-app-wanguard/htdocs/luci-static/resources — the shared
- * core module (wanguard/core.js) and the four file views
- * (view/wanguard/{overview,devices,groups,diagnostics}.js) — inside node
- * with stubbed LuCI globals (view/form/poll/rpc/uci/ui/E/L/_), so no
- * router, LuCI or prod backend is involved — the UCI side is loaded from
- * the handwritten fixtures/ configs (the same lab-shaped configs as the
- * ucode mock suite: witness + lb members 70/30).
+ * core module (wanguard/core.js) and the file views
+ * (view/wanguard/{overview,devices,groups,diagnostics,antidpi-placeholder}.js)
+ * — inside node with stubbed LuCI globals (view/form/poll/rpc/uci/ui/E/L/_),
+ * so no router, LuCI or prod backend is involved — the UCI side is loaded
+ * from the handwritten fixtures/ configs (the same lab-shaped configs as
+ * the ucode mock suite: witness + lb members 70/30).
  *
  * What is pinned here:
  *   - UCI slot derivation parity with the CLI allocator (wand.uc
@@ -56,7 +56,8 @@ const VIEW_SRC = {
 	overview: fs.readFileSync(path.join(VIEW_DIR, 'overview.js'), 'utf8'),
 	devices: fs.readFileSync(path.join(VIEW_DIR, 'devices.js'), 'utf8'),
 	groups: fs.readFileSync(path.join(VIEW_DIR, 'groups.js'), 'utf8'),
-	diagnostics: fs.readFileSync(path.join(VIEW_DIR, 'diagnostics.js'), 'utf8')
+	diagnostics: fs.readFileSync(path.join(VIEW_DIR, 'diagnostics.js'), 'utf8'),
+	'antidpi-placeholder': fs.readFileSync(path.join(VIEW_DIR, 'antidpi-placeholder.js'), 'utf8')
 };
 const fixture = (name) => fs.readFileSync(path.join(FIX, name), 'utf8');
 
@@ -1019,9 +1020,10 @@ scenario('L3 build.sh files', null, async (wg, tag) => {
 		'resources/view/wanguard/devices.js',
 		'resources/view/wanguard/groups.js',
 		'resources/view/wanguard/diagnostics.js',
+		'resources/view/wanguard/antidpi-placeholder.js',
 		'resources/wanguard/core.js'
 	];
-	ok(tag + ' packages the 5 new files, monolith gone',
+	ok(tag + ' packages the 6 new files, monolith gone',
 		want.every((p) => build.includes(p)) && !/resources\/view\/wanguard\.js/.test(build),
 		want.filter((p) => !build.includes(p)));
 });
@@ -1034,10 +1036,11 @@ scenario('L4 CI feed-test paths', null, async (wg, tag) => {
 		'test -f /www/luci-static/resources/view/wanguard/devices.js',
 		'test -f /www/luci-static/resources/view/wanguard/groups.js',
 		'test -f /www/luci-static/resources/view/wanguard/diagnostics.js',
+		'test -f /www/luci-static/resources/view/wanguard/antidpi-placeholder.js',
 		'test -f /www/luci-static/resources/wanguard/core.js',
 		'test ! -e /www/luci-static/resources/view/wanguard.js'
 	];
-	ok(tag + ' install-test checks the 5 files + monolith absence',
+	ok(tag + ' install-test checks the 6 files + monolith absence',
 		want.every((p) => ci.includes(p)),
 		want.filter((p) => !ci.includes(p)));
 });
@@ -1050,10 +1053,11 @@ scenario('L5 deploy script', null, async (wg, tag) => {
 		'resources\\view\\wanguard\\devices.js',
 		'resources\\view\\wanguard\\groups.js',
 		'resources\\view\\wanguard\\diagnostics.js',
+		'resources\\view\\wanguard\\antidpi-placeholder.js',
 		'resources\\wanguard\\core.js',
 		'rm -f /www/luci-static/resources/view/wanguard.js'
 	];
-	ok(tag + ' uploads the 5 files + removes the stale monolith on the router',
+	ok(tag + ' uploads the 6 files + removes the stale monolith on the router',
 		want.every((p) => deploy.includes(p)),
 		want.filter((p) => !deploy.includes(p)));
 });
@@ -1094,6 +1098,95 @@ scenario('L7 page grids (D2, amended by #47/#48)', 'lb2.uci', async (wg, tag) =>
 	await gv49.render();
 	ok(tag + ' groups page = custom #49 build (no grid Map)', gv49._map === undefined);
 	ok(tag + ' groups page mounts the tab container', !!wg.state.groupsRoot);
+});
+
+/* --- L8: #79 — Anti-DPI placeholder stub (menu merge-order contract) --- */
+scenario('L8 antidpi placeholder (#79)', null, async (wg, tag) => {
+	const menu = JSON.parse(fs.readFileSync(
+		path.join(LUCI, 'usr', 'share', 'luci', 'menu.d', 'luci-app-wanguard.json'), 'utf8'));
+	const stub = menu['admin/network/wanguard/antidpi'];
+
+	/* the stub carries its OWN acl group: dispatcher apply_tree_acls() gates
+	 * per session-ACL, and while the add-on is absent ONLY luci-app-wanguard
+	 * exists — a foreign group would hide the tab entirely (#78 discovery) */
+	ok(tag + ' stub node (view wanguard/antidpi-placeholder, order 10, own ACL group)',
+		!!stub && stub.action && stub.action.type === 'view' &&
+		stub.action.path === 'wanguard/antidpi-placeholder' &&
+		stub.order === 10 &&
+		stub.title === 'Anti-DPI placeholder' &&
+		JSON.stringify(stub.depends && stub.depends.acl) === JSON.stringify([ 'luci-app-wanguard' ]));
+
+	/* merge order = sorted menu.d FILE names; the real node lives in the
+	 * add-on's wanguard-antidpi.json which must load AFTER this package's
+	 * file so its keys win wholesale (executable probes live in the
+	 * wanguard-antidpi repo matrix; here the sort contract is pinned) */
+	ok(tag + ' file sort order: luci-app-wanguard.json < wanguard-antidpi.json (real node wins)',
+		'luci-app-wanguard.json' < 'wanguard-antidpi.json');
+
+	/* merged-menu smoke, both combinations — the add-on's real menu file as
+	 * a byte-snapshot fixture (full cross-repo guard = the #79 parity issue) */
+	const mergeFiles = function(files) {
+		const tree = {};
+		files.forEach(function(f) {
+			Object.keys(f).forEach(function(p) {
+				const spec = f[p];
+				const node = (tree[p] = tree[p] || {});
+				[ 'title', 'order', 'action', 'depends' ].forEach(function(k) {
+					if (spec[k] !== undefined)
+						node[k] = spec[k];
+				});
+			});
+		});
+		return tree;
+	};
+	const addonMenu = JSON.parse(fixture('wanguard-antidpi.menu.json'));
+
+	const only = mergeFiles([ menu ]);
+	ok(tag + ' merged w/o add-on: the tab is the placeholder',
+		only['admin/network/wanguard/antidpi'] &&
+		only['admin/network/wanguard/antidpi'].title === 'Anti-DPI placeholder' &&
+		only['admin/network/wanguard/antidpi'].order === 10 &&
+		only['admin/network/wanguard/antidpi'].action.path === 'wanguard/antidpi-placeholder');
+
+	const both = mergeFiles([ menu, addonMenu ]);
+	const real = both['admin/network/wanguard/antidpi'];
+	ok(tag + ' merged with add-on: the real node wins every contract key',
+		real.title === 'Anti-DPI' && real.order === 35 &&
+		real.action.path === 'wanguard/antidpi' &&
+		JSON.stringify(real.depends.acl) === JSON.stringify([ 'luci-app-wanguard-antidpi' ]));
+	ok(tag + ' merged with add-on: parent title/order/action still match the fixture (parentguard holds)',
+		both['admin/network/wanguard'].title === 'WAN Guard' &&
+		both['admin/network/wanguard'].order === 60 &&
+		both['admin/network/wanguard'].action.type === 'firstchild');
+
+	/* the placeholder view must never collide with the add-on's real view
+	 * file (two packages cannot own one path — apk would refuse) */
+	ok(tag + ' no view file collision (placeholder ships, antidpi.js does not)',
+		fs.existsSync(path.join(VIEW_DIR, 'antidpi-placeholder.js')) &&
+		!fs.existsSync(path.join(VIEW_DIR, 'antidpi.js')));
+
+	/* render smoke: the stub is self-contained (no core module, no poll, no
+	 * rpcd) and renders the honest inactive-tab message + README link */
+	ok(tag + ' placeholder view is self-contained (no wanguard.core, no poll)',
+		VIEW_SRC['antidpi-placeholder'].indexOf('wanguard.core') === -1 &&
+		VIEW_SRC['antidpi-placeholder'].indexOf("'require poll'") === -1);
+	const ph = loadView('antidpi-placeholder', wg);
+	const proot = await ph.render();
+	const findHref = function(n) {
+		if (n.attrs && n.attrs.href)
+			return n.attrs.href;
+		for (let i = 0; n.children && i < n.children.length; i++) {
+			const h = findHref(n.children[i]);
+			if (h)
+				return h;
+		}
+		return null;
+	};
+	ok(tag + ' placeholder renders the inactive-tab alert + install hint + README link',
+		proot.children.length === 2 &&
+		proot.children[1].className === 'alert-message warning' &&
+		flat(proot).indexOf('apk add wanguard-antidpi') !== -1 &&
+		findHref(proot) === 'https://github.com/sers88/wanguard-antidpi#readme');
 });
 
 

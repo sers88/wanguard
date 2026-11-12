@@ -76,9 +76,11 @@ pkg wanguard \
 	"ip-full nftables conntrack ucode ucode-mod-fs ucode-mod-uci ucode-mod-ubus" "$W"
 
 # ---- luci-app-wanguard ----
-# Four file views + shared core module (issue #46): the monolith
-# view/wanguard.js is RETIRED — like /usr/bin/wanguard-sh above, it must
-# never come back (CI feed-test asserts its absence).
+# Five file views + shared core module (issue #46, #79 placeholder): the
+# monolith view/wanguard.js is RETIRED — like /usr/bin/wanguard-sh above, it
+# must never come back (CI feed-test asserts its absence). The placeholder
+# view path MUST differ from the add-on's view/wanguard/antidpi.js — two
+# packages cannot own one file (#79).
 L="$work/luci-app-wanguard"
 mkdir -p "$L/www/luci-static/resources/view/wanguard" "$L/www/luci-static/resources/wanguard" \
 	"$L/usr/share/luci/menu.d" "$L/usr/share/rpcd/acl.d"
@@ -86,6 +88,7 @@ inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/overvie
 inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/devices.js"      "$L/www/luci-static/resources/view/wanguard/devices.js" 644
 inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/groups.js"       "$L/www/luci-static/resources/view/wanguard/groups.js" 644
 inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/diagnostics.js"  "$L/www/luci-static/resources/view/wanguard/diagnostics.js" 644
+inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/view/wanguard/antidpi-placeholder.js" "$L/www/luci-static/resources/view/wanguard/antidpi-placeholder.js" 644
 inst "$ROOT/luci-app-wanguard/htdocs/luci-static/resources/wanguard/core.js"              "$L/www/luci-static/resources/wanguard/core.js" 644
 inst "$ROOT/luci-app-wanguard/usr/share/luci/menu.d/luci-app-wanguard.json"  "$L/usr/share/luci/menu.d/luci-app-wanguard.json" 644
 inst "$ROOT/luci-app-wanguard/usr/share/rpcd/acl.d/luci-app-wanguard.json"   "$L/usr/share/rpcd/acl.d/luci-app-wanguard.json" 644

@@ -63,6 +63,12 @@ jobs:
   feed:
     name: Sign index, publish feed branch
     needs: build
+    # tag-only: a branch dispatch must not republish the release feed — the
+    # feed branch must keep matching the released main (same lesson as the
+    # wanguard-antidpi repo's #63: a stray dispatch once shipped 0.0.0-rN to
+    # the feed). Dev builds (0.0.0-rN) sort below any release, but the feed
+    # CONTENT would still flip until the next tag.
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,6 +121,7 @@ jobs:
   feed-test:
     name: Install test (OpenWrt 25.12.6 container)
     needs: [build, feed]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -141,6 +148,7 @@ jobs:
             test -f /www/luci-static/resources/view/wanguard/devices.js
             test -f /www/luci-static/resources/view/wanguard/groups.js
             test -f /www/luci-static/resources/view/wanguard/diagnostics.js
+            test -f /www/luci-static/resources/view/wanguard/antidpi-placeholder.js
             test -f /www/luci-static/resources/wanguard/core.js
             test ! -e /www/luci-static/resources/view/wanguard.js # retired monolith (#46) — must never come back
             test -f /usr/share/luci/menu.d/luci-app-wanguard.json
