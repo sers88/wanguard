@@ -1109,10 +1109,10 @@ scenario('L8 antidpi placeholder (#79)', null, async (wg, tag) => {
 	/* the stub carries its OWN acl group: dispatcher apply_tree_acls() gates
 	 * per session-ACL, and while the add-on is absent ONLY luci-app-wanguard
 	 * exists — a foreign group would hide the tab entirely (#78 discovery) */
-	ok(tag + ' stub node (view wanguard/antidpi-placeholder, order 10, own ACL group)',
+	ok(tag + ' stub node (view wanguard/antidpi-placeholder, order 35 = the real tab position #93, own ACL group)',
 		!!stub && stub.action && stub.action.type === 'view' &&
 		stub.action.path === 'wanguard/antidpi-placeholder' &&
-		stub.order === 10 &&
+		stub.order === 35 &&
 		stub.title === 'Anti-DPI placeholder' &&
 		JSON.stringify(stub.depends && stub.depends.acl) === JSON.stringify([ 'luci-app-wanguard' ]));
 
@@ -1145,7 +1145,7 @@ scenario('L8 antidpi placeholder (#79)', null, async (wg, tag) => {
 	ok(tag + ' merged w/o add-on: the tab is the placeholder',
 		only['admin/network/wanguard/antidpi'] &&
 		only['admin/network/wanguard/antidpi'].title === 'Anti-DPI placeholder' &&
-		only['admin/network/wanguard/antidpi'].order === 10 &&
+		only['admin/network/wanguard/antidpi'].order === 35 &&
 		only['admin/network/wanguard/antidpi'].action.path === 'wanguard/antidpi-placeholder');
 
 	const both = mergeFiles([ menu, addonMenu ]);
