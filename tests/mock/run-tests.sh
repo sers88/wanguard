@@ -7,7 +7,8 @@
 # jsonfilter/date/conntrack (tests/mock/bin). POSIX sh only (busybox ash /
 # dash); developed under WSL:  wsl -e sh tests/mock/run-tests.sh
 #
-# WARNING: wipes /tmp/wanguard (the wand state dir) — never run on a router.
+# WARNING: wipes /tmp/wanguard (the wand state dir) and writes
+# /tmp/dhcp.leases (T26) — never run on a router.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -439,6 +440,64 @@ row=$(echo "$out" | grep '^a ')
 assert_eq "T24 wanstatus shows the order" "$(echo "$row" | awk '{print $5, $6}')" "wan3 wan2"
 rowb=$(echo "$out" | grep '^b ')
 assert_eq "T24 default order shown as *" "$(echo "$rowb" | awk '{print $5}')" "*"
+
+# --- T25: LAN segment render (#113/#115): iifname set + composition tags ---
+reset_router
+add_group p1
+uci_set p1.type proxy
+export NFT_STATE=$TMP/nft.state
+export IP_STATE=$TMP/ip.state
+export WANGUARD_NFT_FILE=$ROOT/router/wanguard.nft
+rm -f "$NFT_STATE" "$IP_STATE"
+# a) default composition (no lan_device): classic iifname + bare legacy tag
+out=$(sh "$WG" apply)
+assert_contains "T25 default apply" "$out" "applied"
+line=$(sh "$MOCKBIN/nft" -a list chain inet wanguard marking | grep 'wg:p1:m300')
+assert_contains "T25 default classic iifname" "$line" 'iifname "br-lan"'
+assert_contains "T25 default bare tag" "$line" 'comment "wg:p1:m300"'
+out=$(sh "$WG" apply)
+assert_contains "T25 default in-sync" "$out" "in-sync"
+# b) three devices -> anonymous iifname set + suffixed tag (live rules re-render)
+uci delete wanguard.globals.lan_device
+uci add_list wanguard.globals.lan_device=br-lan
+uci add_list wanguard.globals.lan_device=br-lan.10
+uci add_list wanguard.globals.lan_device=br-lan.20
+out=$(sh "$WG" apply)
+assert_contains "T25 set apply" "$out" "applied"
+line=$(sh "$MOCKBIN/nft" -a list chain inet wanguard marking | grep 'wg:p1:m300')
+assert_contains "T25 brace iifname marking" "$line" 'iifname { "br-lan", "br-lan.10", "br-lan.20" }'
+assert_contains "T25 suffixed tag marking" "$line" 'wg:p1:m300:d'
+rline=$(sh "$MOCKBIN/nft" -a list chain inet wanguard redir | grep 'wg:p1:r7892')
+assert_contains "T25 brace iifname redir" "$rline" 'iifname { "br-lan", "br-lan.10", "br-lan.20" }'
+oldtags=$(sh "$MOCKBIN/nft" -a list chain inet wanguard marking | grep -c 'wg:p1:m300"')
+assert_eq "T25 bare legacy tag replaced" "${oldtags:-0}" "0"
+# c) single non-default device -> classic form, tag still suffixed
+uci delete wanguard.globals.lan_device
+uci add_list wanguard.globals.lan_device=br-lan.10
+out=$(sh "$WG" apply)
+assert_contains "T25 single apply" "$out" "applied"
+line=$(sh "$MOCKBIN/nft" -a list chain inet wanguard marking | grep 'wg:p1:m300')
+assert_contains "T25 single classic iifname" "$line" 'iifname "br-lan.10"'
+assert_contains "T25 single suffixed tag" "$line" 'wg:p1:m300:d'
+
+# --- T26: devices online across lan_device entries (#113/#115) ---
+reset_router
+uci add_list wanguard.globals.lan_device=br-lan
+uci add_list wanguard.globals.lan_device=br-lan.10
+printf '1000000000 aa:bb:cc:00:00:01 192.168.88.5 dev-a\n' > /tmp/dhcp.leases
+cat > "$TMP/arp" <<EOF
+IP address  HW type  Flags  HW address  Mask  Device
+192.168.88.5      0x1     0x2  aa:bb:cc:00:00:01  *  br-lan
+192.168.10.7      0x1     0x2  aa:bb:cc:00:00:02  *  br-lan.10
+192.168.10.8      0x1     0x2  aa:bb:cc:00:00:03  *  br-lan.99
+EOF
+out=$(WANGUARD_ARP="$TMP/arp" sh "$WG" devices)
+r1=$(echo "$out" | grep '^aa:bb:cc:00:00:01' | awk -F'\t' '{print $2, $3, $4}')
+assert_eq "T26 lease + online on br-lan" "$r1" "192.168.88.5 dev-a 1"
+r2=$(echo "$out" | grep '^aa:bb:cc:00:00:02' | awk -F'\t' '{print $2, $3, $4}')
+assert_eq "T26 arp-only online on br-lan.10" "$r2" "192.168.10.7 - 1"
+r3=$(echo "$out" | grep '^aa:bb:cc:00:00:03' | awk -F'\t' '{print $4}')
+assert_eq "T26 arp on off-list device stays offline" "${r3:-0}" "0"
 
 echo
 echo "passed: $PASS, failed: $FAIL (ticks: $T)"

@@ -45,8 +45,18 @@
 
 CONF=wanguard
 TABLE="inet wanguard"
-NFT_FILE=/usr/share/wanguard/wanguard.nft
+# test seam (#113/#115 mock suite): the skeleton path is overridable so
+# `wanguard apply` can be exercised against the stateful mock nft
+NFT_FILE=${WANGUARD_NFT_FILE:-/usr/share/wanguard/wanguard.nft}
 BR=br-lan
+# LAN segment devices (#113/#115): UCI list globals.lan_device names every L2
+# device whose clients can be group members (br-lan, br-lan.10, br-lan.20).
+# Absent list -> br-lan only: the rendered rules stay byte-identical to the
+# pre-#113 output and the rule tags keep their bare legacy form.
+LAN_DEVICES=$(uci -q get "$CONF.globals.lan_device" 2>/dev/null \
+	| tr ' ' '\n' | grep -v '^$' | awk '!seen[$0]++' | tr '\n' ' ')
+LAN_DEVICES=${LAN_DEVICES% }
+[ -n "$LAN_DEVICES" ] || LAN_DEVICES=$BR
 
 msg() { printf '%s\n' "$*"; }
 warn() { printf 'wanguard: %s\n' "$*" >&2; }
@@ -202,6 +212,29 @@ ensure_table() {
 	nft list set $TABLE local_v4 >/dev/null 2>&1 && return 0
 	nft delete table $TABLE >/dev/null 2>&1
 	nft -f "$NFT_FILE" || return 1
+}
+
+# iifname expression for the LAN client rules (#115): one device -> the
+# classic `iifname "br-lan"` (byte-identical to the pre-#113 output); several
+# devices -> an anonymous nft set:
+#   iifname { "br-lan", "br-lan.10", "br-lan.20" }
+render_lan_iif() {
+	local n=0 d
+	for d in $LAN_DEVICES; do n=$((n+1)); done
+	if [ "$n" -gt 1 ]; then
+		printf 'iifname { %s }' "$(printf '"%s", ' $LAN_DEVICES | sed 's/, $//')"
+	else
+		printf 'iifname "%s"' "$LAN_DEVICES"
+	fi
+}
+
+# rule tag suffix that depends on the device composition ("tag determines the
+# body": changing the device list must re-render already-live rules, #115).
+# The default composition (list absent -> br-lan) keeps the bare legacy tag,
+# so existing fixtures and live rules are untouched until segments appear.
+lan_tag_suffix() {
+	[ "$LAN_DEVICES" = "$BR" ] && return 0
+	printf ':d%s' "$(printf '%s\n' $LAN_DEVICES | md5sum | cut -c1-8)"
 }
 
 render_diff() { # appends add/delete element commands for one set to $TMPF
@@ -678,13 +711,13 @@ cmd_apply() {
 			# TCP is handled by the redirect rule and MUST NOT be marked —
 			# after DNAT-to-local a marked packet would be policy-routed
 			# into the TUN (postmortem issue #5)
-			printf 'marking wg:%s:m%s iifname "%s" ether saddr @mac_%s meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
-				"$g" "$m" "$BR" "$g" "$m" >> "$DRF"
-			printf 'redir wg:%s:r%s iifname "%s" ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta l4proto tcp redirect to :%s\n' \
-				"$g" "$redir" "$BR" "$g" "$redir" >> "$DRF"
+			printf 'marking wg:%s:m%s%s iifname %s ether saddr @mac_%s meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
+				"$g" "$m" "$(lan_tag_suffix)" "$(render_lan_iif)" "$g" "$m" >> "$DRF"
+			printf 'redir wg:%s:r%s%s iifname %s ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta l4proto tcp redirect to :%s\n' \
+				"$g" "$redir" "$(lan_tag_suffix)" "$(render_lan_iif)" "$g" "$redir" >> "$DRF"
 		else
-			printf 'marking wg:%s:m%s iifname "%s" ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
-				"$g" "$m" "$BR" "$g" "$m" >> "$DRF"
+			printf 'marking wg:%s:m%s%s iifname %s ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
+				"$g" "$m" "$(lan_tag_suffix)" "$(render_lan_iif)" "$g" "$m" >> "$DRF"
 		fi
 	done < "$ADF"
 
@@ -791,6 +824,7 @@ cmd_list() {
 
 cmd_grouplist() {
 	local g typ m t p ifc dev cnt
+	printf 'lan devices: %s\n' "$(printf '%s ' $LAN_DEVICES)"
 	printf '%-10s %-7s %-10s %-5s %-5s %-14s %s\n' "GROUP" "TYPE" "IFACE" "MARK" "TABLE" "DEVICE" "MEMBERS"
 	ADF=/tmp/wanguard.gl.$$
 	trap 'rm -f "$ADF"' EXIT
@@ -935,7 +969,9 @@ cmd_remove() {
 cmd_devices() { # LAN clients for the LuCI board (issue #14)
 	# prints: mac<TAB>ip<TAB>name<TAB>online — leases give name/ip, ARP gives
 	# online (complete entry). ARP-only devices (static IPs) show name "-".
-	awk -v LEASES=/tmp/dhcp.leases -v BR="$BR" '
+	# Online = ARP entry on ANY device of globals.lan_device (#113/#115).
+	# WANGUARD_ARP overrides the ARP source (mock-suite test seam).
+	awk -v LEASES=/tmp/dhcp.leases -v ARP="${WANGUARD_ARP:-/proc/net/arp}" -v DEVS="$LAN_DEVICES" '
 		function add(mac, ip, name, on) {
 			mac = tolower(mac)
 			if (mac !~ /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f]){5}$/) return
@@ -945,17 +981,19 @@ cmd_devices() { # LAN clients for the LuCI board (issue #14)
 			if (on) onm[mac] = 1
 		}
 		BEGIN {
+			m = split(DEVS, dv, /[ \t]+/)
+			for (i = 1; i <= m; i++) devs[dv[i]] = 1
 			while ((getline line < LEASES) > 0) {
 				k = split(line, f, /[ \t]+/)
 				if (k >= 4) add(f[2], f[3], (f[4] == "*" ? "-" : f[4]), 0)
 			}
 			close(LEASES)
-			while ((getline line < "/proc/net/arp") > 0) {
+			while ((getline line < ARP) > 0) {
 				k = split(line, f, /[ \t]+/)
 				# "IP address HW type Flags HW address Mask Device"; 0x2 = complete
-				if (k >= 6 && f[3] == "0x2" && f[6] == BR) add(f[4], f[1], "-", 1)
+				if (k >= 6 && f[3] == "0x2" && f[6] in devs) add(f[4], f[1], "-", 1)
 			}
-			close("/proc/net/arp")
+			close(ARP)
 			for (i = 1; i <= n; i++) {
 				mac = order[i]
 				printf "%s\t%s\t%s\t%d\n", mac,

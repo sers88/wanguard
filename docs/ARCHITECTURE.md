@@ -202,6 +202,11 @@ tables).
 config globals 'globals'
         option redir_port '7892'      # mihomo TCP-redirect (proxy group)
         list no_mark '192.0.2.10'     # never mark/redirect these
+        list lan_device 'br-lan'      # LAN client devices (#113/#115): all
+        list lan_device 'br-lan.10'   # L2 devices whose clients can be group
+        list lan_device 'br-lan.20'   # members; absent -> br-lan only (the
+                                      # single-device render and rule tags
+                                      # stay byte-identical to pre-#113)
 
 config group 'a'                      # name = [A-Za-z0-9_], referenced by members
         option type 'direct'          # direct → netifd interface

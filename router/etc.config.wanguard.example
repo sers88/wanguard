@@ -26,8 +26,14 @@ config globals 'globals'
 	# the group wan-watch health-checks and bounces (default: 'a')
 	option main_group 'a'
 	# never mark/redirect traffic to these addresses
-	# (admin channels, management endpoints — survive even a marked window)
+	# (admin channels, management endpoints - survive even a marked window)
 	list no_mark '192.0.2.10'
+	# LAN segment devices (#113/#115): every L2 device whose clients can be
+	# group members (e.g. br-lan + tagged segment bridges br-lan.10/br-lan.20).
+	# Absent -> br-lan only (legacy single-device render and rule tags).
+	# list lan_device 'br-lan'
+	# list lan_device 'br-lan.10'
+	# list lan_device 'br-lan.20'
 	# WAN watchdog probe anchors (#23): the channel counts as UP while at
 	# least `wan_reliability` of them answer (default 1 = any — DOWN only
 	# when ALL fail). Legacy single options wan_anchor1/wan_anchor2 are
