@@ -40,7 +40,13 @@ semantics are the same — the generator emits `ip daddr != @local_v4`.
 Every generated rule carries a tag-comment `wg:<group>:m<mark>` (marking) /
 `wg:<group>:r<port>` (redirect). The tag fully identifies the rule body, so
 the diff compares tags only and does not depend on nft output normalization
-(marks rendered as 0x… etc.).
+(marks rendered as 0x… etc.). The client-side match is `iifname` over the
+LAN segment devices from UCI `globals.lan_device` (#113/#115): one device
+renders the classic `iifname "br-lan"`; several render an anonymous set —
+`iifname { "br-lan", "br-lan.10", "br-lan.20" }`. Because the tag determines
+the body, a non-default device composition appends a `:d<md5-8>` suffix to
+every client-rule tag, so changing the device list re-renders already-live
+rules; the default composition (`br-lan` only) keeps the bare legacy tags.
 
 **Mark/table/prio allocation** is deterministic, driven by sorting group
 names (`config group '<name>'`, type direct|proxy):

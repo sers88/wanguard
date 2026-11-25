@@ -1,7 +1,9 @@
 #!/bin/sh
-# run-tests-ucode.sh — ucode test runner (issue #29 Phase 2; #32 stage 2;
+# run-tests-ucode.sh - ucode test runner (issue #29 Phase 2; #32 stage 2;
 # #30 stage 5): FULL port of the tests/mock/run-tests.sh checks (67 sh
-# equivalents, T1-T24) plus ucode-native extras (B1/B2, F1-F11). Runs
+# equivalents, T1-T24) plus ucode-native extras (B1/B2, F1-F11, LB/LT,
+# DT/EV/SS/DG/IN/DR) and the #113/#115 lan_device port (T25/T26 = the
+# sh-suite render + devices checks re-run against wand.uc). Runs
 # against the REAL uci (/etc/config) and the SAME PATH stubs (curl/date/
 # conntrack) as the sh suite; only ubus is intercepted differently
 # (docs/spike-ucode/mock/ubus.uc via `ucode -L`, reading the same
@@ -1430,6 +1432,91 @@ assert_eq "DR2 sanity: markers ARE planted in /etc/config/network" "$n_net" "2"
 assert_eq "DR2 report carries NO secrets" "$n_rep" "0"
 rm -f /etc/config/network
 
+rm -f /tmp/dhcp.leases
+
+echo
+echo "== #113/#115: LAN segment devices (sh-suite T25/T26 port; render mode) =="
+#
+# globals.lan_device: absent -> br-lan only (byte-identical render, bare
+# legacy rule tags); several devices -> an anonymous iifname set and a
+# :d<md5-8> composition suffix on the rule tags (tag determines the body:
+# a device-list change must re-render already-live rules).
+#
+seg_reset() { # zero render state + minimal proxy fixture (group p1)
+	rm -rf "$RSTATE" "$RIP" /tmp/.uci
+	mkdir -p "$RIP"
+	: > "$UBUS_IFACES"
+	: > "$UBUS_ADDRS"
+	printf 'default via 192.0.2.1 dev mockwan metric 10\n' > "$RIP/route.main"
+	: > "$RIP/links"
+	for d in mockwan eth0 Meta; do printf '%s\n' "$d" >> "$RIP/links"; done
+	cat > /etc/config/wanguard <<'EOF'
+config globals 'globals'
+
+config group 'p1'
+	option type 'proxy'
+EOF
+}
+
+# --- T25a: default composition (no lan_device): classic iifname + bare tag ---
+seg_reset
+out=$(rapply)
+assert_contains "T25 default apply" "$out" "applied"
+mk=$(marking | grep 'wg:p1:m300')
+assert_contains "T25 default classic iifname" "$mk" 'iifname "br-lan"'
+assert_contains "T25 default bare tag" "$mk" 'comment "wg:p1:m300"'
+assert_contains "T25 grouplist default line" "$(rcli grouplist)" "lan devices: br-lan"
+out=$(rapply)
+assert_eq "T25 default second apply: in-sync" "$out" "in-sync"
+
+# --- T25b: three devices -> anon set + suffixed tags, legacy tag replaced ---
+uci add_list wanguard.globals.lan_device='br-lan'
+uci add_list wanguard.globals.lan_device='br-lan.10'
+uci add_list wanguard.globals.lan_device='br-lan.20'
+uci commit wanguard
+out=$(rapply)
+assert_contains "T25 set apply" "$out" "applied"
+mk=$(marking | grep 'wg:p1:m300')
+assert_contains "T25 brace iifname marking" "$mk" 'iifname { "br-lan", "br-lan.10", "br-lan.20" }'
+assert_contains "T25 suffixed tag marking" "$mk" 'wg:p1:m300:d'
+rline=$(rnft -a list chain inet wanguard redir | grep 'wg:p1:r7892')
+assert_contains "T25 brace iifname redir" "$rline" 'iifname { "br-lan", "br-lan.10", "br-lan.20" }'
+assert_eq "T25 bare legacy tag replaced" "$(marking | grep -c 'comment "wg:p1:m300"')" "0"
+out=$(rapply)
+assert_eq "T25 set state second apply: in-sync" "$out" "in-sync"
+assert_contains "T25 grouplist shows the device list" "$(rcli grouplist)" "lan devices: br-lan br-lan.10 br-lan.20"
+assert_contains "T25 diag tables lan row" "$(rcli diag tables)" "$(printf 'lan\tbr-lan br-lan.10 br-lan.20')"
+
+# --- T25c: single non-default device -> classic form, tag still suffixed ---
+uci delete wanguard.globals.lan_device
+uci add_list wanguard.globals.lan_device='br-lan.10'
+uci commit wanguard
+out=$(rapply)
+assert_contains "T25 single apply" "$out" "applied"
+mk=$(marking | grep 'wg:p1:m300')
+assert_contains "T25 single classic iifname" "$mk" 'iifname "br-lan.10"'
+assert_contains "T25 single suffixed tag" "$mk" 'wg:p1:m300:d'
+
+# --- T26: devices online across lan_device entries (WANGUARD_ARP seam) ---
+seg_reset
+uci add_list wanguard.globals.lan_device='br-lan'
+uci add_list wanguard.globals.lan_device='br-lan.10'
+uci commit wanguard
+printf '1753500000 aa:bb:cc:00:00:01 192.168.88.5 dev-a\n' > /tmp/dhcp.leases
+T26ARP=$TMP/arp
+cat > "$T26ARP" <<'EOF'
+IP address  HW type  Flags  HW address  Mask  Device
+192.168.88.5      0x1     0x2  aa:bb:cc:00:00:01  *  br-lan
+192.168.10.7      0x1     0x2  aa:bb:cc:00:00:02  *  br-lan.10
+192.168.10.8      0x1     0x2  aa:bb:cc:00:00:03  *  br-lan.99
+EOF
+d26() { WANGUARD_ARP=$T26ARP ucode -L "$MOCK" "$UC" devices 2>&1 | cut -f1-4; }
+r1=$(d26 | grep '^aa:bb:cc:00:00:01')
+assert_eq "T26 lease + online on br-lan" "$(printf '%s' "$r1" | awk -F'\t' '{print $2, $3, $4}')" "192.168.88.5 dev-a 1"
+r2=$(d26 | grep '^aa:bb:cc:00:00:02')
+assert_eq "T26 arp-only online on br-lan.10" "$(printf '%s' "$r2" | awk -F'\t' '{print $2, $3, $4}')" "192.168.10.7 - 1"
+r3=$(d26 | grep '^aa:bb:cc:00:00:03')
+assert_eq "T26 arp on off-list device stays invisible" "${r3:-none}" "none"
 rm -f /tmp/dhcp.leases
 
 echo

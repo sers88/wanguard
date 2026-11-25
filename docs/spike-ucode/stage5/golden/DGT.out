@@ -7,3 +7,4 @@ route	freedom	default dev eth1
 route	freedom	default via 192.0.2.1 dev mockwan metric 10 metric 200
 slot	rostelecom	direct	down	mark=200	table=401	prio=8101
 route	rostelecom	default via 192.0.2.1 dev mockwan metric 10 metric 200
+lan	br-lan

@@ -497,7 +497,7 @@ assert_eq "T26 lease + online on br-lan" "$r1" "192.168.88.5 dev-a 1"
 r2=$(echo "$out" | grep '^aa:bb:cc:00:00:02' | awk -F'\t' '{print $2, $3, $4}')
 assert_eq "T26 arp-only online on br-lan.10" "$r2" "192.168.10.7 - 1"
 r3=$(echo "$out" | grep '^aa:bb:cc:00:00:03' | awk -F'\t' '{print $4}')
-assert_eq "T26 arp on off-list device stays offline" "${r3:-0}" "0"
+assert_eq "T26 arp on off-list device stays invisible" "${r3:-none}" "none"
 
 echo
 echo "passed: $PASS, failed: $FAIL (ticks: $T)"

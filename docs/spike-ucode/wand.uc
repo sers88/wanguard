@@ -700,6 +700,45 @@ function ensure_table() { // skeleton hallmark: the local_v4 set
 	return sh_rc(`nft -f ${NFT_FILE}`) == 0;
 }
 
+// ---------- LAN segment devices (#113/#115) ----------
+//
+// UCI list globals.lan_device names every L2 device whose clients can be
+// group members (br-lan, br-lan.10, br-lan.20). Absent list -> br-lan only:
+// the rendered rules stay byte-identical to the pre-#113 output and the
+// rule tags keep their bare legacy form (parity with the sh reference;
+// fixtures and live rules are untouched until segments appear). Names are
+// sanitized ([A-Za-z0-9][A-Za-z0-9._-]*) — they are rendered into nft rule
+// bodies AND passed to the md5sum argv below.
+
+function lan_devices() { // sanitized, deduped, list order preserved
+	let l = cursor.get(CONF, 'globals', 'lan_device');
+	let vals = (type(l) == 'array') ? l :
+		((l != null && trim('' + l) != '') ? [ '' + l ] : []);
+	let out = [], seen = {};
+	for (let d in vals) {
+		d = trim('' + d);
+		if (d == '' || match(d, /^[A-Za-z0-9][A-Za-z0-9._-]*$/) == null || (d in seen))
+			continue;
+		seen[d] = 1;
+		push(out, d);
+	}
+	return (length(out) > 0) ? out : [ BR ];
+}
+
+function lan_iif(devs) { // iifname expression for the client rules: one
+	if (length(devs) == 1)  // device -> the classic form (byte-identical to
+		return `iifname "${devs[0]}"`; // pre-#113); several -> an anonymous set
+	return `iifname { ${join(', ', map(devs, (d) => `"${d}"`))} }`;
+}
+
+function lan_tag_suffix(devs) { // rule-tag suffix that depends on the device
+	if (length(devs) == 1 && devs[0] == BR) // composition ("tag determines
+		return ''; // the body": changing the device list must re-render
+	let h = sh_read(`printf '%s\n' ${join(' ', map(devs, (d) => `'${d}'`))} | md5sum`);
+	let m = match(h, /^([0-9a-f]{8})/); // already-live rules). The DEFAULT
+	return (m != null) ? `:d${m[1]}` : ':d0'; // composition keeps the bare
+} // legacy tag (the sh reference hashes the same bytes)
+
 // ---------- direct-lb helpers (#27/#38) ----------
 
 function lb_members(g) { // sorted members [{ ifc, w }]; weights default 50
@@ -789,6 +828,7 @@ function alloc_entries() { // [{g, typ, m, t, p, ifc}] (sh alloc_lines)
 
 function desired_rules(alloc, redir) { // [{chain, tag, body}] (sh DRF)
 	let out = [];
+	let ld = lan_devices(), iif = lan_iif(ld), suf = lan_tag_suffix(ld);
 	// #27/#38: collect LB groups (marks by sorted member name) while
 	// walking the alloc; per-slot marking rules are NOT emitted for them
 	let lbg = {};
@@ -806,13 +846,13 @@ function desired_rules(alloc, redir) { // [{chain, tag, body}] (sh DRF)
 			// TCP is handled by the redirect rule and MUST NOT be marked —
 			// after DNAT-to-local a marked packet would be policy-routed
 			// into the TUN (postmortem issue #5)
-			push(out, { chain: 'marking', tag: `wg:${a.g}:m${a.m}`,
-				body: `iifname "${BR}" ether saddr @mac_${a.g} meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set ${a.m}` });
-			push(out, { chain: 'redir', tag: `wg:${a.g}:r${redir}`,
-				body: `iifname "${BR}" ether saddr @mac_${a.g} ip daddr != @local_v4 ip daddr != @no_mark meta l4proto tcp redirect to :${redir}` });
+			push(out, { chain: 'marking', tag: `wg:${a.g}:m${a.m}${suf}`,
+				body: `${iif} ether saddr @mac_${a.g} meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set ${a.m}` });
+			push(out, { chain: 'redir', tag: `wg:${a.g}:r${redir}${suf}`,
+				body: `${iif} ether saddr @mac_${a.g} ip daddr != @local_v4 ip daddr != @no_mark meta l4proto tcp redirect to :${redir}` });
 		} else {
-			push(out, { chain: 'marking', tag: `wg:${a.g}:m${a.m}`,
-				body: `iifname "${BR}" ether saddr @mac_${a.g} ip daddr != @local_v4 ip daddr != @no_mark meta mark set ${a.m}` });
+			push(out, { chain: 'marking', tag: `wg:${a.g}:m${a.m}${suf}`,
+				body: `${iif} ether saddr @mac_${a.g} ip daddr != @local_v4 ip daddr != @no_mark meta mark set ${a.m}` });
 		}
 	}
 	// #27/#38: one stick + N member rules per LB group, in group order.
@@ -827,8 +867,8 @@ function desired_rules(alloc, redir) { // [{chain, tag, body}] (sh DRF)
 		// stick: established flows follow their ct mark and skip the
 		// rest of the chain (base chain return = policy accept);
 		// counter BEFORE return (return ends the rule)
-		push(out, { chain: 'marking', tag: `wg:${g}:stick`,
-			body: `iifname "${BR}" ether saddr @mac_${g} ip daddr != @local_v4 ip daddr != @no_mark ct mark != 0 counter meta mark set ct mark return` });
+		push(out, { chain: 'marking', tag: `wg:${g}:stick${suf}`,
+			body: `${iif} ether saddr @mac_${g} ip daddr != @local_v4 ip daddr != @no_mark ct mark != 0 counter meta mark set ct mark return` });
 		// member selection: NUMGEN RANDOM cascade (mwan3's own approach:
 		// statistic random on NEW + connmark restore). LIVE LAB FINDING
 		// (spike session 1, nft 1.1.6 + the 25.12 kernel): jhash is
@@ -861,11 +901,11 @@ function desired_rules(alloc, redir) { // [{chain, tag, body}] (sh DRF)
 		let acc = 0;
 		for (let i = 0; i < length(mem); i++) {
 			let cut = acc + b[i];
-			let body = `iifname "${BR}" ether saddr @mac_${g} ip daddr != @local_v4 ip daddr != @no_mark `;
+			let body = `${iif} ether saddr @mac_${g} ip daddr != @local_v4 ip daddr != @no_mark `;
 			if (i < length(mem) - 1)
 				body += `numgen random mod 100 < ${cut} `;
 			body += `counter meta mark set ${mem[i].m} ct mark set meta mark return`;
-			push(out, { chain: 'marking', tag: `wg:${g}:s${cut}@${mem[i].m}`,
+			push(out, { chain: 'marking', tag: `wg:${g}:s${cut}@${mem[i].m}${suf}`,
 				body: body });
 			acc = cut;
 		}
@@ -1399,6 +1439,9 @@ function cmd_list() {
 }
 
 function cmd_grouplist() {
+	// #113/#115: the LAN segment devices (post-freeze delta, CLI-CONTRACT
+	// §1.1 — the header line is the one byte-visible change to this output)
+	printf('lan devices: %s\n', join(' ', lan_devices()));
 	printf('%-10s %-7s %-10s %-5s %-5s %-14s %s\n',
 		'GROUP', 'TYPE', 'IFACE', 'MARK', 'TABLE', 'DEVICE', 'MEMBERS');
 	for (let a in alloc_entries()) {
@@ -1523,14 +1566,20 @@ function lan_inventory() { // leases + ARP merge -> { order, ip, name,
 			if (length(f) >= 4)
 				add(f[1], f[2], (f[3] == '*') ? '-' : f[3], false);
 		}
-	let arp = fs.readfile('/proc/net/arp');
-	if (arp != null)
+	let arp = fs.readfile(getenv('WANGUARD_ARP') ?? '/proc/net/arp');
+	if (arp != null) {
+		// online = a complete ARP entry on ANY device of globals.lan_device
+		// (#113/#115; the env override is the mock-suite test seam)
+		let lds = {};
+		for (let d in lan_devices())
+			lds[d] = 1;
 		for (let line in split(arp, /\n/)) {
 			let f = split(line, /[ \t]+/);
 			// "IP address HW type Flags HW address Mask Device"; 0x2 = complete
-			if (length(f) >= 6 && f[2] == '0x2' && f[5] == BR)
+			if (length(f) >= 6 && f[2] == '0x2' && (f[5] in lds))
 				add(f[3], f[0], '-', true);
 		}
+	}
 	return { order: order, ip: ipm, name: nm, online: onm };
 }
 
@@ -1931,6 +1980,7 @@ function diag_tables() { // per-slot: device + the table's routes verbatim
 			if (trim(line) != '')
 				msg(`route\t${a.g}\t${line}`);
 	}
+	msg(`lan\t${join(' ', lan_devices())}`); // #113/#115: marking/redir scope
 }
 
 function diag_nft() { // the whole table verbatim (the applied state)

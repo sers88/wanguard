@@ -50,6 +50,10 @@ frozen bytes of the existing surfaces never moved:
 | `inspect <mac\|ip\|hostname>` — configured vs live for one device | #45 | New subcommand; MAC normalization + dhcp.leases/inventory resolve; prints group, allocation (mark/table), configured iface vs live (netifd dump), nft `mac_<g>` membership, matching `wg:<g>:` rules. Cases: direct / proxy / direct-lb / ungrouped / unknown |
 | `diag-report` — full text report (LuCI "Download report") | #45 | New subcommand; aggregate: diag sections + inspect summary + syncstatus + timestamp header. NEVER reads `/etc/config/network` (PPPoE/WG secrets) or any secret-bearing config — only read-command output; test-gated by a secrets-marker grep |
 | `help` text extended for the above | #44/#45 | `H.out` golden re-captured (append-only) |
+| LAN segment devices: UCI list `globals.lan_device` (default `br-lan`); single device renders the classic `iifname "br-lan"` (byte-identical), several render an anonymous set `iifname { "br-lan", "br-lan.10", "br-lan.20" }`; rule tags get a `:d<md5-8>` composition suffix so a device-list change re-renders live rules (default composition keeps the bare tag) | #113/#115 | `apply` batch/state bytes unchanged for the default config; non-default compositions are new bytes (render-parity harness covers both) |
+| `grouplist` gains a header line `lan devices: <space-joined list>` | #113/#115 | `GL.out` golden re-captured; the table rows below stay byte-frozen |
+| `diag tables` gains a trailing `lan<TAB><space-joined list>` row | #113/#115 | `DGT.out` golden re-captured (append-only); `diag-report` includes it via `diag tables` |
+| `devices` online = complete ARP entry on ANY `lan_device` (was: `br-lan` only); `WANGUARD_ARP` env overrides the ARP source (test seam, both CLIs) | #113/#115 | The 5-column format is unchanged; the `D.out` golden needed no re-capture (fixture sits on br-lan) |
 
 Machine readers of `devices` that stop at 4 fields (old LuCI) keep working
 unchanged.

@@ -711,12 +711,12 @@ cmd_apply() {
 			# TCP is handled by the redirect rule and MUST NOT be marked —
 			# after DNAT-to-local a marked packet would be policy-routed
 			# into the TUN (postmortem issue #5)
-			printf 'marking wg:%s:m%s%s iifname %s ether saddr @mac_%s meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
+			printf 'marking wg:%s:m%s%s %s ether saddr @mac_%s meta l4proto != tcp ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
 				"$g" "$m" "$(lan_tag_suffix)" "$(render_lan_iif)" "$g" "$m" >> "$DRF"
-			printf 'redir wg:%s:r%s%s iifname %s ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta l4proto tcp redirect to :%s\n' \
+			printf 'redir wg:%s:r%s%s %s ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta l4proto tcp redirect to :%s\n' \
 				"$g" "$redir" "$(lan_tag_suffix)" "$(render_lan_iif)" "$g" "$redir" >> "$DRF"
 		else
-			printf 'marking wg:%s:m%s%s iifname %s ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
+			printf 'marking wg:%s:m%s%s %s ether saddr @mac_%s ip daddr != @local_v4 ip daddr != @no_mark meta mark set %s\n' \
 				"$g" "$m" "$(lan_tag_suffix)" "$(render_lan_iif)" "$g" "$m" >> "$DRF"
 		fi
 	done < "$ADF"
@@ -824,7 +824,7 @@ cmd_list() {
 
 cmd_grouplist() {
 	local g typ m t p ifc dev cnt
-	printf 'lan devices: %s\n' "$(printf '%s ' $LAN_DEVICES)"
+	printf 'lan devices: %s\n' "$LAN_DEVICES"
 	printf '%-10s %-7s %-10s %-5s %-5s %-14s %s\n' "GROUP" "TYPE" "IFACE" "MARK" "TABLE" "DEVICE" "MEMBERS"
 	ADF=/tmp/wanguard.gl.$$
 	trap 'rm -f "$ADF"' EXIT
